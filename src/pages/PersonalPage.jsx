@@ -90,6 +90,9 @@ const PersonalPage = ({ setActivePage, setSelectedTechId }) => {
   // Modals / Drawer Editing
   const [editingPersonal, setEditingPersonal] = useState(null);
   const [confirmBajaTech, setConfirmBajaTech] = useState(null);
+  const [operationError, setOperationError] = useState('');
+  const [operationSuccess, setOperationSuccess] = useState('');
+  const [savingPersonal, setSavingPersonal] = useState(false);
 
   // EPP Auto Allocation internal states
   const [selectedKitDept, setSelectedKitDept] = useState('');
@@ -115,12 +118,16 @@ const PersonalPage = ({ setActivePage, setSelectedTechId }) => {
   };
 
   const handleOpenEdit = (colaborador) => {
+    setOperationError('');
+    setOperationSuccess('');
     setEditingPersonal({ ...colaborador });
     setSelectedKitDept('');
     setCustomKitItems([]);
   };
 
   const handleOpenCreateColaborador = (isDemo = false) => {
+    setOperationError('');
+    setOperationSuccess('');
     // Find matching supervisor dynamically for the logged-in supervisor user
     let defaultSupId = 'SUP-001';
     if (currentRole?.startsWith('Supervisor')) {
@@ -204,9 +211,17 @@ const PersonalPage = ({ setActivePage, setSelectedTechId }) => {
   const handleSaveEdit = async (e) => {
     e.preventDefault();
     if (!editingPersonal) return;
+    setSavingPersonal(true);
+    setOperationError('');
+    setOperationSuccess('');
     
-    // Save technician in SQLite
-    await saveTecnico(editingPersonal);
+    // Save technician in MySQL
+    const savedTech = await saveTecnico(editingPersonal);
+    if (!savedTech?.success) {
+      setOperationError(savedTech?.message || 'No se pudo guardar el colaborador en MySQL.');
+      setSavingPersonal(false);
+      return;
+    }
 
     // If new collaborator and has active items checked in EPP selector, trigger Acta
     if (editingPersonal.isNew && customKitItems.length > 0) {
@@ -232,10 +247,17 @@ const PersonalPage = ({ setActivePage, setSelectedTechId }) => {
             };
           })
         };
-        await createActa(newActa);
+        const actaResult = await createActa(newActa);
+        if (!actaResult?.success) {
+          setOperationError(actaResult?.message || 'El tecnico fue guardado, pero no se pudo crear el acta inicial.');
+          setSavingPersonal(false);
+          return;
+        }
       }
     }
 
+    setOperationSuccess(savedTech.message || 'Colaborador guardado correctamente en MySQL.');
+    setSavingPersonal(false);
     setEditingPersonal(null);
   };
 
@@ -268,14 +290,30 @@ const PersonalPage = ({ setActivePage, setSelectedTechId }) => {
     setConfirmBajaTech(colaborador);
   };
 
-  const handleConfirmBaja = () => {
+  const handleConfirmBaja = async () => {
     if (!confirmBajaTech) return;
-    darDeBajaColaborador(confirmBajaTech.id);
+    setOperationError('');
+    setOperationSuccess('');
+    const result = await darDeBajaColaborador(confirmBajaTech.id);
+    if (!result?.success) {
+      setOperationError(result?.message || 'No se pudo dar de baja el colaborador en MySQL.');
+      return;
+    }
+    setOperationSuccess(result.message || 'Colaborador dado de baja correctamente en MySQL.');
     setConfirmBajaTech(null);
   };
 
   return (
     <div className="space-y-6">
+      {(operationError || operationSuccess) && (
+        <div className={`glass-panel rounded-lg p-3 border text-xs font-bold ${
+          operationError
+            ? 'border-industrial-red text-industrial-red bg-industrial-red/5'
+            : 'border-industrial-green text-industrial-green bg-industrial-green/5'
+        }`}>
+          {operationError || operationSuccess}
+        </div>
+      )}
       
       {/* Search and Filters */}
       <div className="glass-panel p-4 rounded-lg flex flex-col md:flex-row gap-4 justify-between items-center border-opacity-40">
@@ -451,6 +489,11 @@ const PersonalPage = ({ setActivePage, setSelectedTechId }) => {
             </div>
 
             <form onSubmit={handleSaveEdit} className="space-y-4 text-xs font-semibold">
+              {operationError && (
+                <div className="p-3 rounded border border-industrial-red bg-industrial-red/10 text-industrial-red font-bold">
+                  {operationError}
+                </div>
+              )}
               <div className="max-h-[70vh] overflow-y-auto pr-2 space-y-5 scrollbar-thin">
                 
                 {/* SECTION 1: DATOS PERSONALES */}
@@ -805,10 +848,11 @@ const PersonalPage = ({ setActivePage, setSelectedTechId }) => {
                 </button>
                 <button
                   type="submit"
+                  disabled={savingPersonal}
                   className="w-1/2 py-2.5 rounded bg-industrial-cyan text-industrial-bg hover:bg-cyan-400 font-extrabold text-[10px] uppercase tracking-wider flex items-center justify-center space-x-1 transition-all shadow-cyan-glow"
                 >
                   <Save size={12} />
-                  <span>{editingPersonal.isNew ? 'Registrar Técnico' : 'Guardar Cambios'}</span>
+                  <span>{savingPersonal ? 'Guardando...' : (editingPersonal.isNew ? 'Registrar Técnico' : 'Guardar Cambios')}</span>
                 </button>
               </div>
             </form>

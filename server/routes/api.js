@@ -106,6 +106,35 @@ async function createAuditLog(db, req, action, entity, before, after) {
   );
 }
 
+function getDatabaseErrorMessage(error, fallback = 'La operacion no pudo completarse en MySQL.') {
+  if (!error) return fallback;
+
+  if (error.code === 'ER_DUP_ENTRY') {
+    if (error.message?.includes('cedula')) return 'Ya existe un tecnico con esa cedula.';
+    if (error.message?.includes('codigo_empleado')) return 'Ya existe un tecnico con ese codigo de empleado.';
+    if (error.message?.includes('username')) return 'Ya existe un operador con ese codigo de usuario.';
+    if (error.message?.includes('email')) return 'Ya existe un operador con ese correo.';
+    if (error.message?.includes('code')) return 'Ya existe un registro con ese codigo.';
+    return 'El registro ya existe en MySQL. Verifique cedula, codigo o usuario duplicado.';
+  }
+
+  if (error.code === 'ER_NO_REFERENCED_ROW_2' || error.code === 'ER_ROW_IS_REFERENCED_2') {
+    return 'Hay una referencia invalida en MySQL. Verifique que la brigada, supervisor o coordinador exista antes de guardar.';
+  }
+
+  if (error.code === 'ECONNREFUSED' || error.code === 'ETIMEDOUT' || error.code === 'EACCES') {
+    return 'No se pudo conectar con la base de datos MySQL remota. Revise las variables DB_HOST/DB_USER/DB_PASSWORD y permisos de red.';
+  }
+
+  return `${fallback} Detalle: ${error.message}`;
+}
+
+async function existsById(db, table, id) {
+  if (!id) return false;
+  const row = await db.get(`SELECT id FROM ${table} WHERE id = ? LIMIT 1`, [id]);
+  return Boolean(row);
+}
+
 // -------------------- 1. AUTHENTICATION --------------------
 router.post('/auth/login', async (req, res) => {
   const { username, password } = req.body;
@@ -299,7 +328,19 @@ router.post('/usuarios', async (req, res) => {
   const { username, name, role, zone } = req.body;
   const db = await getDb();
   try {
+    if (!username || !name || !role) {
+      return res.status(400).json({ success: false, message: 'Complete nombre, usuario y rol antes de guardar.' });
+    }
+
     const email = `${username}@gridops.com`;
+    const existing = await db.get(
+      'SELECT id FROM users WHERE LOWER(username) = ? OR LOWER(email) = ? LIMIT 1',
+      [username.toLowerCase().trim(), email.toLowerCase()]
+    );
+    if (existing) {
+      return res.status(409).json({ success: false, message: 'Ya existe un operador con ese usuario o correo.' });
+    }
+
     const securePassword = hashPassword('1234');
     const result = await db.run(
       'INSERT INTO users (username, email, password, role, zone, status) VALUES (?, ?, ?, ?, ?, ?)',
@@ -327,7 +368,7 @@ router.post('/usuarios', async (req, res) => {
 
     res.json({ success: true, message: 'Usuario creado con éxito.', id: result.lastID });
   } catch (error) {
-    res.status(500).json({ success: false, message: 'Error creando operador: ' + error.message });
+    res.status(500).json({ success: false, message: getDatabaseErrorMessage(error, 'Error creando operador en MySQL.') });
   } finally {
     await db.close();
   }
@@ -397,6 +438,10 @@ router.post('/tecnicos', async (req, res) => {
   const t = req.body;
   const db = await getDb();
   try {
+    if (!t.name || !t.cedula || !t.codigoEmpleado) {
+      return res.status(400).json({ success: false, message: 'Complete nombre, cedula y codigo de empleado antes de guardar.' });
+    }
+
     const parseId = (val, prefix) => {
       if (!val) return 1;
       if (typeof val === 'number') return val;
@@ -406,6 +451,29 @@ router.post('/tecnicos', async (req, res) => {
     };
     const supId = parseId(t.supervisorId, 'SUP-00');
     const coordId = parseId(t.coordinatorId, 'COORD-00');
+
+    const existing = await db.get(
+      'SELECT id FROM technicians WHERE cedula = ? OR codigo_empleado = ? LIMIT 1',
+      [t.cedula, t.codigoEmpleado]
+    );
+    if (existing) {
+      return res.status(409).json({ success: false, message: 'Ya existe un tecnico con esa cedula o codigo de empleado.' });
+    }
+
+    if (!(await existsById(db, 'supervisores', supId))) {
+      return res.status(400).json({ success: false, message: `El supervisor seleccionado (${t.supervisorId || supId}) no existe en MySQL.` });
+    }
+
+    if (!(await existsById(db, 'coordinadores', coordId))) {
+      return res.status(400).json({ success: false, message: `El coordinador seleccionado (${t.coordinatorId || coordId}) no existe en MySQL.` });
+    }
+
+    if (t.brigadaId) {
+      const brigada = await db.get('SELECT code FROM brigadas WHERE code = ? LIMIT 1', [t.brigadaId]);
+      if (!brigada) {
+        return res.status(400).json({ success: false, message: `La brigada ${t.brigadaId} no existe en MySQL. Cree la brigada o deje el campo vacio.` });
+      }
+    }
 
     const result = await db.run(
       `INSERT INTO technicians (name, cedula, codigo_empleado, telefono, tipo_sangre, licencia, vigencia_licencia, sie, licencia_sie, talla_camisa, talla_pantalon, talla_bota, brigada_id, supervisor_id, coordinator_id, estado, fecha_ingreso)
@@ -423,7 +491,7 @@ router.post('/tecnicos', async (req, res) => {
 
     res.json({ success: true, message: 'Técnico registrado con éxito.', id: result.lastID });
   } catch (error) {
-    res.status(500).json({ success: false, message: 'Error creando expediente: ' + error.message });
+    res.status(500).json({ success: false, message: getDatabaseErrorMessage(error, 'Error creando expediente en MySQL.') });
   } finally {
     await db.close();
   }
@@ -447,6 +515,33 @@ router.put('/tecnicos/:id', async (req, res) => {
     const supId = parseId(t.supervisorId, 'SUP-00');
     const coordId = parseId(t.coordinatorId, 'COORD-00');
 
+    if (!t.name || !t.cedula) {
+      return res.status(400).json({ success: false, message: 'Complete nombre y cedula antes de guardar.' });
+    }
+
+    const duplicate = await db.get(
+      'SELECT id FROM technicians WHERE cedula = ? AND id <> ? LIMIT 1',
+      [t.cedula, id]
+    );
+    if (duplicate) {
+      return res.status(409).json({ success: false, message: 'Ya existe otro tecnico con esa cedula.' });
+    }
+
+    if (!(await existsById(db, 'supervisores', supId))) {
+      return res.status(400).json({ success: false, message: `El supervisor seleccionado (${t.supervisorId || supId}) no existe en MySQL.` });
+    }
+
+    if (!(await existsById(db, 'coordinadores', coordId))) {
+      return res.status(400).json({ success: false, message: `El coordinador seleccionado (${t.coordinatorId || coordId}) no existe en MySQL.` });
+    }
+
+    if (t.brigadaId) {
+      const brigada = await db.get('SELECT code FROM brigadas WHERE code = ? LIMIT 1', [t.brigadaId]);
+      if (!brigada) {
+        return res.status(400).json({ success: false, message: `La brigada ${t.brigadaId} no existe en MySQL. Cree la brigada o deje el campo vacio.` });
+      }
+    }
+
     await db.run(
       `UPDATE technicians SET name = ?, cedula = ?, telefono = ?, tipo_sangre = ?, licencia = ?, vigencia_licencia = ?, sie = ?, licencia_sie = ?, talla_camisa = ?, talla_pantalon = ?, talla_bota = ?, supervisor_id = ?, coordinator_id = ?, estado = ?, brigada_id = ?
        WHERE id = ?`,
@@ -463,7 +558,7 @@ router.put('/tecnicos/:id', async (req, res) => {
 
     res.json({ success: true, message: 'Expediente editado con éxito.' });
   } catch (error) {
-    res.status(500).json({ success: false, message: error.message });
+    res.status(500).json({ success: false, message: getDatabaseErrorMessage(error, 'Error editando expediente en MySQL.') });
   } finally {
     await db.close();
   }
@@ -528,6 +623,13 @@ router.post('/brigadas', async (req, res) => {
 
   const db = await getDb();
   try {
+    if (!code) {
+      return res.status(400).json({ success: false, message: 'Ingrese el codigo de la brigada antes de guardar.' });
+    }
+    if (!vehicle) {
+      return res.status(400).json({ success: false, message: 'Ingrese el vehiculo asignado antes de guardar.' });
+    }
+
     const parseId = (val, prefix) => {
       if (!val) return 1;
       if (typeof val === 'number') return val;
@@ -536,6 +638,15 @@ router.post('/brigadas', async (req, res) => {
       return isNaN(num) ? 1 : num;
     };
     const supId = parseId(supervisorId, 'SUP-00');
+
+    const existing = await db.get('SELECT code FROM brigadas WHERE code = ? LIMIT 1', [code]);
+    if (existing) {
+      return res.status(409).json({ success: false, message: 'Ya existe una brigada con ese codigo.' });
+    }
+
+    if (!(await existsById(db, 'supervisores', supId))) {
+      return res.status(400).json({ success: false, message: `El supervisor seleccionado (${supervisorId}) no existe en MySQL.` });
+    }
 
     await db.run(
       'INSERT INTO brigadas (code, type, vehicle, supervisor_id, zone, campamento, estado) VALUES (?, ?, ?, ?, ?, ?, ?)',
@@ -564,7 +675,7 @@ router.post('/brigadas', async (req, res) => {
 
     res.json({ success: true, message: 'Brigada creada con éxito.' });
   } catch (error) {
-    res.status(500).json({ success: false, message: 'Error creando brigada: ' + error.message });
+    res.status(500).json({ success: false, message: getDatabaseErrorMessage(error, 'Error creando brigada en MySQL.') });
   } finally {
     await db.close();
   }
@@ -590,6 +701,14 @@ router.put('/brigadas/:code', async (req, res) => {
     const zone = b.zone || b.zona || '';
     const campamento = b.campamento || '';
 
+    if (!vehicle) {
+      return res.status(400).json({ success: false, message: 'Ingrese el vehiculo asignado antes de guardar.' });
+    }
+
+    if (!(await existsById(db, 'supervisores', supId))) {
+      return res.status(400).json({ success: false, message: `El supervisor seleccionado (${b.supervisorId || supId}) no existe en MySQL.` });
+    }
+
     await db.run(
       'UPDATE brigadas SET vehicle = ?, estado = ?, supervisor_id = ?, zone = ?, campamento = ? WHERE code = ?',
       [vehicle, b.estado, supId, zone, campamento, code]
@@ -605,7 +724,7 @@ router.put('/brigadas/:code', async (req, res) => {
 
     res.json({ success: true, message: 'Brigada modificada.' });
   } catch (error) {
-    res.status(500).json({ success: false, message: error.message });
+    res.status(500).json({ success: false, message: getDatabaseErrorMessage(error, 'Error editando brigada en MySQL.') });
   } finally {
     await db.close();
   }

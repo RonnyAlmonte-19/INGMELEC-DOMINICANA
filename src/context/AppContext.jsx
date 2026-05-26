@@ -142,6 +142,24 @@ export const AppProvider = ({ children }) => {
     return headers;
   };
 
+  const readApiResponse = async (response) => {
+    let payload = {};
+    try {
+      payload = await response.json();
+    } catch (e) {
+      payload = {};
+    }
+
+    if (!response.ok || !payload.success) {
+      return {
+        success: false,
+        message: payload.message || `Error HTTP ${response.status}: la operacion no pudo completarse.`
+      };
+    }
+
+    return payload;
+  };
+
   // Authentication Actions (REST POST)
   const loginUser = async (username, password) => {
     try {
@@ -195,7 +213,7 @@ export const AppProvider = ({ children }) => {
         method: 'POST',
         headers: getHeaders()
       });
-      const res = await response.json();
+      const res = await readApiResponse(response);
       if (res.success) {
         await loadAllData();
         
@@ -205,8 +223,10 @@ export const AppProvider = ({ children }) => {
           ...prev
         ]);
       }
+      return res;
     } catch (e) {
       console.error(e);
+      return { success: false, message: e.message };
     }
   };
 
@@ -222,12 +242,14 @@ export const AppProvider = ({ children }) => {
         headers: getHeaders(),
         body: JSON.stringify(tech)
       });
-      const res = await response.json();
+      const res = await readApiResponse(response);
       if (res.success) {
         await loadAllData();
       }
+      return res;
     } catch (e) {
       console.error(e);
+      return { success: false, message: e.message };
     }
   };
 
@@ -242,12 +264,14 @@ export const AppProvider = ({ children }) => {
         headers: getHeaders(),
         body: JSON.stringify({ selectedTechIds: numericIds })
       });
-      const res = await response.json();
+      const res = await readApiResponse(response);
       if (res.success) {
         await loadAllData();
       }
+      return res;
     } catch (e) {
       console.error(e);
+      return { success: false, message: e.message };
     }
   };
 
@@ -263,12 +287,14 @@ export const AppProvider = ({ children }) => {
         headers: getHeaders(),
         body: JSON.stringify(bData)
       });
-      const res = await response.json();
+      const res = await readApiResponse(response);
       if (res.success) {
         await loadAllData();
       }
+      return res;
     } catch (e) {
       console.error(e);
+      return { success: false, message: e.message };
     }
   };
 
@@ -279,7 +305,7 @@ export const AppProvider = ({ children }) => {
         headers: getHeaders(),
         body: JSON.stringify({ toolsList, overrideStock })
       });
-      const res = await response.json();
+      const res = await readApiResponse(response);
       if (res.success) {
         await loadAllData();
         return { success: true, message: res.message };
@@ -300,12 +326,14 @@ export const AppProvider = ({ children }) => {
         headers: getHeaders(),
         body: JSON.stringify({ newState, observation })
       });
-      const res = await response.json();
+      const res = await readApiResponse(response);
       if (res.success) {
         await loadAllData();
       }
+      return res;
     } catch (e) {
       console.error(e);
+      return { success: false, message: e.message };
     }
   };
 
@@ -317,12 +345,14 @@ export const AppProvider = ({ children }) => {
         headers: getHeaders(),
         body: JSON.stringify({ code, adjustQty: qty, newStatus: adjustStatus })
       });
-      const res = await response.json();
+      const res = await readApiResponse(response);
       if (res.success) {
         await loadAllData();
       }
+      return res;
     } catch (e) {
       console.error(e);
+      return { success: false, message: e.message };
     }
   };
 
@@ -349,12 +379,14 @@ export const AppProvider = ({ children }) => {
           signatureData: newActa.signatureData || null
         })
       });
-      const res = await response.json();
+      const res = await readApiResponse(response);
       if (res.success) {
         await loadAllData();
       }
+      return res;
     } catch (e) {
       console.error(e);
+      return { success: false, message: e.message };
     }
   };
 
@@ -365,12 +397,14 @@ export const AppProvider = ({ children }) => {
         headers: getHeaders(),
         body: JSON.stringify({ signatureData, observaciones })
       });
-      const res = await response.json();
+      const res = await readApiResponse(response);
       if (res.success) {
         await loadAllData();
       }
+      return res;
     } catch (e) {
       console.error(e);
+      return { success: false, message: e.message };
     }
   };
 
@@ -381,10 +415,10 @@ export const AppProvider = ({ children }) => {
         headers: getHeaders(),
         body: JSON.stringify({ text })
       });
-      const res = await response.json();
+      const res = await readApiResponse(response);
       if (res.success) {
         await loadAllData();
-        return { success: true };
+        return { success: true, message: res.message };
       }
       return { success: false, message: res.message };
     } catch (e) {
@@ -399,12 +433,14 @@ export const AppProvider = ({ children }) => {
         method: 'POST',
         headers: getHeaders()
       });
-      const res = await response.json();
+      const res = await readApiResponse(response);
       if (res.success) {
         await loadAllData();
       }
+      return res;
     } catch (e) {
       console.error(e);
+      return { success: false, message: e.message };
     }
   };
 
@@ -416,12 +452,14 @@ export const AppProvider = ({ children }) => {
         headers: getHeaders(),
         body: JSON.stringify({ decision })
       });
-      const res = await response.json();
+      const res = await readApiResponse(response);
       if (res.success) {
         await loadAllData();
       }
+      return res;
     } catch (e) {
       console.error(e);
+      return { success: false, message: e.message };
     }
   };
 
@@ -433,12 +471,14 @@ export const AppProvider = ({ children }) => {
         headers: getHeaders(),
         body: JSON.stringify(swapData)
       });
-      const res = await response.json();
+      const res = await readApiResponse(response);
       if (res.success) {
         await loadAllData();
       }
+      return res;
     } catch (e) {
       console.error(e);
+      return { success: false, message: e.message };
     }
   };
 
@@ -450,12 +490,14 @@ export const AppProvider = ({ children }) => {
         headers: getHeaders(),
         body: JSON.stringify({ cantDevuelta: returnedQty, estado, observacion })
       });
-      const res = await response.json();
+      const res = await readApiResponse(response);
       if (res.success) {
         await loadAllData();
       }
+      return res;
     } catch (e) {
       console.error(e);
+      return { success: false, message: e.message };
     }
   };
 
@@ -467,12 +509,14 @@ export const AppProvider = ({ children }) => {
         headers: getHeaders(),
         body: JSON.stringify(uData)
       });
-      const res = await response.json();
+      const res = await readApiResponse(response);
       if (res.success) {
         await loadAllData();
       }
+      return res;
     } catch (e) {
       console.error(e);
+      return { success: false, message: e.message };
     }
   };
 
@@ -482,12 +526,14 @@ export const AppProvider = ({ children }) => {
         method: 'POST',
         headers: getHeaders()
       });
-      const res = await response.json();
+      const res = await readApiResponse(response);
       if (res.success) {
         await loadAllData();
       }
+      return res;
     } catch (e) {
       console.error(e);
+      return { success: false, message: e.message };
     }
   };
 

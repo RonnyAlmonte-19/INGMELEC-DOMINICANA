@@ -720,7 +720,7 @@ const ActasPage = () => {
 
         <div className="flex justify-between items-center pt-2">
           <span className="text-[10px] text-industrial-gray font-semibold">
-            Mostrando <span className="text-white font-bold">{filteredActas.length} actas</span> de un total de {totalActasCount} en SQLite.
+            Mostrando <span className="text-white font-bold">{filteredActas.length} actas</span> de un total de {totalActasCount} en MySQL.
           </span>
           <button
             onClick={() => setShowNewActaModal(true)}
@@ -1172,7 +1172,7 @@ const ActasPage = () => {
                           className="w-full py-2.5 rounded bg-gradient-to-r from-industrial-cyan to-blue-600 hover:from-cyan-400 hover:to-blue-500 text-industrial-bg font-extrabold text-[10px] uppercase tracking-widest transition-all shadow-cyan-glow flex items-center justify-center space-x-1.5"
                         >
                           <Check size={12} className="text-industrial-bg" />
-                          <span>Sellar y Firmar Acta en SQLite</span>
+                          <span>Sellar y Firmar Acta en MySQL</span>
                         </button>
                       </div>
 

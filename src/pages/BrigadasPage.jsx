@@ -47,6 +47,9 @@ const BrigadasPage = ({ setActivePage, setSelectedTechId }) => {
   const [modalTools, setModalTools] = useState([]);
   const [overrideStockChoice, setOverrideStockChoice] = useState(false);
   const [deficitsList, setDeficitsList] = useState([]);
+  const [operationError, setOperationError] = useState('');
+  const [operationSuccess, setOperationSuccess] = useState('');
+  const [savingBrigade, setSavingBrigade] = useState(false);
 
   // Tools editing state
   const [editingTool, setEditingTool] = useState(null);
@@ -107,6 +110,8 @@ const BrigadasPage = ({ setActivePage, setSelectedTechId }) => {
   };
 
   const handleOpenCreateBrigade = () => {
+    setOperationError('');
+    setOperationSuccess('');
     let defaultSupId = 'SUP-001';
     if (currentRole?.startsWith('Supervisor')) {
       const matchedSup = (supervisores || []).find(s => {
@@ -137,6 +142,8 @@ const BrigadasPage = ({ setActivePage, setSelectedTechId }) => {
   };
 
   const handleEditBrigade = async (b) => {
+    setOperationError('');
+    setOperationSuccess('');
     setEditBrigadeData({ ...b });
     setDeficitsList([]);
     setOverrideStockChoice(false);
@@ -152,6 +159,7 @@ const BrigadasPage = ({ setActivePage, setSelectedTechId }) => {
       console.error(e);
       setModalTools([]);
     }
+    setSavingBrigade(false);
   };
 
   const handleLoadKitSuggested = async () => {
@@ -206,17 +214,27 @@ const BrigadasPage = ({ setActivePage, setSelectedTechId }) => {
   const handleSaveBrigade = async (e) => {
     e.preventDefault();
     if (!editBrigadeData) return;
+    setOperationError('');
+    setOperationSuccess('');
+    setSavingBrigade(true);
 
     const code = editBrigadeData.id.toUpperCase().trim();
     if (!code) {
       alert('Por favor ingrese el código de la brigada.');
+      setSavingBrigade(false);
       return;
     }
 
-    await saveBrigada(editBrigadeData);
+    const savedBrigade = await saveBrigada(editBrigadeData);
+    if (!savedBrigade?.success) {
+      setOperationError(savedBrigade?.message || 'No se pudo guardar la brigada en MySQL.');
+      setSavingBrigade(false);
+      return;
+    }
 
     const res = await saveBrigadaTools(code, modalTools, overrideStockChoice);
     if (res.success) {
+      setOperationSuccess(res.message || savedBrigade.message || 'Brigada guardada correctamente en MySQL.');
       setEditBrigadeData(null);
       setModalTools([]);
       setDeficitsList([]);
@@ -226,9 +244,10 @@ const BrigadasPage = ({ setActivePage, setSelectedTechId }) => {
         setDeficitsList(res.deficits);
         alert(`Stock insuficiente en almacén central para completar la asignación.`);
       } else {
-        alert('Error: ' + res.message);
+        setOperationError(res.message || 'No se pudo guardar el kit de la brigada.');
       }
     }
+    setSavingBrigade(false);
   };
 
   const getStatusColor = (status) => {
@@ -242,6 +261,15 @@ const BrigadasPage = ({ setActivePage, setSelectedTechId }) => {
 
   return (
     <div className="space-y-6">
+      {(operationError || operationSuccess) && (
+        <div className={`glass-panel rounded-lg p-3 border text-xs font-bold ${
+          operationError
+            ? 'border-industrial-red text-industrial-red bg-industrial-red/5'
+            : 'border-industrial-green text-industrial-green bg-industrial-green/5'
+        }`}>
+          {operationError || operationSuccess}
+        </div>
+      )}
       
       {/* Search and Filters */}
       <div className="glass-panel p-4 rounded-lg flex flex-col md:flex-row gap-4 justify-between items-center">
@@ -610,6 +638,11 @@ const BrigadasPage = ({ setActivePage, setSelectedTechId }) => {
             </div>
 
             <form onSubmit={handleSaveBrigade} className="space-y-4 text-xs font-semibold">
+              {operationError && (
+                <div className="p-3 rounded border border-industrial-red bg-industrial-red/10 text-industrial-red font-bold">
+                  {operationError}
+                </div>
+              )}
               
               <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
                 
@@ -895,10 +928,11 @@ const BrigadasPage = ({ setActivePage, setSelectedTechId }) => {
                     </button>
                     <button
                       type="submit"
+                      disabled={savingBrigade}
                       className="w-1/2 py-2.5 rounded bg-industrial-cyan text-industrial-bg hover:bg-cyan-400 font-extrabold text-[10px] uppercase tracking-wider flex items-center justify-center space-x-1 transition-all shadow-cyan-glow"
                     >
                       <Save size={12} />
-                      <span>{editBrigadeData.isNew ? 'Registrar Brigada' : 'Guardar Parámetros'}</span>
+                      <span>{savingBrigade ? 'Guardando...' : (editBrigadeData.isNew ? 'Registrar Brigada' : 'Guardar Parámetros')}</span>
                     </button>
                   </div>
                 </div>

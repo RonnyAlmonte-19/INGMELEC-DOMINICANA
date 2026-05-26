@@ -52,7 +52,7 @@ const DEMO_STEPS = [
     title: "4. Generar Acta de Entrega",
     page: "actas",
     icon: FileText,
-    description: "Procesa el registro del colaborador en SQLite. Esto genera de manera instantánea el Acta oficial de entrega de herramientas en estado Pendiente.",
+    description: "Procesa el registro del colaborador en MySQL. Esto genera de manera instantánea el Acta oficial de entrega de herramientas en estado Pendiente.",
     actionText: "Generar Acta",
     spotlight: { top: '150px', left: '240px', width: '600px', height: '120px', label: "Protocolo de Entrega: Acta ACT-2026 en estado pendiente registrada." }
   },

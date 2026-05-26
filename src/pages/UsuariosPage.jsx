@@ -31,9 +31,12 @@ const UsuariosPage = () => {
   // Search
   const [searchTerm, setSearchTerm] = useState('');
   const [showNewUserModal, setShowNewUserModal] = useState(false);
+  const [operationError, setOperationError] = useState('');
+  const [operationSuccess, setOperationSuccess] = useState('');
+  const [savingUser, setSavingUser] = useState(false);
   const [activeTab, setActiveTab] = useState('Tabla'); // 'Tabla' | 'Jerarquía'
 
-  // Read users directly from SQLite backend via context
+  // Read users directly from MySQL backend via context
   const systemUsers = usuarios || [];
 
   // Form states
@@ -52,20 +55,30 @@ const UsuariosPage = () => {
     toggleUsuarioStatus(userId);
   };
 
-  const handleCreateUser = (e) => {
+  const handleCreateUser = async (e) => {
     e.preventDefault();
+    setOperationError('');
+    setOperationSuccess('');
     if (!newUsername || !newName) {
-      alert('Por favor complete todos los datos del operador.');
+      setOperationError('Por favor complete todos los datos del operador.');
       return;
     }
 
-    saveUsuario({
+    setSavingUser(true);
+    const result = await saveUsuario({
       username: newUsername.toLowerCase().trim(),
       name: newName,
       role: newRole,
       zone: newZone
     });
 
+    setSavingUser(false);
+    if (!result?.success) {
+      setOperationError(result?.message || 'No se pudo crear el operador en MySQL.');
+      return;
+    }
+
+    setOperationSuccess(result.message || 'Operador creado correctamente en MySQL.');
     setShowNewUserModal(false);
 
     // Clear form
@@ -84,6 +97,15 @@ const UsuariosPage = () => {
 
   return (
     <div className="space-y-6">
+      {(operationError || operationSuccess) && (
+        <div className={`glass-panel rounded-lg p-3 border text-xs font-bold ${
+          operationError
+            ? 'border-industrial-red text-industrial-red bg-industrial-red/5'
+            : 'border-industrial-green text-industrial-green bg-industrial-green/5'
+        }`}>
+          {operationError || operationSuccess}
+        </div>
+      )}
       
       {/* Tab Selectors & Search bar */}
       <div className="flex flex-col md:flex-row gap-4 items-center justify-between border-b border-industrial-border pb-4">
@@ -315,6 +337,11 @@ const UsuariosPage = () => {
             </div>
 
             <form onSubmit={handleCreateUser} className="space-y-4 text-xs font-semibold">
+              {operationError && (
+                <div className="p-3 rounded border border-industrial-red bg-industrial-red/10 text-industrial-red font-bold">
+                  {operationError}
+                </div>
+              )}
               
               <div>
                 <label className="block text-[9px] text-industrial-gray uppercase font-bold tracking-widest mb-1">Nombre Completo del Operador *</label>
@@ -376,10 +403,11 @@ const UsuariosPage = () => {
                 </button>
                 <button
                   type="submit"
+                  disabled={savingUser}
                   className="w-1/2 py-2 rounded bg-industrial-cyan text-industrial-bg hover:bg-cyan-400 font-extrabold text-[10px] uppercase tracking-wider flex items-center justify-center space-x-1"
                 >
                   <Save size={12} />
-                  <span>Crear Operador</span>
+                  <span>{savingUser ? 'Creando...' : 'Crear Operador'}</span>
                 </button>
               </div>
             </form>

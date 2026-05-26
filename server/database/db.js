@@ -54,7 +54,7 @@ class MySQLWrapper {
     this.connection = connection;
   }
 
-  // Intercept and translate SQLite-specific statements to MySQL standard SQL
+  // Intercept legacy transaction statements and translate them to MySQL standard SQL
   _prepareSql(sql) {
     if (typeof sql !== 'string') return sql;
     const clean = sql.trim().replace(/;$/, '').toUpperCase();
@@ -70,7 +70,7 @@ class MySQLWrapper {
     return sql;
   }
 
-  // SQLite-compatible db.get(): returns first row or null
+  // db.get(): returns first row or null
   async get(sql, params = []) {
     const preparedSql = this._prepareSql(sql);
     const [rows] = await this.connection.query(preparedSql, params);
@@ -80,14 +80,14 @@ class MySQLWrapper {
     return rows;
   }
 
-  // SQLite-compatible db.all(): returns all matching rows
+  // db.all(): returns all matching rows
   async all(sql, params = []) {
     const preparedSql = this._prepareSql(sql);
     const [rows] = await this.connection.query(preparedSql, params);
     return Array.isArray(rows) ? rows : [];
   }
 
-  // SQLite-compatible db.run(): returns { lastID, changes }
+  // db.run(): returns { lastID, changes }
   async run(sql, params = []) {
     const preparedSql = this._prepareSql(sql);
     const [result] = await this.connection.query(preparedSql, params);
@@ -97,7 +97,7 @@ class MySQLWrapper {
     };
   }
 
-  // SQLite-compatible db.exec(): runs multiple query statements
+  // db.exec(): runs multiple query statements
   async exec(sql) {
     const preparedSql = this._prepareSql(sql);
     await this.connection.query(preparedSql);
