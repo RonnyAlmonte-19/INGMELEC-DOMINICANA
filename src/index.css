@@ -1,0 +1,318 @@
+@import url('https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&family=Inter:wght@300;400;500;600;700&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  body {
+    @apply bg-industrial-bg text-industrial-text font-sans antialiased overflow-x-hidden;
+    background-image: 
+      radial-gradient(at 0% 0%, rgba(241, 245, 249, 0.9) 0%, transparent 60%),
+      radial-gradient(at 50% 0%, rgba(242, 133, 36, 0.04) 0%, transparent 50%),
+      radial-gradient(at 100% 100%, rgba(30, 41, 59, 0.02) 0%, transparent 60%);
+    min-height: 100vh;
+  }
+
+  /* Custom scrollbar for premium feeling */
+  ::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+  ::-webkit-scrollbar-track {
+    background: #f8fafc;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: #cbd5e1;
+    border-radius: 9999px;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: #f28524;
+  }
+}
+
+@layer utilities {
+  .glass-panel {
+    background: #ffffff;
+    border: 1px solid #e2e8f0;
+    box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.02), 0 2px 4px -2px rgba(0, 0, 0, 0.02);
+  }
+  
+  .glass-panel-cyan {
+    background: #ffffff;
+    border: 1px solid rgba(242, 133, 36, 0.4);
+    box-shadow: 0 0 15px rgba(242, 133, 36, 0.08);
+  }
+
+  .glass-panel-orange {
+    background: #ffffff;
+    border: 1px solid rgba(30, 41, 59, 0.2);
+    box-shadow: 0 0 15px rgba(30, 41, 59, 0.08);
+  }
+
+  .text-neon-cyan {
+    color: #f28524;
+    text-shadow: 0 0 8px rgba(242, 133, 36, 0.2);
+  }
+
+  .text-neon-orange {
+    color: #1e293b;
+    text-shadow: 0 0 8px rgba(30, 41, 59, 0.1);
+  }
+
+  .border-neon-cyan {
+    border-color: rgba(242, 133, 36, 0.6);
+    box-shadow: 0 0 10px rgba(242, 133, 36, 0.15);
+  }
+
+  .border-neon-orange {
+    border-color: rgba(30, 41, 59, 0.6);
+    box-shadow: 0 0 10px rgba(30, 41, 59, 0.1);
+  }
+  
+  .grid-pattern {
+    background-size: 40px 40px;
+    background-image: 
+      linear-gradient(to right, rgba(226, 232, 240, 0.4) 1px, transparent 1px),
+      linear-gradient(to bottom, rgba(226, 232, 240, 0.4) 1px, transparent 1px);
+  }
+}
+
+/* Animations */
+@keyframes pulse-cyan {
+  0%, 100% { opacity: 0.6; transform: scale(1); }
+  50% { opacity: 1; transform: scale(1.05); }
+}
+
+.animate-pulse-cyan {
+  animation: pulse-cyan 3s infinite ease-in-out;
+}
+
+/* Global Font Legibility Enhancements (Ingmelec Enterprise Dashboard) */
+html {
+  font-size: 16px;
+  letter-spacing: -0.01em;
+}
+
+body {
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Ensure all form inputs, select options, and buttons are highly readable */
+input, select, textarea, button {
+  font-size: 0.9375rem !important; /* Force at least sm (15px) size for better UX */
+}
+
+/* Override all Tailwind arbitrary small text classes to make them highly legible */
+.text-\[8px\] {
+  font-size: 0.75rem !important; /* 12px instead of 8px */
+  line-height: 1rem !important;
+}
+
+.text-\[9px\] {
+  font-size: 0.75rem !important; /* 12px instead of 9px */
+  line-height: 1rem !important;
+}
+
+.text-\[10px\] {
+  font-size: 0.8125rem !important; /* 13px instead of 10px */
+  line-height: 1.15rem !important;
+}
+
+.text-\[11px\] {
+  font-size: 0.875rem !important; /* 14px instead of 11px */
+  line-height: 1.25rem !important;
+}
+
+/* Standard utilities overrides with !important to guarantee higher priority */
+.text-xs {
+  font-size: 0.875rem !important; /* 14px instead of 12px */
+  line-height: 1.25rem !important;
+}
+
+.text-sm {
+  font-size: 0.9375rem !important; /* 15px instead of 14px */
+  line-height: 1.4rem !important;
+}
+
+.text-base {
+  font-size: 1.0625rem !important; /* 17px instead of 16px */
+  line-height: 1.6rem !important;
+}
+
+.text-lg {
+  font-size: 1.1875rem !important; /* 19px instead of 18px */
+  line-height: 1.8rem !important;
+}
+
+/* Ensure high contrast for text-white elements inside light-mode panels and tables */
+.glass-panel .text-white:not(button):not([class*="bg-"]):not([class*="hover:bg-"]),
+.glass-panel-cyan .text-white:not(button):not([class*="bg-"]):not([class*="hover:bg-"]),
+.glass-panel-orange .text-white:not(button):not([class*="bg-"]):not([class*="hover:bg-"]),
+tr.hover\:bg-industrial-border .text-white:not(button):not([class*="bg-"]),
+.bg-white .text-white:not(button):not([class*="bg-"]) {
+  color: #0f172a !important; /* Set to deep slate */
+}
+
+/* Automatically enhance contrast for tables and card layouts in light theme */
+table td.text-white,
+table td .text-white,
+.table-cell .text-white {
+  color: #0f172a !important;
+}
+
+/* ==========================================================================
+   🏛️ PREMIUM LIGHT THEME MODALS OVERRIDES (Ingmelec Enterprise Dashboard)
+   ========================================================================== */
+
+/* 1. Modal Overlay / Backdrop */
+div.fixed.inset-0.bg-black {
+  background-color: rgba(15, 23, 42, 0.45) !important; /* Soft modern slate backdrop */
+  backdrop-filter: blur(4px) !important;
+}
+
+/* 2. Modal Main Card Container */
+div.fixed.inset-0.bg-black > div,
+div.fixed.inset-0.bg-black > motion\.div,
+div.fixed.inset-0.bg-black > [class*="glass-panel"],
+div.fixed.inset-0.bg-black > [class*="bg-"] {
+  background: #ffffff !important; /* Pure white background */
+  color: #0f172a !important;     /* Deep charcoal text */
+  border: 1px solid #e2e8f0 !important; /* Subtle gray border */
+  box-shadow: 0 25px 50px -12px rgba(15, 23, 42, 0.18) !important; /* Premium drop shadow */
+  border-radius: 0.75rem !important; /* Elegant 12px rounded corners */
+}
+
+/* 3. Modal Headers and Icons */
+div.fixed.inset-0.bg-black h3,
+div.fixed.inset-0.bg-black h4,
+div.fixed.inset-0.bg-black h5,
+div.fixed.inset-0.bg-black .text-white:not(button):not([class*="bg-"]):not([class*="hover:bg-"]) {
+  color: #0f172a !important; /* Set titles to deep slate */
+}
+
+/* Header line separating modal title */
+div.fixed.inset-0.bg-black .border-b {
+  border-color: #e2e8f0 !important;
+}
+
+/* 4. Select dropdowns, inputs and textareas inside Modals */
+div.fixed.inset-0.bg-black select,
+div.fixed.inset-0.bg-black input[type="text"],
+div.fixed.inset-0.bg-black input[type="number"],
+div.fixed.inset-0.bg-black input[type="password"],
+div.fixed.inset-0.bg-black textarea {
+  background-color: #f8fafc !important; /* Soft slate gray input bg */
+  color: #0f172a !important;            /* Deep slate input text */
+  border: 1px solid #cbd5e1 !important;  /* Consistent clean border */
+  border-radius: 0.375rem !important;
+}
+
+div.fixed.inset-0.bg-black select:focus,
+div.fixed.inset-0.bg-black input[type="text"]:focus,
+div.fixed.inset-0.bg-black input[type="number"]:focus,
+div.fixed.inset-0.bg-black input[type="password"]:focus,
+div.fixed.inset-0.bg-black textarea:focus {
+  border-color: #f28524 !important; /* Accent orange border on focus */
+  background-color: #ffffff !important;
+  outline: none !important;
+  box-shadow: 0 0 0 1px rgba(242, 133, 36, 0.15) !important;
+}
+
+/* Dropdown Options */
+div.fixed.inset-0.bg-black select option {
+  background-color: #ffffff !important;
+  color: #0f172a !important;
+}
+
+/* 5. Sub-containers & Checklist wrappers inside Modals */
+div.fixed.inset-0.bg-black div.bg-industrial-bg,
+div.fixed.inset-0.bg-black div.bg-industrial-panel,
+div.fixed.inset-0.bg-black div.max-h-\[380px\],
+div.fixed.inset-0.bg-black div.max-h-\[350px\] {
+  background-color: #f8fafc !important;
+  border-color: #e2e8f0 !important;
+}
+
+div.fixed.inset-0.bg-black .text-industrial-gray {
+  color: #475569 !important; /* Cohesive secondary text */
+}
+
+/* 6. Signature canvases (make background white for high contrast signatures) */
+div.fixed.inset-0.bg-black canvas {
+  background-color: #ffffff !important;
+  border: 1px solid #cbd5e1 !important;
+}
+
+/* 7. Department active and inactive tab buttons */
+div.fixed.inset-0.bg-black button[class*="border-industrial-border"] {
+  border-color: #e2e8f0 !important;
+  color: #475569 !important;
+  background-color: #ffffff !important;
+}
+
+div.fixed.inset-0.bg-black button[class*="border-industrial-border"]:hover {
+  background-color: #f1f5f9 !important;
+  color: #0f172a !important;
+}
+
+/* Active tab state */
+div.fixed.inset-0.bg-black button[class*="bg-industrial-cyan"][class*="bg-opacity-10"],
+div.fixed.inset-0.bg-black button[class*="bg-industrial-cyan bg-opacity-10"] {
+  background-color: rgba(242, 133, 36, 0.08) !important;
+  border-color: #f28524 !important;
+  color: #f28524 !important;
+  box-shadow: 0 0 10px rgba(242, 133, 36, 0.05) !important;
+}
+
+/* 8. Action and Cancel Buttons */
+div.fixed.inset-0.bg-black button[type="submit"],
+div.fixed.inset-0.bg-black button[class*="bg-gradient-to-r"],
+div.fixed.inset-0.bg-black button[class*="bg-industrial-cyan text-industrial-bg"],
+div.fixed.inset-0.bg-black button[class*="bg-industrial-orange"] {
+  background: linear-gradient(135deg, #f28524 0%, #d97706 100%) !important;
+  color: #ffffff !important;
+  border: none !important;
+  box-shadow: 0 4px 10px rgba(242, 133, 36, 0.15) !important;
+  transition: all 0.2s ease-in-out !important;
+}
+
+div.fixed.inset-0.bg-black button[type="submit"]:hover,
+div.fixed.inset-0.bg-black button[class*="bg-gradient-to-r"]:hover,
+div.fixed.inset-0.bg-black button[class*="bg-industrial-cyan text-industrial-bg"]:hover,
+div.fixed.inset-0.bg-black button[class*="bg-industrial-orange"]:hover {
+  background: linear-gradient(135deg, #f59e0b 0%, #f28524 100%) !important;
+  box-shadow: 0 6px 14px rgba(242, 133, 36, 0.25) !important;
+  transform: translateY(-1px) !important;
+}
+
+/* Cancel / Close Buttons */
+div.fixed.inset-0.bg-black button[class*="bg-industrial-border"] {
+  background-color: #e2e8f0 !important;
+  color: #475569 !important;
+  border: none !important;
+}
+
+div.fixed.inset-0.bg-black button[class*="bg-industrial-border"]:hover {
+  background-color: #cbd5e1 !important;
+  color: #0f172a !important;
+}
+
+/* 9. Miscellaneous overrides inside modals */
+div.fixed.inset-0.bg-black .text-white {
+  color: #0f172a !important;
+}
+
+div.fixed.inset-0.bg-black span.text-white[class*="bg-slate-800"] {
+  background-color: #e2e8f0 !important;
+  color: #475569 !important;
+}
+
+div.fixed.inset-0.bg-black div.border-t {
+  border-color: #e2e8f0 !important;
+}
+
+
+
