@@ -19,7 +19,7 @@ const dbConfig = {
   database: process.env.DB_NAME || 'gridops_enterprise',
   ssl: process.env.DB_SSL === 'true' ? { rejectUnauthorized: false } : undefined,
   waitForConnections: true,
-  connectionLimit: 15,
+  connectionLimit: 2, // Set to 2 to avoid exceeding Clever Cloud's 5 max connections limit
   queueLimit: 0,
   multipleStatements: true
 };
