@@ -121,13 +121,6 @@ export const AppProvider = ({ children }) => {
     }
   };
 
-  // Try auto-login Developer on start
-  useEffect(() => {
-    const autoAuth = async () => {
-      await loginUser('dev', '1234');
-    };
-    autoAuth();
-  }, []);
 
   const getHeaders = () => {
     const headers = {
