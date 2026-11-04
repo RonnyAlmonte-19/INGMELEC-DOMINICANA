@@ -1,100 +1,81 @@
-# GridOps Enterprise v2 - ERP Operativo Industrial Full-Stack
+# INGMELEC | ALMACÉN GENERAL (v2.0.0)
 
-GridOps Enterprise es una plataforma ERP empresarial para el control operativo de brigadas tecnicas, personal de campo, inventario maestro (EPP, EPC, herramientas), actas digitales, reposicion de incidencias, auditoria y jerarquia operativa.
-
-Esta version usa un frontend **React + Vite**, un backend **Node.js + Express** y una base de datos relacional **MySQL remota**. En produccion, MySQL debe apuntar a Clever Cloud mediante variables de entorno.
+Plataforma corporativa multi-almacén y multi-campamento para el control integral de inventario, activos maestros, movimientos transaccionales, levantamientos físicos y auditoría documental de **INGMELEC DOMINICANA**.
 
 ---
 
-## Estructura del Monorepo
+## Arquitectura del Sistema
+
+- **Frontend:** React 19 + Vite + Tailwind CSS + Lucide Icons + Recharts.
+- **Backend:** Node.js + Express (`/api/v2`) con cabeceras de seguridad HTTP (OWASP / HSTS) y autenticación criptográfica JWT (`HS256` + `PBKDF2-SHA512`).
+- **Base de Datos:** MySQL Relacional (Clever Cloud en producción).
+
+### Módulos Principales
+1. **Dashboard General:** Indicadores globales y desglose de 13 métricas operativas por campamento confirmado (`ALMACÉN 27 DE FEBRERO`, `OPL`, `MANTENIMIENTO 633`) y activos pendientes de clasificación territorial.
+2. **Inventario Maestro y Vistas Departamentales:** Informática y Telecomunicaciones, Oficinas y Mobiliario, Cocina y Comedor, y Almacén y Herramientas.
+3. **Sedes, Campamentos y Almacenes:** Gestión territorial de sedes operativas y bodegas internas.
+4. **Levantamientos y Auditorías en Campo:** Creación de sesiones de levantamiento, captura de bienes, importación desde plantillas Excel y consolidación.
+5. **Movimientos de Stock (Kárdex):** Registro transaccional de entradas, salidas, traslados, asignaciones, devoluciones y ajustes.
+6. **Centro de Reportes y Exportación:** Balances consolidados y exportación estructurada en formato CSV.
+7. **Bitácora de Auditoría:** Trazabilidad inmutable de operaciones.
+8. **Administración Exclusiva de Usuarios y Permisos:** Reservada exclusivamente al perfil de **Desarrollador Principal (`developer`)** con control granular por permiso (`permisos_json`) y por sede (`inv_usuario_campamentos`).
+
+---
+
+## Estructura del Repositorio
 
 ```text
-novaops-enterprise/
-├── package.json               # Scripts raiz para frontend, backend y build
-├── index.html                 # Punto de entrada HTML
-├── tailwind.config.js         # Tokens de diseno
-├── postcss.config.js          # Compilacion Tailwind CSS
-├── /src                       # Frontend React
-│   ├── /components            # Componentes visuales
-│   ├── /context               # AppContext.jsx con llamadas REST HTTP
-│   ├── /pages                 # Paginas operativas
-│   └── App.jsx                # Enrutador principal
-└── /server                    # Backend API Express
-    ├── index.js               # Entrada principal Express
-    ├── package.json           # Dependencias backend
-    ├── /database
-    │   ├── db.js              # Conexion/pool MySQL
-    │   └── initDb.js          # Inicializador de esquemas y semillas MySQL
-    └── /routes
-        └── api.js             # Endpoints JSON y logica relacional
+INGMELEC-DOMINICANA/
+├── package.json               # Scripts y dependencias para Render (frontend + backend)
+├── index.html                 # Punto de entrada SPA
+├── vite.config.js             # Configuración de compilación Vite
+├── tailwind.config.js         # Diseño visual e identidad INGMELEC
+├── postcss.config.js          # Procesamiento CSS
+├── .env.example               # Plantilla de variables de entorno (sin secretos)
+├── /src                       # Código fuente Frontend React
+│   ├── /components            # Componentes reutilizables, modales y layout
+│   ├── /context               # AppContext.jsx (estado de sesión y cliente API /api/v2)
+│   ├── /pages                 # Vistas operativas y administrativas
+│   └── /utils                 # Utilidades y normalización de estados
+├── /server                    # Servidor Backend Express
+│   ├── index.js               # Punto de entrada Express, /health, /api/v2 y estáticos dist/
+│   ├── /config                # Validación estricta de JWT_SECRET (auth.js)
+│   ├── /database              # Conexión MySQL (db.js), esquemas y migraciones SQL aditivas
+│   └── /routes                # Router principal almacenApi.js
+└── /docs                      # Manual de usuario y documentación de arquitectura/migración
 ```
 
 ---
 
-## Requisitos Previos
+## Variables de Entorno Requeridas
 
-- Node.js v18 o superior.
-- npm v9 o superior.
-- Base de datos MySQL disponible, por ejemplo Clever Cloud.
-
----
-
-## Variables de Entorno del Backend
-
-Configura estas variables en `server/.env` para desarrollo local y en Render para produccion:
+Configurar en `server/.env` (entorno local) o en el panel **Environment** de Render (producción), basándose en `.env.example`:
 
 ```env
-DB_HOST=tu-host-mysql
-DB_PORT=3306
-DB_USER=tu-usuario
-DB_PASSWORD=tu-password
-DB_NAME=tu-base
-DB_SSL=false
-JWT_SECRET=tu-secreto
 PORT=5000
+NODE_ENV=production
+DB_HOST=tu-host-mysql.services.clever-cloud.com
+DB_PORT=3306
+DB_USER=tu-usuario-mysql
+DB_PASSWORD=tu-contrasena-segura
+DB_NAME=tu-base-de-datos
+DB_SSL=false
+JWT_SECRET=clave-criptografica-aleatoria-minimo-32-caracteres
 ```
 
 ---
 
-## Inicio Rapido Local
+## Comandos de Ejecución y Despliegue (Render)
 
-```bash
-npm install
-cd server
-npm install
-cd ..
-npm run dev
-```
-
-Abre [http://localhost:5173/](http://localhost:5173/) para explorar la consola operativa.
-
----
-
-## Inicializar MySQL
-
-Usa este comando solo cuando quieras crear o resembrar las tablas MySQL configuradas en `server/.env`:
-
-```bash
-npm run db-init
-```
-
-Importante: no ejecutes `db-init` contra la base de produccion si ya contiene datos reales, porque puede recrear o resembrar estructuras.
-
----
-
-## Cuentas Demo
-
-La clave general para las cuentas sembradas es `1234`.
-
-- Developer: `developer@gridops.com` / `1234`
-- Gerente: `gerente@gridops.com` / `1234`
-- Coordinador: `coordinador@gridops.com` / `1234`
-- Supervisor: `supervisor@gridops.com` / `1234`
-
----
-
-## Produccion
-
-- GitHub guarda el codigo.
-- Render ejecuta la aplicacion y debe tener las variables `DB_*` configuradas.
-- Clever Cloud aloja MySQL como fuente unica de datos.
+- **Instalación y Compilación (Build Command):**
+  ```bash
+  npm install && npm run build
+  ```
+- **Arranque en Producción (Start Command):**
+  ```bash
+  npm start
+  ```
+- **Verificación de Salud (Health Check Path):**
+  ```text
+  /health
+  ```

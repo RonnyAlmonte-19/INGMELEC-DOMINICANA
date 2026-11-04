@@ -1,678 +1,608 @@
-import React, { createContext, useState, useContext, useEffect } from 'react';
+import React, { createContext, useState, useContext, useEffect, useCallback } from 'react';
 
 const AppContext = createContext();
 
 export const useApp = () => useContext(AppContext);
 
-const API_BASE = '/api';
+const API_V2 = '/api/v2';
 
 export const AppProvider = ({ children }) => {
   // Session State
-  const [currentUser, setCurrentUser] = useState(null);
-  const [currentRole, setCurrentRole] = useState(null); // 'Developer', 'Gerente', 'Coordinador', 'Supervisor'
-  const [authToken, setAuthToken] = useState(localStorage.getItem('gridops_auth_token') || null);
-
-  // DB States
-  const [coordinadores, setCoordinadores] = useState([]);
-  const [supervisores, setSupervisores] = useState([]);
-  const [brigadas, setBrigadas] = useState([]);
-  const [tecnicos, setTecnicos] = useState([]);
-  const [inventario, setInventario] = useState([]);
-  const [brigadaHerramientas, setBrigadaHerramientas] = useState([]);
-  const [actas, setActas] = useState([]);
-  const [reposiciones, setReposiciones] = useState([]);
-  const [swaps, setSwaps] = useState([]);
-  const [devoluciones, setDevoluciones] = useState([]);
-  const [auditoria, setAuditoria] = useState([]);
-  const [kits, setKits] = useState([]);
-  const [usuarios, setUsuarios] = useState([]);
-
-  // Telemetry status
-  const [loading, setLoading] = useState(true);
-
-  // System Notifications
-  const [notifications, setNotifications] = useState([
-    { id: 'nt-1', type: 'critical', text: 'Pértiga aislada en Lote 4 reporta nivel crítico de desgaste.', time: 'Hace 10 min', unread: true },
-    { id: 'nt-2', type: 'pending', text: 'Acta ACT-2026-003 requiere firma digital por Supervisor Isaac.', time: 'Hace 1 hora', unread: true },
-    { id: 'nt-3', type: 'stock', text: 'EPP: Chaleco reflectivo stock bajo el mínimo en Bodega D5.', time: 'Hace 4 horas', unread: false }
-  ]);
-
-  // Load all tables from REST API
-  const loadAllData = async (userHeader = null, roleHeader = null) => {
+  const [currentUser, setCurrentUser] = useState(() => {
     try {
-      const username = userHeader || currentUser?.username || 'anonymous';
-      const role = roleHeader || currentRole || 'Guest';
+      const saved = localStorage.getItem('ingmelec_user');
+      return saved ? JSON.parse(saved) : null;
+    } catch {
+      return null;
+    }
+  });
 
-      const headers = {
-        'x-username': username,
-        'x-user-role': role,
-        'Content-Type': 'application/json'
-      };
+  const [authToken, setAuthToken] = useState(() => {
+    return localStorage.getItem('ingmelec_token') || null;
+  });
 
-      const token = localStorage.getItem('gridops_auth_token') || authToken;
-      if (token) {
-        headers['Authorization'] = `Bearer ${token}`;
-      }
+  const [activeCampamento, setActiveCampamentoState] = useState(() => {
+    try {
+      const saved = localStorage.getItem('ingmelec_active_campamento');
+      return saved ? JSON.parse(saved) : null;
+    } catch {
+      return null;
+    }
+  });
 
-      // Fetch all tables parallel
-      const [
-        resTecnicos,
-        resBrigadas,
-        resInventario,
-        resTools,
-        resActas,
-        resReposiciones,
-        resSwaps,
-        resDevoluciones,
-        resAuditoria,
-        resKits,
-        resUsuarios,
-        resSupervisores
-      ] = await Promise.all([
-        fetch(`${API_BASE}/tecnicos`, { headers }),
-        fetch(`${API_BASE}/brigadas`, { headers }),
-        fetch(`${API_BASE}/inventario`, { headers }),
-        fetch(`${API_BASE}/brigadas/herramientas/todas`, { headers }),
-        fetch(`${API_BASE}/actas`, { headers }),
-        fetch(`${API_BASE}/reposiciones`, { headers }),
-        fetch(`${API_BASE}/swaps`, { headers }),
-        fetch(`${API_BASE}/devoluciones`, { headers }),
-        fetch(`${API_BASE}/auditoria`, { headers }),
-        fetch(`${API_BASE}/kits`, { headers }),
-        fetch(`${API_BASE}/usuarios`, { headers }),
-        fetch(`${API_BASE}/supervisores`, { headers })
-      ]);
-
-      const dataTecnicos = await resTecnicos.json();
-      const dataBrigadas = await resBrigadas.json();
-      const dataInventario = await resInventario.json();
-      const dataTools = await resTools.json();
-      const dataActas = await resActas.json();
-      const dataReposiciones = await resReposiciones.json();
-      const dataSwaps = await resSwaps.json();
-      const dataDevoluciones = await resDevoluciones.json();
-      const dataAuditoria = await resAuditoria.json();
-      const dataKits = await resKits.json();
-      const dataUsuarios = await resUsuarios.json();
-      const dataSupervisores = await resSupervisores.json();
-
-      if (dataTecnicos.success) setTecnicos(dataTecnicos.tecnicos);
-      if (dataBrigadas.success) setBrigadas(dataBrigadas.brigadas);
-      if (dataInventario.success) setInventario(dataInventario.inventario);
-      if (dataTools.success) setBrigadaHerramientas(dataTools.tools);
-      if (dataActas.success) setActas(dataActas.actas);
-      if (dataReposiciones.success) setReposiciones(dataReposiciones.reposiciones);
-      if (dataSwaps.success) setSwaps(dataSwaps.swaps);
-      if (dataDevoluciones.success) setDevoluciones(dataDevoluciones.devoluciones);
-      if (dataAuditoria.success) setAuditoria(dataAuditoria.auditoria);
-      if (dataKits.success) setKits(dataKits.kits);
-      if (dataUsuarios.success) setUsuarios(dataUsuarios.users);
-      if (dataSupervisores.success) setSupervisores(dataSupervisores.supervisores);
-
-      // Hardcode relations statically for supervisor tree views
-      setCoordinadores([
-        { id: 'COORD-001', name: 'William', zone: 'Noroeste Lote 4', campamento: 'Mantenimiento Noroeste' }
-      ]);
-
-    } catch (e) {
-      console.error('❌ ERROR SINCRONIZANDO CON BASE DE DATOS SQLITE:', e);
-    } finally {
-      setLoading(false);
+  const setActiveCampamento = (camp) => {
+    setActiveCampamentoState(camp);
+    if (camp) {
+      localStorage.setItem('ingmelec_active_campamento', JSON.stringify(camp));
+    } else {
+      localStorage.removeItem('ingmelec_active_campamento');
     }
   };
 
+  const hasPermission = useCallback((permKey) => {
+    if (!currentUser) return false;
+    if (currentUser.rol === 'developer' || currentUser.es_developer === 1) return true;
+    const perms = Array.isArray(currentUser.permisos) ? currentUser.permisos : [];
+    if (perms.includes('*')) return true;
+    return perms.includes(permKey);
+  }, [currentUser]);
 
-  const getHeaders = () => {
+  const [kpis, setKpis] = useState(null);
+  const [kpisLoading, setKpisLoading] = useState(false);
+  const [entornoInfo, setEntornoInfo] = useState(null);
+  const [toast, setToast] = useState(null);
+
+  const showToast = (message, type = 'success') => {
+    setToast({ id: Date.now(), message, type });
+    setTimeout(() => {
+      setToast(null);
+    }, 4500);
+  };
+
+  // Helper for authenticated requests
+  const apiFetch = useCallback(async (endpoint, options = {}) => {
+    const token = localStorage.getItem('ingmelec_token') || authToken;
     const headers = {
       'Content-Type': 'application/json',
-      'x-username': currentUser?.username || 'anonymous',
-      'x-user-role': currentRole || 'Guest'
+      ...(token ? { 'Authorization': `Bearer ${token}` } : {}),
+      ...(options.headers || {})
     };
-    const token = localStorage.getItem('gridops_auth_token') || authToken;
-    if (token) {
-      headers['Authorization'] = `Bearer ${token}`;
-    }
-    return headers;
-  };
 
-  const readApiResponse = async (response) => {
-    let payload = {};
+    const res = await fetch(`${API_V2}${endpoint}`, {
+      ...options,
+      headers
+    });
+
+    if (res.status === 401) {
+      // Auto logout on unauthorized
+      localStorage.removeItem('ingmelec_token');
+      localStorage.removeItem('ingmelec_user');
+      setAuthToken(null);
+      setCurrentUser(null);
+      throw new Error('Sesión expirada o no autorizada.');
+    }
+
+    const data = await res.json();
+    return data;
+  }, [authToken]);
+
+  // Login action
+  const login = async (email, password) => {
     try {
-      payload = await response.json();
-    } catch (e) {
-      payload = {};
-    }
-
-    if (!response.ok || !payload.success) {
-      return {
-        success: false,
-        message: payload.message || `Error HTTP ${response.status}: la operacion no pudo completarse.`
-      };
-    }
-
-    return payload;
-  };
-
-  // Authentication Actions (REST POST)
-  const loginUser = async (username, password) => {
-    try {
-      const response = await fetch(`${API_BASE}/auth/login`, {
+      const res = await fetch(`${API_V2}/auth/login`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ username, password })
+        body: JSON.stringify({ email, password })
       });
-
-      const result = await response.json();
-      if (result.success) {
-        setAuthToken(result.token);
-        localStorage.setItem('gridops_auth_token', result.token);
-        setCurrentUser(result.user);
-        setCurrentRole(result.user.role);
-        // Load initial SQL data
-        await loadAllData(result.user.username, result.user.role);
-        return true;
+      const data = await res.json();
+      if (!data.success) {
+        throw new Error(data.message || 'Error al iniciar sesión');
       }
-      return false;
-    } catch (err) {
-      console.error(err);
-      return false;
-    }
-  };
 
-  const logoutUser = async () => {
-    try {
-      await fetch(`${API_BASE}/auth/login`, {
-        method: 'POST',
-        headers: getHeaders(),
-        body: JSON.stringify({ logout: true })
-      });
-    } catch (e) {}
-    setAuthToken(null);
-    localStorage.removeItem('gridops_auth_token');
-    setCurrentUser(null);
-    setCurrentRole(null);
-  };
+      localStorage.setItem('ingmelec_token', data.token);
+      localStorage.setItem('ingmelec_user', JSON.stringify(data.user));
+      setAuthToken(data.token);
+      setCurrentUser(data.user);
 
-  const changeRole = async (newRole) => {
-    setCurrentRole(newRole);
-    // Refresh databases matching role authorization levels
-    await loadAllData(currentUser?.username, newRole);
-  };
-
-  // Deactivate Colaborador (Dar de Baja - SQL UPDATE)
-  const darDeBajaColaborador = async (id) => {
-    try {
-      const response = await fetch(`${API_BASE}/tecnicos/${id}/baja`, {
-        method: 'POST',
-        headers: getHeaders()
-      });
-      const res = await readApiResponse(response);
-      if (res.success) {
-        await loadAllData();
-        
-        // Push notification
-        setNotifications(prev => [
-          { id: `nt-${Date.now()}`, type: 'critical', text: `Baja efectuada con éxito en base de datos. Historial conservado.`, time: 'Ahora', unread: true },
-          ...prev
-        ]);
-      }
-      return res;
-    } catch (e) {
-      console.error(e);
-      return { success: false, message: e.message };
-    }
-  };
-
-  // Add / Edit Technical Expediente
-  const saveTecnico = async (tech) => {
-    try {
-      const isNew = !tech.id || tech.id.startsWith('new') || !tecnicos.some(t => t.id === tech.id);
-      const url = isNew ? `${API_BASE}/tecnicos` : `${API_BASE}/tecnicos/${tech.id}`;
-      const method = isNew ? 'POST' : 'PUT';
-
-      const response = await fetch(url, {
-        method,
-        headers: getHeaders(),
-        body: JSON.stringify(tech)
-      });
-      const res = await readApiResponse(response);
-      if (res.success) {
-        await loadAllData();
-      }
-      return res;
-    } catch (e) {
-      console.error(e);
-      return { success: false, message: e.message };
-    }
-  };
-
-  // Assign technicians crew to squad brigade (SQL UPDATE)
-  const assignTecnicosToBrigada = async (brigadaCode, selectedTechIds) => {
-    try {
-      // Map tech primary key IDs to actual integers
-      const numericIds = selectedTechIds.map(id => parseInt(id) || id);
-
-      const response = await fetch(`${API_BASE}/brigadas/${brigadaCode}/roster`, {
-        method: 'POST',
-        headers: getHeaders(),
-        body: JSON.stringify({ selectedTechIds: numericIds })
-      });
-      const res = await readApiResponse(response);
-      if (res.success) {
-        await loadAllData();
-      }
-      return res;
-    } catch (e) {
-      console.error(e);
-      return { success: false, message: e.message };
-    }
-  };
-
-  // Modify squad vehicle parameter
-  const saveBrigada = async (bData) => {
-    try {
-      const isNew = bData.isNew || !brigadas.some(b => b.id === bData.id);
-      const url = isNew ? `${API_BASE}/brigadas` : `${API_BASE}/brigadas/${bData.id}`;
-      const method = isNew ? 'POST' : 'PUT';
-
-      const response = await fetch(url, {
-        method,
-        headers: getHeaders(),
-        body: JSON.stringify(bData)
-      });
-      const res = await readApiResponse(response);
-      if (res.success) {
-        await loadAllData();
-      }
-      return res;
-    } catch (e) {
-      console.error(e);
-      return { success: false, message: e.message };
-    }
-  };
-
-  const saveBrigadaTools = async (brigadaCode, toolsList, overrideStock = false) => {
-    try {
-      const response = await fetch(`${API_BASE}/brigadas/${brigadaCode}/herramientas`, {
-        method: 'PATCH',
-        headers: getHeaders(),
-        body: JSON.stringify({ toolsList, overrideStock })
-      });
-      const res = await readApiResponse(response);
-      if (res.success) {
-        await loadAllData();
-        return { success: true, message: res.message };
+      if (data.user.campamentos && data.user.campamentos.length > 0) {
+        const principal = data.user.campamentos.find(c => c.es_principal) || data.user.campamentos[0];
+        setActiveCampamento(principal);
       } else {
-        return { success: false, message: res.message, deficits: res.deficits };
+        setActiveCampamento(null);
       }
-    } catch (e) {
-      console.error(e);
-      return { success: false, message: e.message };
+
+      showToast(`¡Bienvenido de nuevo, ${data.user.nombre}!`, 'success');
+      return { success: true };
+    } catch (err) {
+      showToast(err.message, 'error');
+      return { success: false, message: err.message };
     }
   };
 
-  // Update specific tools state on active squad
-  const updateToolState = async (brigadaId, itemCode, newState, observation) => {
+  // Logout action
+  const logout = () => {
+    localStorage.removeItem('ingmelec_token');
+    localStorage.removeItem('ingmelec_user');
+    setAuthToken(null);
+    setCurrentUser(null);
+    setActiveCampamento(null);
+    setKpis(null);
+    showToast('Sesión cerrada correctamente.', 'info');
+  };
+
+  // Fetch Dashboard KPIs
+  const refreshKpis = useCallback(async () => {
+    if (!currentUser) return;
     try {
-      const response = await fetch(`${API_BASE}/brigadas/${brigadaId}/tools/${itemCode}/state`, {
-        method: 'POST',
-        headers: getHeaders(),
-        body: JSON.stringify({ newState, observation })
-      });
-      const res = await readApiResponse(response);
-      if (res.success) {
-        await loadAllData();
+      setKpisLoading(true);
+      const data = await apiFetch('/dashboard/kpis');
+      if (data.success) {
+        setKpis(data.kpis);
       }
-      return res;
-    } catch (e) {
-      console.error(e);
-      return { success: false, message: e.message };
+    } catch (err) {
+      console.error('Error refreshing KPIs:', err);
+    } finally {
+      setKpisLoading(false);
     }
-  };
+  }, [currentUser, apiFetch]);
 
-  // Modify warehouse stock levels (Kárdex adjust)
-  const adjustStockItem = async (code, qty, adjustStatus = null) => {
+  // Fetch Entorno Info (PRUEBAS vs PRODUCCIÓN)
+  const fetchEntorno = useCallback(async () => {
+    if (!currentUser) return;
     try {
-      const response = await fetch(`${API_BASE}/inventario/adjust`, {
-        method: 'POST',
-        headers: getHeaders(),
-        body: JSON.stringify({ code, adjustQty: qty, newStatus: adjustStatus })
-      });
-      const res = await readApiResponse(response);
-      if (res.success) {
-        await loadAllData();
+      const data = await apiFetch('/config/entorno');
+      if (data.success) {
+        setEntornoInfo(data);
       }
-      return res;
-    } catch (e) {
-      console.error(e);
-      return { success: false, message: e.message };
+    } catch (err) {
+      console.error('Error fetching entorno info:', err);
     }
-  };
+  }, [currentUser, apiFetch]);
 
-  // Create delivery act
-  const createActa = async (newActa) => {
-    try {
-      // Map items structure
-      const itemsMap = newActa.items.map(it => ({
-        code: it.code,
-        qty: it.qty
-      }));
+  useEffect(() => {
+    if (currentUser) {
+      refreshKpis();
+      fetchEntorno();
+    }
+  }, [currentUser, refreshKpis, fetchEntorno]);
 
-      // Extract brigade or tech name
-      const destName = newActa.destino.split(': ')[1] || newActa.destino;
-
-      const response = await fetch(`${API_BASE}/actas`, {
-        method: 'POST',
-        headers: getHeaders(),
-        body: JSON.stringify({
-          tipo: newActa.tipo,
-          destino: destName,
-          items: itemsMap,
-          firmado: newActa.firmado,
-          signatureData: newActa.signatureData || null
-        })
-      });
-      const res = await readApiResponse(response);
-      if (res.success) {
-        await loadAllData();
+  // Fetch items with filters and pagination
+  const fetchArticulos = useCallback(async (filters = {}) => {
+    const params = new URLSearchParams();
+    Object.entries(filters).forEach(([k, v]) => {
+      if (v !== undefined && v !== null && v !== '') {
+        params.append(k, v);
       }
-      return res;
-    } catch (e) {
-      console.error(e);
-      return { success: false, message: e.message };
-    }
-  };
+    });
+    return await apiFetch(`/articulos?${params.toString()}`);
+  }, [apiFetch]);
 
-  const firmarActa = async (code, signatureData = null, observaciones = '') => {
-    try {
-      const response = await fetch(`${API_BASE}/actas/${code}/firmar`, {
-        method: 'POST',
-        headers: getHeaders(),
-        body: JSON.stringify({ signatureData, observaciones })
-      });
-      const res = await readApiResponse(response);
-      if (res.success) {
-        await loadAllData();
+  // Get item by ID with full details & movements
+  const getArticuloById = useCallback(async (id) => {
+    return await apiFetch(`/articulos/${id}`);
+  }, [apiFetch]);
+
+  // Update item
+  const updateArticulo = useCallback(async (id, data) => {
+    const res = await apiFetch(`/articulos/${id}`, {
+      method: 'PUT',
+      body: JSON.stringify(data)
+    });
+    if (res.success) {
+      showToast('Artículo actualizado correctamente.', 'success');
+      refreshKpis();
+    } else {
+      showToast(res.message || 'Error al actualizar', 'error');
+    }
+    return res;
+  }, [apiFetch, refreshKpis]);
+
+  // Create item
+  const createArticulo = useCallback(async (data) => {
+    const res = await apiFetch('/articulos', {
+      method: 'POST',
+      body: JSON.stringify(data)
+    });
+    if (res.success) {
+      showToast('Artículo registrado exitosamente en MySQL.', 'success');
+      refreshKpis();
+    } else {
+      showToast(res.message || 'Error al registrar', 'error');
+    }
+    return res;
+  }, [apiFetch, refreshKpis]);
+
+  // Delete/Deactivate item
+  const deleteArticulo = useCallback(async (id) => {
+    const res = await apiFetch(`/articulos/${id}`, {
+      method: 'DELETE'
+    });
+    if (res.success) {
+      showToast('Artículo retirado del inventario activo.', 'info');
+      refreshKpis();
+    } else {
+      showToast(res.message || 'Error al retirar', 'error');
+    }
+    return res;
+  }, [apiFetch, refreshKpis]);
+
+  // Register movement
+  const registrarMovimiento = useCallback(async (movData) => {
+    const res = await apiFetch('/movimientos', {
+      method: 'POST',
+      body: JSON.stringify(movData)
+    });
+    if (res.success) {
+      showToast(`Movimiento de ${movData.tipo_movimiento} registrado con éxito.`, 'success');
+      refreshKpis();
+    } else {
+      showToast(res.message || 'Error en movimiento', 'error');
+    }
+    return res;
+  }, [apiFetch, refreshKpis]);
+
+  // Fetch movements
+  const fetchMovimientos = useCallback(async (limit = 100) => {
+    return await apiFetch(`/movimientos?limit=${limit}`);
+  }, [apiFetch]);
+
+  // Fetch reports
+  const fetchReporteConsolidado = useCallback(async (params = {}) => {
+    const query = new URLSearchParams();
+    Object.entries(params).forEach(([k, v]) => {
+      if (v !== undefined && v !== null && v !== '') query.append(k, v);
+    });
+    const qs = query.toString();
+    return await apiFetch(`/reportes/consolidado${qs ? `?${qs}` : ''}`);
+  }, [apiFetch]);
+
+  // Fetch audit log
+  const fetchAuditoria = useCallback(async (limit = 100) => {
+    return await apiFetch(`/auditoria?limit=${limit}`);
+  }, [apiFetch]);
+
+  // Users management (Exclusivo Developer)
+  const fetchUsuarios = useCallback(async () => {
+    return await apiFetch('/usuarios');
+  }, [apiFetch]);
+
+  const createUsuario = useCallback(async (userData) => {
+    const res = await apiFetch('/usuarios', {
+      method: 'POST',
+      body: JSON.stringify(userData)
+    });
+    if (res.success) {
+      showToast('Usuario creado correctamente.', 'success');
+    } else {
+      showToast(res.message || 'Error creando usuario', 'error');
+    }
+    return res;
+  }, [apiFetch]);
+
+  const updateUsuario = useCallback(async (id, userData) => {
+    const res = await apiFetch(`/usuarios/${id}`, {
+      method: 'PUT',
+      body: JSON.stringify(userData)
+    });
+    if (res.success) {
+      showToast('Usuario actualizado correctamente.', 'success');
+    } else {
+      showToast(res.message || 'Error actualizando usuario', 'error');
+    }
+    return res;
+  }, [apiFetch]);
+
+  const updateUsuarioEstado = useCallback(async (id, activo) => {
+    const res = await apiFetch(`/usuarios/${id}/estado`, {
+      method: 'PATCH',
+      body: JSON.stringify({ activo })
+    });
+    if (res.success) {
+      showToast(`Usuario ${activo ? 'activado' : 'desactivado'} con éxito.`, 'info');
+    } else {
+      showToast(res.message || 'Error cambiando estado de usuario', 'error');
+    }
+    return res;
+  }, [apiFetch]);
+
+  const updateUsuarioPermisos = useCallback(async (id, permisos) => {
+    const res = await apiFetch(`/usuarios/${id}/permisos`, {
+      method: 'PUT',
+      body: JSON.stringify({ permisos })
+    });
+    if (res.success) {
+      showToast('Permisos del usuario actualizados.', 'success');
+    } else {
+      showToast(res.message || 'Error actualizando permisos', 'error');
+    }
+    return res;
+  }, [apiFetch]);
+
+  const recoverUsuarioPassword = useCallback(async (id, nuevaPassword) => {
+    const res = await apiFetch(`/usuarios/${id}/recuperar`, {
+      method: 'POST',
+      body: JSON.stringify({ nuevaPassword })
+    });
+    if (res.success) {
+      showToast('Contraseña restablecida exitosamente.', 'success');
+    } else {
+      showToast(res.message || 'Error restableciendo contraseña', 'error');
+    }
+    return res;
+  }, [apiFetch]);
+
+  const fetchUsuariosAuditoria = useCallback(async () => {
+    return await apiFetch('/usuarios/auditoria');
+  }, [apiFetch]);
+
+  // ==========================================
+  // CAMPAMENTOS & ALMACENES (AUDITORÍAS)
+  // ==========================================
+  const fetchCampamentos = useCallback(async () => {
+    return await apiFetch('/campamentos');
+  }, [apiFetch]);
+
+  const createCampamento = useCallback(async (campData) => {
+    const res = await apiFetch('/campamentos', {
+      method: 'POST',
+      body: JSON.stringify(campData)
+    });
+    if (res.success) {
+      showToast('Campamento registrado exitosamente.', 'success');
+    } else {
+      showToast(res.message || 'Error al registrar campamento.', 'error');
+    }
+    return res;
+  }, [apiFetch]);
+
+  const createAlmacen = useCallback(async (campamentoId, almData) => {
+    const res = await apiFetch(`/campamentos/${campamentoId}/almacenes`, {
+      method: 'POST',
+      body: JSON.stringify(almData)
+    });
+    if (res.success) {
+      showToast('Almacén/Bodega agregada correctamente.', 'success');
+    } else {
+      showToast(res.message || 'Error al agregar almacén.', 'error');
+    }
+    return res;
+  }, [apiFetch]);
+
+  // ==========================================
+  // LEVANTAMIENTOS Y AUDITORÍAS EN CAMPO
+  // ==========================================
+  const fetchLevantamientos = useCallback(async (filters = {}) => {
+    const params = new URLSearchParams();
+    Object.entries(filters).forEach(([k, v]) => {
+      if (v !== undefined && v !== null && v !== '' && v !== 'TODOS') {
+        params.append(k, v);
       }
-      return res;
-    } catch (e) {
-      console.error(e);
-      return { success: false, message: e.message };
-    }
-  };
+    });
+    return await apiFetch(`/levantamientos?${params.toString()}`);
+  }, [apiFetch]);
 
-  const addAnnexToActa = async (code, text) => {
-    try {
-      const response = await fetch(`${API_BASE}/actas/${code}/anexos`, {
-        method: 'POST',
-        headers: getHeaders(),
-        body: JSON.stringify({ text })
-      });
-      const res = await readApiResponse(response);
-      if (res.success) {
-        await loadAllData();
-        return { success: true, message: res.message };
+  const getLevantamientoById = useCallback(async (id) => {
+    return await apiFetch(`/levantamientos/${id}`);
+  }, [apiFetch]);
+
+  const createLevantamiento = useCallback(async (data) => {
+    const res = await apiFetch('/levantamientos', {
+      method: 'POST',
+      body: JSON.stringify(data)
+    });
+    if (res.success) {
+      showToast(`Levantamiento ${res.codigo_levantamiento || ''} iniciado con éxito.`, 'success');
+    } else {
+      showToast(res.message || 'Error al crear levantamiento.', 'error');
+    }
+    return res;
+  }, [apiFetch]);
+
+  const updateLevantamiento = useCallback(async (id, data) => {
+    const res = await apiFetch(`/levantamientos/${id}`, {
+      method: 'PUT',
+      body: JSON.stringify(data)
+    });
+    if (res.success) {
+      showToast('Datos del levantamiento actualizados.', 'success');
+    } else {
+      showToast(res.message || 'Error al actualizar levantamiento.', 'error');
+    }
+    return res;
+  }, [apiFetch]);
+
+  const fetchLevantamientoItems = useCallback(async (levId, filters = {}) => {
+    const params = new URLSearchParams();
+    Object.entries(filters).forEach(([k, v]) => {
+      if (v !== undefined && v !== null && v !== '' && v !== 'TODOS') {
+        params.append(k, v);
       }
-      return { success: false, message: res.message };
-    } catch (e) {
-      console.error(e);
-      return { success: false, message: e.message };
-    }
-  };
+    });
+    return await apiFetch(`/levantamientos/${levId}/items?${params.toString()}`);
+  }, [apiFetch]);
 
-  const anularActa = async (code) => {
-    try {
-      const response = await fetch(`${API_BASE}/actas/${code}/anular`, {
-        method: 'POST',
-        headers: getHeaders()
-      });
-      const res = await readApiResponse(response);
-      if (res.success) {
-        await loadAllData();
+  const addLevantamientoItem = useCallback(async (levId, itemData) => {
+    const res = await apiFetch(`/levantamientos/${levId}/items`, {
+      method: 'POST',
+      body: JSON.stringify(itemData)
+    });
+    if (res.success) {
+      if (res.warning_duplicado) {
+        showToast(`Artículo guardado con advertencia: ${res.warning_duplicado.mensaje}`, 'info');
+      } else {
+        showToast('Artículo registrado en el levantamiento.', 'success');
       }
-      return res;
-    } catch (e) {
-      console.error(e);
-      return { success: false, message: e.message };
+    } else {
+      showToast(res.message || 'Error al registrar artículo.', 'error');
     }
-  };
+    return res;
+  }, [apiFetch]);
 
-  // Solve replacements tickets
-  const resolveReposicion = async (code, decision) => {
-    try {
-      const response = await fetch(`${API_BASE}/reposiciones/${code}/resolve`, {
-        method: 'POST',
-        headers: getHeaders(),
-        body: JSON.stringify({ decision })
-      });
-      const res = await readApiResponse(response);
-      if (res.success) {
-        await loadAllData();
-      }
-      return res;
-    } catch (e) {
-      console.error(e);
-      return { success: false, message: e.message };
+  const updateLevantamientoItem = useCallback(async (levId, itemId, itemData) => {
+    const res = await apiFetch(`/levantamientos/${levId}/items/${itemId}`, {
+      method: 'PUT',
+      body: JSON.stringify(itemData)
+    });
+    if (res.success) {
+      showToast('Artículo actualizado correctamente.', 'success');
+    } else {
+      showToast(res.message || 'Error al actualizar artículo.', 'error');
     }
-  };
+    return res;
+  }, [apiFetch]);
 
-  // Swap field tools
-  const registerSwap = async (swapData) => {
-    try {
-      const response = await fetch(`${API_BASE}/swaps`, {
-        method: 'POST',
-        headers: getHeaders(),
-        body: JSON.stringify(swapData)
-      });
-      const res = await readApiResponse(response);
-      if (res.success) {
-        await loadAllData();
-      }
-      return res;
-    } catch (e) {
-      console.error(e);
-      return { success: false, message: e.message };
+  const deleteLevantamientoItem = useCallback(async (levId, itemId) => {
+    const res = await apiFetch(`/levantamientos/${levId}/items/${itemId}`, {
+      method: 'DELETE'
+    });
+    if (res.success) {
+      showToast('Artículo eliminado del levantamiento.', 'info');
+    } else {
+      showToast(res.message || 'Error al eliminar artículo.', 'error');
     }
-  };
+    return res;
+  }, [apiFetch]);
 
-  // Checkout returns
-  const checkoutReturn = async (code, returnedQty, estado, observacion) => {
-    try {
-      const response = await fetch(`${API_BASE}/devoluciones/${code}`, {
-        method: 'PUT',
-        headers: getHeaders(),
-        body: JSON.stringify({ cantDevuelta: returnedQty, estado, observacion })
-      });
-      const res = await readApiResponse(response);
-      if (res.success) {
-        await loadAllData();
-      }
-      return res;
-    } catch (e) {
-      console.error(e);
-      return { success: false, message: e.message };
+  const importLevantamientoItems = useCallback(async (levId, items) => {
+    const res = await apiFetch(`/levantamientos/${levId}/import-items`, {
+      method: 'POST',
+      body: JSON.stringify({ items })
+    });
+    if (res.success) {
+      showToast(res.message || `${items.length} artículos importados.`, 'success');
+    } else {
+      showToast(res.message || 'Error al importar artículos.', 'error');
     }
-  };
+    return res;
+  }, [apiFetch]);
 
-  const saveUsuario = async (uData) => {
-    // Standard secure profiles manager endpoint helper
-    try {
-      const response = await fetch(`${API_BASE}/usuarios`, {
-        method: 'POST',
-        headers: getHeaders(),
-        body: JSON.stringify(uData)
-      });
-      const res = await readApiResponse(response);
-      if (res.success) {
-        await loadAllData();
-      }
-      return res;
-    } catch (e) {
-      console.error(e);
-      return { success: false, message: e.message };
+  const consolidarLevantamiento = useCallback(async (levId, payload = {}) => {
+    const res = await apiFetch(`/levantamientos/${levId}/consolidar`, {
+      method: 'POST',
+      body: JSON.stringify(payload)
+    });
+    if (res.success) {
+      showToast(`¡Consolidación exitosa! ${res.articulos_incorporados} artículos agregados al inventario maestro.`, 'success');
+      refreshKpis();
+    } else {
+      showToast(res.message || 'Error al consolidar levantamiento.', 'error');
     }
-  };
+    return res;
+  }, [apiFetch, refreshKpis]);
 
-  const toggleUsuarioStatus = async (id) => {
-    try {
-      const response = await fetch(`${API_BASE}/usuarios/${id}/status`, {
-        method: 'POST',
-        headers: getHeaders()
-      });
-      const res = await readApiResponse(response);
-      if (res.success) {
-        await loadAllData();
-      }
-      return res;
-    } catch (e) {
-      console.error(e);
-      return { success: false, message: e.message };
-    }
-  };
+  // Dynamic Catalogs & Auto-coding
+  const fetchNextCode = useCallback(async (area) => {
+    return await apiFetch(`/articulos/next-code?area=${encodeURIComponent(area || 'ALMACEN')}`);
+  }, [apiFetch]);
 
-  const clearNotifications = () => {
-    setNotifications(prev => prev.map(n => ({ ...n, unread: false })));
-  };
+  const fetchCategorias = useCallback(async (area) => {
+    return await apiFetch(`/catalogos/categorias${area ? `?area=${encodeURIComponent(area)}` : ''}`);
+  }, [apiFetch]);
 
-  // Role Filtering selectors based on Hierarchy Rules
-  // Developer: ve todo
-  // Gerente: ve todo
-  // Coordinador (William): ve solo sus supervisores, brigadas, técnicos, zona Lote 4.
-  // Supervisor: ve solo sus brigadas, técnicos, herramientas asignadas.
-  
-  const getFilteredBrigadas = () => {
-    if (currentRole === 'Developer' || currentRole === 'Gerente') {
-      return brigadas || [];
+  const createCategoria = useCallback(async (payload) => {
+    const res = await apiFetch('/catalogos/categorias', {
+      method: 'POST',
+      body: JSON.stringify(payload)
+    });
+    if (res.success) {
+      showToast(`Categoría "${payload.nombre}" agregada al catálogo.`, 'success');
+    } else {
+      showToast(res.message || 'Error registrando categoría.', 'error');
     }
-    if (currentRole === 'Coordinador') {
-      return (brigadas || []).filter(b => b && b.zone === 'Noroeste Lote 4');
-    }
-    if (currentRole?.startsWith('Supervisor')) {
-      const matchedSup = (supervisores || []).find(s => {
-        if (!s || !s.name || !currentUser || !currentUser.username) return false;
-        const sNameLower = s.name.toLowerCase();
-        const userLower = currentUser.username.toLowerCase();
-        const sFirstWord = s.name.split(' ')[0]?.toLowerCase() || '';
-        return sNameLower.includes(userLower) || userLower.includes(sFirstWord);
-      });
-      const supCode = matchedSup ? matchedSup.id : 'SUP-001';
-      return (brigadas || []).filter(b => b && b.supervisorId === supCode);
-    }
-    return [];
-  };
+    return res;
+  }, [apiFetch, showToast]);
 
-  const getFilteredTecnicos = () => {
-    if (currentRole === 'Developer' || currentRole === 'Gerente') {
-      return tecnicos || [];
-    }
-    if (currentRole === 'Coordinador') {
-      return (tecnicos || []).filter(t => t && t.coordinatorId === 'COORD-001');
-    }
-    if (currentRole?.startsWith('Supervisor')) {
-      const matchedSup = (supervisores || []).find(s => {
-        if (!s || !s.name || !currentUser || !currentUser.username) return false;
-        const sNameLower = s.name.toLowerCase();
-        const userLower = currentUser.username.toLowerCase();
-        const sFirstWord = s.name.split(' ')[0]?.toLowerCase() || '';
-        return sNameLower.includes(userLower) || userLower.includes(sFirstWord);
-      });
-      const supCode = matchedSup ? matchedSup.id : 'SUP-001';
-      return (tecnicos || []).filter(t => t && t.supervisorId === supCode);
-    }
-    return [];
-  };
+  const fetchCustodios = useCallback(async (q) => {
+    return await apiFetch(`/catalogos/custodios${q ? `?q=${encodeURIComponent(q)}` : ''}`);
+  }, [apiFetch]);
 
-  const getFilteredSupervisores = () => {
-    if (currentRole === 'Developer' || currentRole === 'Gerente') {
-      return supervisores || [];
+  const createCustodio = useCallback(async (payload) => {
+    const res = await apiFetch('/catalogos/custodios', {
+      method: 'POST',
+      body: JSON.stringify(payload)
+    });
+    if (res.success) {
+      showToast(`Responsable "${payload.nombre}" agregado al catálogo.`, 'success');
+    } else {
+      showToast(res.message || 'Error registrando responsable.', 'error');
     }
-    if (currentRole === 'Coordinador') {
-      return (supervisores || []).filter(s => s && s.coordinatorId === 'COORD-001');
-    }
-    if (currentRole?.startsWith('Supervisor')) {
-      const matchedSup = (supervisores || []).find(s => {
-        if (!s || !s.name || !currentUser || !currentUser.username) return false;
-        const sNameLower = s.name.toLowerCase();
-        const userLower = currentUser.username.toLowerCase();
-        const sFirstWord = s.name.split(' ')[0]?.toLowerCase() || '';
-        return sNameLower.includes(userLower) || userLower.includes(sFirstWord);
-      });
-      const supCode = matchedSup ? matchedSup.id : 'SUP-001';
-      return (supervisores || []).filter(s => s && s.id === supCode);
-    }
-    return [];
-  };
+    return res;
+  }, [apiFetch, showToast]);
 
-  const getFilteredReposiciones = () => {
-    if (currentRole === 'Developer' || currentRole === 'Gerente') {
-      return reposiciones || [];
-    }
-    if (currentRole === 'Coordinador') {
-      return (reposiciones || []).filter(r => r && r.coordinatorId === 'COORD-001');
-    }
-    if (currentRole?.startsWith('Supervisor')) {
-      const isIsaac = currentUser?.username?.toLowerCase() === 'isaac';
-      const matchedSup = (supervisores || []).find(s => {
-        if (!s || !s.name || !currentUser || !currentUser.username) return false;
-        const sNameLower = s.name.toLowerCase();
-        const userLower = currentUser.username.toLowerCase();
-        const sFirstWord = s.name.split(' ')[0]?.toLowerCase() || '';
-        return sNameLower.includes(userLower) || userLower.includes(sFirstWord);
-      });
-      const supCode = matchedSup ? matchedSup.id : (isIsaac ? 'SUP-001' : 'SUP-002');
-      return (reposiciones || []).filter(r => r && r.supervisorId === supCode);
-    }
-    return [];
-  };
+  const fetchUbicaciones = useCallback(async () => {
+    return await apiFetch('/catalogos/ubicaciones');
+  }, [apiFetch]);
 
   return (
-    <AppContext.Provider value={{
-      currentUser,
-      currentRole,
-      loginUser,
-      logoutUser,
-      changeRole,
-      
-      coordinadores,
-      supervisores,
-      brigadas,
-      tecnicos,
-      inventario,
-      brigadaHerramientas,
-      actas,
-      reposiciones,
-      swaps,
-      devoluciones,
-      auditoria,
-      kits,
-      usuarios,
-      notifications,
-      loading,
-      
-      clearNotifications,
-      darDeBajaColaborador,
-      saveTecnico,
-      assignTecnicosToBrigada,
-      saveBrigada,
-      saveBrigadaTools,
-      updateToolState,
-      adjustStockItem,
-      createActa,
-      firmarActa,
-      anularActa,
-      addAnnexToActa,
-      resolveReposicion,
-      registerSwap,
-      checkoutReturn,
-      saveUsuario,
-      toggleUsuarioStatus,
-      
-      getFilteredBrigadas,
-      getFilteredTecnicos,
-      getFilteredSupervisores,
-      getFilteredReposiciones
-    }}>
+    <AppContext.Provider
+      value={{
+        currentUser,
+        currentRole: currentUser?.rol,
+        authToken,
+        login,
+        logout,
+        kpis,
+        kpisLoading,
+        refreshKpis,
+        entornoInfo,
+        fetchEntorno,
+        fetchArticulos,
+        getArticuloById,
+        updateArticulo,
+        createArticulo,
+        deleteArticulo,
+        registrarMovimiento,
+        fetchMovimientos,
+        fetchReporteConsolidado,
+        fetchAuditoria,
+        fetchUsuarios,
+        createUsuario,
+        updateUsuario,
+        updateUsuarioEstado,
+        updateUsuarioPermisos,
+        recoverUsuarioPassword,
+        fetchUsuariosAuditoria,
+        activeCampamento,
+        setActiveCampamento,
+        hasPermission,
+        // Levantamientos & Campamentos
+        fetchCampamentos,
+        createCampamento,
+        createAlmacen,
+        fetchLevantamientos,
+        getLevantamientoById,
+        createLevantamiento,
+        updateLevantamiento,
+        fetchLevantamientoItems,
+        addLevantamientoItem,
+        updateLevantamientoItem,
+        deleteLevantamientoItem,
+        importLevantamientoItems,
+        consolidarLevantamiento,
+        // Dynamic Catalogs & Codes
+        fetchNextCode,
+        fetchCategorias,
+        createCategoria,
+        fetchCustodios,
+        createCustodio,
+        fetchUbicaciones,
+        showToast
+      }}
+    >
       {children}
+      {toast && (
+        <div
+          className={`fixed bottom-6 right-6 z-50 px-5 py-3 rounded-xl shadow-2xl flex items-center space-x-3 text-sm font-medium transition-all duration-300 transform translate-y-0 ${
+            toast.type === 'success'
+              ? 'bg-emerald-600 text-white'
+              : toast.type === 'error'
+              ? 'bg-rose-600 text-white'
+              : 'bg-slate-800 text-white'
+          }`}
+        >
+          <span>{toast.message}</span>
+        </div>
+      )}
     </AppContext.Provider>
   );
 };

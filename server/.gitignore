@@ -1,0 +1,13 @@
+# Server secrets, backups and local test artifacts
+.env
+.env.*
+*.env
+*.env.*
+!.env.example
+backups/
+tests/
+scripts/
+data/*.xlsx
+start-test-server.js
+test-hash.js
+check-db.js

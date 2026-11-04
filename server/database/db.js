@@ -49,6 +49,11 @@ export function resetPool() {
   }
 }
 
+// Override pool for isolated testing harness (prevents any connection to production)
+export function setPoolOverride(override) {
+  pool = override;
+}
+
 class MySQLWrapper {
   constructor(connection) {
     this.connection = connection;
@@ -68,6 +73,12 @@ class MySQLWrapper {
       return 'ROLLBACK';
     }
     return sql;
+  }
+
+  // query(): standard mysql2 promise query
+  async query(sql, params = []) {
+    const preparedSql = this._prepareSql(sql);
+    return this.connection.query(preparedSql, params);
   }
 
   // db.get(): returns first row or null

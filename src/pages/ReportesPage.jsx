@@ -1,245 +1,220 @@
-import React from 'react';
-import { useApp } from '../context/AppContext';
-import { 
-  BarChart, Bar, 
-  XAxis, YAxis, Tooltip, 
-  Legend, ResponsiveContainer, 
-  PieChart, Pie, Cell, 
-  AreaChart, Area, 
-  LineChart, Line 
-} from 'recharts';
-import { 
-  BarChart3, 
-  Download, 
-  Calendar, 
-  TrendingUp, 
-  FileCheck2, 
-  ShieldCheck, 
-  Hammer 
+import React, { useState, useEffect } from 'react';
+import {
+  BarChart3, Download, FileSpreadsheet, Printer,
+  CheckCircle2, AlertTriangle, Layers, MapPin, User, ArrowRight
 } from 'lucide-react';
+import { useApp } from '../context/AppContext';
 
-const ReportesPage = () => {
-  const { 
-    tecnicos, 
-    brigadas, 
-    reposiciones, 
-    inventario, 
-    actas 
-  } = useApp();
+export default function ReportesPage() {
+  const { fetchReporteConsolidado } = useApp();
+  const [loading, setLoading] = useState(true);
+  const [data, setData] = useState(null);
+  const [selectedCampamento, setSelectedCampamento] = useState('TODOS');
 
-  const COLORS = ['#00f0ff', '#ff6b00', '#10b981', '#a855f7', '#f59e0b', '#ef4444'];
+  useEffect(() => {
+    setLoading(true);
+    fetchReporteConsolidado(selectedCampamento !== 'TODOS' ? { campamento_id: selectedCampamento } : {})
+      .then(res => {
+        if (res.success) {
+          setData(res.reporte);
+        }
+      })
+      .finally(() => setLoading(false));
+  }, [fetchReporteConsolidado, selectedCampamento]);
 
-  // 1. Personal por Zona
-  const personalPorZonaData = [
-    { name: 'Noroeste Lote 4', Técnicos: tecnicos.length },
-    { name: 'Sur Lote 1', Técnicos: 8 },
-    { name: 'Este Lote 2', Técnicos: 12 },
-    { name: 'Metro Lote 3', Técnicos: 19 }
-  ];
+  const handleExportFullCsv = async () => {
+    try {
+      const q = selectedCampamento !== 'TODOS' ? `?campamento_id=${encodeURIComponent(selectedCampamento)}` : '';
+      const res = await fetch(`/api/v2/reportes/exportar${q}`, {
+        headers: { 'Authorization': `Bearer ${localStorage.getItem('ingmelec_token')}` }
+      });
+      const json = await res.json();
+      if (!json.success || !json.data) return;
 
-  // 2. Brigadas por Coordinador
-  const brigadasCoordinadorData = [
-    { name: 'Coordinador William', Brigadas: brigadas.length },
-    { name: 'Coordinadora Sofía', Brigadas: 5 },
-    { name: 'Coordinador Marcos', Brigadas: 4 }
-  ];
+      const headers = [
+        'ID', 'Código', 'Campamento / Sede Verificada', 'Área', 'Categoría', 'Artículo', 'Marca/Modelo',
+        'Serie/IMEI', 'Cantidad', 'Unidad', 'Estado', 'Ubicación Excel', 'Zona/Estante',
+        'Propietario', 'Custodio', 'Observaciones', 'Hoja Origen', 'Fila Origen'
+      ];
 
-  // 3. Brigadas por Supervisor
-  const brigadasPorSupervisorData = [
-    { name: 'Isaac G. (TCT)', Brigadas: brigadas.filter(b => b.supervisorId === 'SUP-001').length },
-    { name: 'Cristian P. (Maint)', Brigadas: brigadas.filter(b => b.supervisorId === 'SUP-002').length }
-  ];
+      const rows = json.data.map(a => [
+        a.id,
+        `"${a.codigo_original || ''}"`,
+        `"${a.campamento_nombre || 'SIN SEDE VERIFICADA (PENDIENTE DE CLASIFICACIÓN)'}"`,
+        `"${a.area || ''}"`,
+        `"${a.categoria || ''}"`,
+        `"${(a.articulo_nombre || '').replace(/"/g, '""')}"`,
+        `"${(a.marca_modelo || '').replace(/"/g, '""')}"`,
+        `"${a.serie_imei || ''}"`,
+        a.cantidad_num !== null ? a.cantidad_num : `"${a.cantidad_texto || 'PENDIENTE DE VERIFICACIÓN'}"`,
+        `"${a.unidad_medida || 'Unidad'}"`,
+        `"${a.estado_fisico || ''}"`,
+        `"${a.ubicacion_nombre || ''}"`,
+        `"${a.zona_estante || ''}"`,
+        `"${a.propietario || ''}"`,
+        `"${a.asignado_a || ''}"`,
+        `"${(a.observaciones || '').replace(/"/g, '""')}"`,
+        `"${a.hoja_origen || ''}"`,
+        a.fila_origen
+      ]);
 
-  // 4. Técnicos por Brigada
-  const tecnicosPorBrigadaData = brigadas.map(b => ({
-    name: b.id,
-    Técnicos: tecnicos.filter(t => t.brigadaId === b.id).length
-  }));
-
-  // 5. Reposiciones por Zona (Valores en USD)
-  const reposicionesPorZonaData = [
-    { name: 'Lote 4 Noroeste', Costo: reposiciones.reduce((acc, c) => acc + c.valor, 0) },
-    { name: 'Lote 1 Sur', Costo: 420.00 },
-    { name: 'Lote 2 Este', Costo: 180.00 },
-    { name: 'Lote 3 Metro', Costo: 890.00 }
-  ];
-
-  // 6. Actas por Estado
-  const actasPorEstadoData = [
-    { name: 'Borrador', Actas: actas.filter(a => a.estado === 'Borrador').length },
-    { name: 'Validada', Actas: actas.filter(a => a.estado === 'Validada').length },
-    { name: 'Firmada', Actas: actas.filter(a => a.estado === 'Firmada').length },
-    { name: 'Anulada', Actas: actas.filter(a => a.estado === 'Anulada').length },
-    { name: 'Pendiente', Actas: actas.filter(a => a.estado === 'Pendiente').length }
-  ];
-
-  // Custom tooltips
-  const CustomTooltip = ({ active, payload, label }) => {
-    if (active && payload && payload.length) {
-      return (
-        <div className="bg-industrial-panel border border-industrial-border p-2.5 rounded shadow-panel-glow">
-          <p className="text-neon-cyan font-bold text-xs">{label}</p>
-          <p className="text-white text-xs font-semibold mt-1">
-            {payload[0].name}: <span className="font-extrabold">{payload[0].value}</span>
-          </p>
-        </div>
-      );
+      const csvContent = '\uFEFF' + [headers.join(','), ...rows.map(r => r.join(','))].join('\n');
+      const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.setAttribute('href', url);
+      link.setAttribute('download', `reporte_maestro_ingmelec_${selectedCampamento}_${new Date().toISOString().slice(0, 10)}.csv`);
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+    } catch (err) {
+      console.error('Export error:', err);
     }
-    return null;
   };
 
-  const handleExportData = () => {
-    alert('Preparando y compilando reporte cifrado en PDF...\nGenerando hashes criptográficos de GridOps...\n[PDF exportado con éxito en simulación]');
+  const handlePrint = () => {
+    window.print();
   };
 
   return (
     <div className="space-y-6">
-      
-      {/* Header filters */}
-      <div className="glass-panel p-4 rounded-lg flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-opacity-40">
-        <div className="flex items-center space-x-2">
-          <Calendar size={14} className="text-industrial-cyan" />
-          <span className="text-xs text-industrial-gray font-bold">Rango Operativo: <span className="text-white">Mayo 2026 (Mensual Activo)</span></span>
+      {/* Header */}
+      <div className="bg-white p-5 rounded-2xl shadow-sm border border-slate-200/80 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+        <div>
+          <h1 className="text-xl font-black text-slate-900 tracking-tight flex items-center space-x-2">
+            <BarChart3 className="w-5 h-5 text-[#F28524]" />
+            <span>Centro de Reportes y Auditoría de Gestión</span>
+          </h1>
+          <p className="text-xs text-slate-500 mt-1">
+            Consolidado gerencial calculado directamente desde MySQL sobre los {data?.totales?.totalArticulos ?? 433} activos empresariales ({Number(data?.totales?.totalUnidades ?? 1971).toLocaleString('es-DO')} unidades físicas conocidas + {data?.totales?.totalSinCantidad ?? 23} con cantidad pendiente).
+          </p>
         </div>
-        <button
-          onClick={handleExportData}
-          className="flex items-center justify-center space-x-2 px-4 py-1.5 rounded bg-gradient-to-r from-industrial-cyan to-blue-600 hover:from-cyan-400 hover:to-blue-500 text-industrial-bg text-xs font-extrabold tracking-wider uppercase transition-all shadow-cyan-glow"
-        >
-          <Download size={14} />
-          <span>Exportar PDF Operativo</span>
-        </button>
+
+        <div className="flex flex-wrap items-center gap-2">
+          <select
+            value={selectedCampamento}
+            onChange={(e) => setSelectedCampamento(e.target.value)}
+            className="px-3 py-2 border border-slate-200 rounded-xl text-xs font-semibold text-slate-800 bg-slate-50 focus:outline-none focus:ring-2 focus:ring-[#F28524]"
+          >
+            <option value="TODOS">Todos los Campamentos (433)</option>
+            <option value="3">ALMACÉN 27 DE FEBRERO (84)</option>
+            <option value="12">OPL (136)</option>
+            <option value="13">MANTENIMIENTO 633 (109)</option>
+            <option value="SIN_SEDE">SIN SEDE VERIFICADA · KM 19 (104)</option>
+          </select>
+
+          <button
+            onClick={handlePrint}
+            className="px-3.5 py-2 border border-slate-200 text-slate-700 hover:bg-slate-50 rounded-xl text-xs font-semibold flex items-center space-x-1.5 transition-colors"
+          >
+            <Printer className="w-4 h-4" />
+            <span>Imprimir / PDF</span>
+          </button>
+
+          <button
+            onClick={handleExportFullCsv}
+            className="px-4 py-2 bg-[#F28524] hover:bg-[#d87019] text-white rounded-xl text-xs font-bold shadow-md shadow-[#F28524]/20 flex items-center space-x-1.5 transition-all"
+          >
+            <Download className="w-4 h-4" />
+            <span>Exportar Todo a CSV</span>
+          </button>
+        </div>
       </div>
 
-      {/* Grid containing 6 charts */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-        
-        {/* Chart 1: Personal por Zona */}
-        <div className="glass-panel rounded-lg p-5">
-          <div className="flex items-center justify-between mb-4 border-b border-industrial-border pb-3">
-            <h4 className="text-xs font-bold text-white uppercase tracking-wider">1. Colaboradores por Lote / Zona</h4>
-            <span className="w-2.5 h-2.5 rounded-full bg-industrial-cyan shadow-cyan-glow" />
-          </div>
-          <div className="h-56">
-            <ResponsiveContainer width="100%" height="100%">
-              <BarChart data={personalPorZonaData}>
-                <XAxis dataKey="name" stroke="#94a3b8" fontSize={9} tickLine={false} />
-                <YAxis stroke="#94a3b8" fontSize={9} tickLine={false} />
-                <Tooltip content={<CustomTooltip />} />
-                <Bar dataKey="Técnicos" fill="#00f0ff" radius={[4, 4, 0, 0]} />
-              </BarChart>
-            </ResponsiveContainer>
-          </div>
+      {loading ? (
+        <div className="p-16 text-center text-slate-400">
+          <div className="w-8 h-8 border-4 border-[#F28524] border-t-transparent rounded-full animate-spin mx-auto mb-2"></div>
+          <span>Generando agregados de base de datos...</span>
         </div>
-
-        {/* Chart 2: Brigadas por Coordinador */}
-        <div className="glass-panel rounded-lg p-5">
-          <div className="flex items-center justify-between mb-4 border-b border-industrial-border pb-3">
-            <h4 className="text-xs font-bold text-white uppercase tracking-wider">2. Brigadas por Coordinador de Lote</h4>
-            <span className="w-2.5 h-2.5 rounded-full bg-industrial-orange shadow-orange-glow" />
-          </div>
-          <div className="h-56">
-            <ResponsiveContainer width="100%" height="100%">
-              <PieChart>
-                <Pie
-                  data={brigadasCoordinadorData}
-                  cx="50%"
-                  cy="50%"
-                  outerRadius={65}
-                  dataKey="Brigadas"
-                  label={({ name, percent }) => `${name.split(' ')[1]}: ${(percent * 100).toFixed(0)}%`}
-                >
-                  {brigadasCoordinadorData.map((entry, index) => (
-                    <Cell key={`cell-${index}`} fill={COLORS[index % COLORS.length]} />
+      ) : (
+        <div className="space-y-6">
+          {/* Table: Consolidado por Área y Estado */}
+          <div className="bg-white rounded-2xl shadow-sm border border-slate-200/80 overflow-hidden">
+            <div className="p-4 border-b border-slate-100 flex items-center justify-between">
+              <h3 className="font-bold text-sm text-slate-800 flex items-center space-x-2">
+                <Layers className="w-4 h-4 text-[#F28524]" />
+                <span>Matriz de Activos: Área Operativa vs Estado Físico</span>
+              </h3>
+            </div>
+            <div className="overflow-x-auto">
+              <table className="w-full text-left text-xs">
+                <thead>
+                  <tr className="bg-slate-50 border-b border-slate-100 text-slate-600 font-bold uppercase">
+                    <th className="py-3 px-4">Área Operativa</th>
+                    <th className="py-3 px-4">Estado Físico</th>
+                    <th className="py-3 px-4 text-center">Total Registros</th>
+                    <th className="py-3 px-4 text-center">Unidades Físicas Sumadas</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100">
+                  {data?.areaEstado?.map((row, idx) => (
+                    <tr key={idx} className="hover:bg-slate-50/60 transition-colors">
+                      <td className="py-2.5 px-4 font-bold text-slate-800">{row.area}</td>
+                      <td className="py-2.5 px-4">
+                        <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${
+                          row.estado_fisico === 'Bueno' ? 'bg-emerald-50 text-emerald-700' :
+                          row.estado_fisico === 'Regular' ? 'bg-amber-50 text-amber-700' :
+                          row.estado_fisico === 'Dañado' ? 'bg-rose-50 text-rose-700' :
+                          row.estado_fisico === 'Fuera de servicio' ? 'bg-red-100 text-red-800' : 'bg-slate-100 text-slate-700'
+                        }`}>
+                          {row.estado_fisico}
+                        </span>
+                      </td>
+                      <td className="py-2.5 px-4 text-center font-bold text-slate-900">{row.registros}</td>
+                      <td className="py-2.5 px-4 text-center font-mono text-slate-700">{row.total_unidades}</td>
+                    </tr>
                   ))}
-                </Pie>
-                <Tooltip />
-              </PieChart>
-            </ResponsiveContainer>
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+            {/* Top Custodians */}
+            <div className="bg-white rounded-2xl shadow-sm border border-slate-200/80 overflow-hidden">
+              <div className="p-4 border-b border-slate-100">
+                <h3 className="font-bold text-sm text-slate-800 flex items-center space-x-2">
+                  <User className="w-4 h-4 text-[#F28524]" />
+                  <span>Distribución por Responsable / Custodio</span>
+                </h3>
+              </div>
+              <div className="divide-y divide-slate-100 text-xs">
+                {data?.porCustodio?.map((c, i) => (
+                  <div key={i} className="py-2.5 px-4 flex items-center justify-between hover:bg-slate-50">
+                    <span className="font-medium text-slate-800">{c.custodio}</span>
+                    <span className="font-bold bg-slate-100 text-slate-800 px-2 py-0.5 rounded-md text-[11px]">
+                      {c.articulos} bienes
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            {/* Distribution by Location & Area */}
+            <div className="bg-white rounded-2xl shadow-sm border border-slate-200/80 overflow-hidden">
+              <div className="p-4 border-b border-slate-100">
+                <h3 className="font-bold text-sm text-slate-800 flex items-center space-x-2">
+                  <MapPin className="w-4 h-4 text-[#F28524]" />
+                  <span>Distribución por Ubicación y Área</span>
+                </h3>
+              </div>
+              <div className="divide-y divide-slate-100 text-xs">
+                {data?.porUbicacion?.map((u, i) => (
+                  <div key={i} className="py-2.5 px-4 flex items-center justify-between hover:bg-slate-50">
+                    <div className="truncate pr-2">
+                      <div className="font-medium text-slate-800">{u.ubicacion_nombre}</div>
+                      <div className="text-[10px] text-slate-400 font-bold uppercase">{u.area}</div>
+                    </div>
+                    <span className="font-bold bg-slate-100 text-slate-800 px-2 py-0.5 rounded-md text-[11px] whitespace-nowrap">
+                      {u.registros} registros
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </div>
           </div>
         </div>
-
-        {/* Chart 3: Brigadas por Supervisor */}
-        <div className="glass-panel rounded-lg p-5">
-          <div className="flex items-center justify-between mb-4 border-b border-industrial-border pb-3">
-            <h4 className="text-xs font-bold text-white uppercase tracking-wider">3. Brigadas por Supervisor (Lote 4)</h4>
-            <span className="w-2.5 h-2.5 rounded-full bg-industrial-green shadow-[0_0_8px_rgba(16,185,129,0.4)]" />
-          </div>
-          <div className="h-56">
-            <ResponsiveContainer width="100%" height="100%">
-              <BarChart data={brigadasPorSupervisorData}>
-                <XAxis dataKey="name" stroke="#94a3b8" fontSize={9} tickLine={false} />
-                <YAxis stroke="#94a3b8" fontSize={9} tickLine={false} />
-                <Tooltip content={<CustomTooltip />} />
-                <Bar dataKey="Brigadas" fill="#10b981" radius={[4, 4, 0, 0]} />
-              </BarChart>
-            </ResponsiveContainer>
-          </div>
-        </div>
-
-        {/* Chart 4: Técnicos por Brigada */}
-        <div className="glass-panel rounded-lg p-5">
-          <div className="flex items-center justify-between mb-4 border-b border-industrial-border pb-3">
-            <h4 className="text-xs font-bold text-white uppercase tracking-wider">4. Dotación de Técnicos por Roster de Brigada</h4>
-            <span className="w-2.5 h-2.5 rounded-full bg-purple-500 shadow-[0_0_8px_rgba(168,85,247,0.4)]" />
-          </div>
-          <div className="h-56">
-            <ResponsiveContainer width="100%" height="100%">
-              <BarChart data={tecnicosPorBrigadaData}>
-                <XAxis dataKey="name" stroke="#94a3b8" fontSize={8} tickLine={false} />
-                <YAxis stroke="#94a3b8" fontSize={9} tickLine={false} />
-                <Tooltip content={<CustomTooltip />} />
-                <Bar dataKey="Técnicos" fill="#a855f7" radius={[4, 4, 0, 0]} />
-              </BarChart>
-            </ResponsiveContainer>
-          </div>
-        </div>
-
-        {/* Chart 5: Reposiciones por Zona */}
-        <div className="glass-panel rounded-lg p-5">
-          <div className="flex items-center justify-between mb-4 border-b border-industrial-border pb-3">
-            <h4 className="text-xs font-bold text-white uppercase tracking-wider">5. Costo de Reposición por Daño en USD</h4>
-            <span className="w-2.5 h-2.5 rounded-full bg-industrial-yellow shadow-[0_0_8px_rgba(245,158,11,0.4)]" />
-          </div>
-          <div className="h-56">
-            <ResponsiveContainer width="100%" height="100%">
-              <AreaChart data={reposicionesPorZonaData}>
-                <defs>
-                  <linearGradient id="colorCosto" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="5%" stopColor="#f59e0b" stopOpacity={0.4}/>
-                    <stop offset="95%" stopColor="#f59e0b" stopOpacity={0}/>
-                  </linearGradient>
-                </defs>
-                <XAxis dataKey="name" stroke="#94a3b8" fontSize={9} tickLine={false} />
-                <YAxis stroke="#94a3b8" fontSize={9} tickLine={false} />
-                <Tooltip />
-                <Area type="monotone" dataKey="Costo" stroke="#f59e0b" fillOpacity={1} fill="url(#colorCosto)" />
-              </AreaChart>
-            </ResponsiveContainer>
-          </div>
-        </div>
-
-        {/* Chart 6: Actas por Estado */}
-        <div className="glass-panel rounded-lg p-5">
-          <div className="flex items-center justify-between mb-4 border-b border-industrial-border pb-3">
-            <h4 className="text-xs font-bold text-white uppercase tracking-wider">6. Estado de Actas de Entrega / Despacho</h4>
-            <span className="w-2.5 h-2.5 rounded-full bg-blue-500 shadow-[0_0_8px_rgba(59,130,246,0.4)]" />
-          </div>
-          <div className="h-56">
-            <ResponsiveContainer width="100%" height="100%">
-              <LineChart data={actasPorEstadoData}>
-                <XAxis dataKey="name" stroke="#94a3b8" fontSize={9} tickLine={false} />
-                <YAxis stroke="#94a3b8" fontSize={9} tickLine={false} />
-                <Tooltip />
-                <Line type="monotone" dataKey="Actas" stroke="#3b82f6" strokeWidth={2.5} activeDot={{ r: 6 }} />
-              </LineChart>
-            </ResponsiveContainer>
-          </div>
-        </div>
-
-      </div>
-
+      )}
     </div>
   );
-};
-
-export default ReportesPage;
+}

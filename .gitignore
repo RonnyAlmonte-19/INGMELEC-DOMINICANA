@@ -1,3 +1,8 @@
+# ==============================================================================
+# INGMELEC | ALMACÉN GENERAL — REGLAS DE EXCLUSIÓN GIT (.gitignore)
+# Protege secretos, respaldos, volcados SQL/JSON, datos locales y suites de QA
+# ==============================================================================
+
 # Logs
 logs
 *.log
@@ -7,16 +12,61 @@ yarn-error.log*
 pnpm-debug.log*
 lerna-debug.log*
 
-node_modules
-dist
-dist-ssr
+# Dependencias y artefactos de compilación
+node_modules/
+server/node_modules/
+dist/
+dist-ssr/
 *.local
 
-# Editor directories and files
+# Variables de entorno, credenciales y secretos (NUNCA PUBLICAR)
+.env
+.env.*
+server/.env
+server/.env.*
+*.env
+*.env.*
+!.env.example
+!server/.env.example
+!**/.env.example
+*.pem
+*.key
+*.crt
+
+# Respaldos, volcados de bases de datos y hojas Excel sensibles
+server/backups/
+backups/
+*.bak
+*.sql.gz
+*.dump
+gridops_mysql_dump.sql
+server/data/*.xlsx
+*.xlsx
+*.xls
+server/scripts/*.json
+
+# Entornos de prueba aislados, scripts de QA, Playwright y carpetas temporales
+scratch/
+scripts/
+archive/
+e2e/
+playwright-report/
+test-results/
+playwright.config.js
+server/tests/
+server/scripts/
+server/start-test-server.js
+server/test-hash.js
+server/check-db.js
+check-db.js
+test-api.js
+
+# Directorios de editores y sistema operativo
 .vscode/*
 !.vscode/extensions.json
-.idea
+.idea/
 .DS_Store
+Thumbs.db
 *.suo
 *.ntvs*
 *.njsproj
