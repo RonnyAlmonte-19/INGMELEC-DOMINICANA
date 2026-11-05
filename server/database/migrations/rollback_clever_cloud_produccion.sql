@@ -11,30 +11,55 @@
 -- =================================================================================
 
 -- ---------------------------------------------------------------------------------
--- NIVEL 1: REVERSIÓN DE DATOS DML (DESVINCULAR SEDES Y RETIRAR SEDES NUEVAS VACÍAS)
+-- NIVEL 1: REVERSIÓN DML CONDICIONADA Y ESTRICTAMENTE NO DESTRUCTIVA
+-- ---------------------------------------------------------------------------------
+-- GARANTÍAS DE SEGURIDAD ESTRICTA:
+--   1. NO ELIMINA campamentos, artículos, almacenes ni movimientos existentes.
+--   2. FILTRA ESTRICTAMENTE los registros afectados:
+--      - Solo desvincula los 434 artículos iniciales (id <= 434) cuya ubicación histórica
+--        corresponde a las 3 sedes homologadas.
+--      - PRESERVA INTACTOS todos los artículos creados posteriormente (id > 434)
+--        y cualquier vinculación legítima creada tras la migración.
+--      - PRESERVA INTACTOS todos los campamentos nuevos creados posteriormente (id > 5).
+--      - Restaura exclusivamente los nombres/códigos preexistentes de las 3 sedes (id 1, 3, 4).
+--   3. PROTEGE el 100% de los movimientos operativos en inv_movimientos.
 -- ---------------------------------------------------------------------------------
 START TRANSACTION;
 
--- 1.1 Restablecer el vínculo campamento_id de los artículos sin tocar ubicacion_nombre ni cantidades
-UPDATE inv_articulos
-SET campamento_id = NULL,
-    almacen_id = NULL,
-    es_sintetico = 0,
-    cantidad_verificada = 1,
-    estado_cantidad = 'VERIFICADO';
-
--- 1.2 Eliminar almacenes internos creados para OPL y MANTENIMIENTO 633 si no tienen movimientos
-DELETE a FROM inv_almacenes a
+-- 1.1 Desvincular ÚNICAMENTE los artículos históricos (id <= 434) vinculados por la migración
+UPDATE inv_articulos a
 JOIN inv_campamentos c ON a.campamento_id = c.id
-WHERE c.codigo IN ('CAMP-OPL', 'CAMP-M633')
-  AND c.origen_registro = 'GERENCIA_CONFIRMADO';
+SET a.campamento_id = NULL,
+    a.almacen_id = NULL,
+    a.estado_vinculacion_sede = 'SEDE_AMBIGUA'
+WHERE a.id <= 434
+  AND c.codigo IN ('ALM-27FEB', 'CAMP-OPL', 'CAMP-M633', 'KM19-OPL', 'MANT-633', 'DN-27FEB')
+  AND UPPER(TRIM(a.ubicacion_nombre)) IN (
+      'DISTRITO NACIONAL 27 DE FEBRERO', 'ALMACEN 27 DE FEBRERO', 'ALMACÉN 27 DE FEBRERO',
+      'KM 19 AUTOPISTA DUARTE OPL', 'OPL',
+      'MANTENIMIENTO 633'
+  );
 
--- 1.3 Eliminar las sedes nuevas OPL y MANTENIMIENTO 633 si fueron creadas en la migración
-DELETE FROM inv_campamentos
-WHERE codigo IN ('CAMP-OPL', 'CAMP-M633')
-  AND origen_registro = 'GERENCIA_CONFIRMADO';
+-- 1.2 Restaurar nombres, códigos y clasificación original de las 3 sedes preexistentes (id 1, 3, 4)
+-- SIN TOCAR campamentos creados con posterioridad (id > 5 ni otros id)
+UPDATE inv_campamentos
+SET codigo = CASE
+        WHEN id = 1 THEN 'DN-27FEB'
+        WHEN id = 3 THEN 'KM19-OPL'
+        WHEN id = 4 THEN 'MANT-633'
+        ELSE codigo
+    END,
+    nombre = CASE
+        WHEN id = 1 THEN 'DISTRITO NACIONAL 27 DE FEBRERO'
+        WHEN id = 3 THEN 'KM 19 AUTOPISTA DUARTE OPL'
+        WHEN id = 4 THEN 'MANTENIMIENTO 633'
+        ELSE nombre
+    END,
+    clasificacion_sede = 'PROPUESTO',
+    origen_registro = 'SISTEMA_INICIAL'
+WHERE id IN (1, 3, 4);
 
--- 1.4 Limpiar permisos_json y es_developer en cuentas operativas
+-- 1.3 Limpiar permisos_json y es_developer en cuentas operativas preexistentes
 UPDATE inv_usuarios
 SET permisos_json = NULL,
     es_developer = 0
