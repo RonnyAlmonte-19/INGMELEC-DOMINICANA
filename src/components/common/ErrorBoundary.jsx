@@ -28,7 +28,7 @@ class ErrorBoundary extends React.Component {
           {/* Glowing Background FX */}
           <div className="absolute top-1/4 left-1/4 w-96 h-96 rounded-full bg-red-500 bg-opacity-5 filter blur-[120px] pointer-events-none" />
           <div className="absolute bottom-1/4 right-1/4 w-96 h-96 rounded-full bg-orange-500 bg-opacity-5 filter blur-[120px] pointer-events-none" />
-          
+
           <div className="w-full max-w-4xl bg-[#0d1527] rounded-lg border border-red-500 border-opacity-40 p-8 shadow-[0_0_30px_rgba(239,68,68,0.15)] relative z-10">
             {/* Header */}
             <div className="flex items-center space-x-4 border-b border-red-500 border-opacity-20 pb-4 mb-6">

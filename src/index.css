@@ -7,7 +7,7 @@
 @layer base {
   body {
     @apply bg-industrial-bg text-industrial-text font-sans antialiased overflow-x-hidden;
-    background-image: 
+    background-image:
       radial-gradient(at 0% 0%, rgba(241, 245, 249, 0.9) 0%, transparent 60%),
       radial-gradient(at 50% 0%, rgba(242, 133, 36, 0.04) 0%, transparent 50%),
       radial-gradient(at 100% 100%, rgba(30, 41, 59, 0.02) 0%, transparent 60%);
@@ -37,7 +37,7 @@
     border: 1px solid #e2e8f0;
     box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.02), 0 2px 4px -2px rgba(0, 0, 0, 0.02);
   }
-  
+
   .glass-panel-cyan {
     background: #ffffff;
     border: 1px solid rgba(242, 133, 36, 0.4);
@@ -69,10 +69,10 @@
     border-color: rgba(30, 41, 59, 0.6);
     box-shadow: 0 0 10px rgba(30, 41, 59, 0.1);
   }
-  
+
   .grid-pattern {
     background-size: 40px 40px;
-    background-image: 
+    background-image:
       linear-gradient(to right, rgba(226, 232, 240, 0.4) 1px, transparent 1px),
       linear-gradient(to bottom, rgba(226, 232, 240, 0.4) 1px, transparent 1px);
   }

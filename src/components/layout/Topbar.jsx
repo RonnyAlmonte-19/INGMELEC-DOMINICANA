@@ -1,221 +1,132 @@
-import React, { useState } from 'react';
+import React from 'react';
+import { Database, Bell, Shield, User, Search, RefreshCw, MapPin, FlaskConical } from 'lucide-react';
 import { useApp } from '../../context/AppContext';
-import { 
-  Bell, 
-  Cpu, 
-  Activity, 
-  Wifi, 
-  User, 
-  Check, 
-  Shield, 
-  RefreshCw 
-} from 'lucide-react';
 
-const Topbar = ({ activePage, demoModeActive, onToggleDemoMode }) => {
-  const { 
-    currentUser, 
-    currentRole, 
-    changeRole, 
-    notifications,
-    clearNotifications 
-  } = useApp();
+export default function Topbar({ activePage, setActivePage }) {
+  const { currentUser, currentRole, refreshKpis, kpisLoading, activeCampamento, setActiveCampamento, entornoInfo, kpis } = useApp();
 
-  const [showNotifications, setShowNotifications] = useState(false);
-  const [showRoleSwapper, setShowRoleSwapper] = useState(false);
-
-  if (!currentUser) return null;
-
-  const unreadCount = notifications.filter(n => n.unread).length;
-
-  const getPageTitle = () => {
-    switch (activePage) {
-      case 'dashboard': return 'Consola de Monitoreo General';
-      case 'brigadas': return 'Control de Brigadas Técnicas';
-      case 'tecnicos': return 'Expedientes Técnicos de Personal';
-      case 'personal': return 'Administración de Colaboradores';
-      case 'inventario': return 'Inventario Maestro de Operaciones';
-      case 'actas': return 'Actas de Entrega de EPP y Herramientas';
-      case 'reposiciones': return 'Workflow de Reposiciones e Incidencias';
-      case 'swaps': return 'Registro de Sustituciones y Swaps';
-      case 'devoluciones': return 'Gestión de Retorno y Devoluciones';
-      case 'usuarios': return 'Gestión de Seguridad, Jerarquía y Accesos';
-      case 'auditoria': return 'Visor de Auditoría y Logs del Sistema';
-      case 'reportes': return 'Dashboard Analítico y de Reportes';
-      default: return 'Consola Operativa';
+  const getPageTitle = (page) => {
+    switch (page) {
+      case 'dashboard': return 'Dashboard Ejecutivo';
+      case 'inventario': return `Inventario Maestro${kpis?.totalArticulos != null ? ` (${kpis.totalArticulos} Activos)` : ''}`;
+      case 'informatica': return `Informática y Telecomunicaciones${kpis?.porArea?.INFORMATICA != null ? ` (${kpis.porArea.INFORMATICA})` : ''}`;
+      case 'oficinas': return `Mobiliario y Oficinas${kpis?.porArea?.OFICINAS != null ? ` (${kpis.porArea.OFICINAS})` : ''}`;
+      case 'cocina': return `Cocina y Comedor${kpis?.porArea?.COCINA != null ? ` (${kpis.porArea.COCINA})` : ''}`;
+      case 'almacen': return `Almacén Central y Herramientas${kpis?.porArea?.ALMACEN != null ? ` (${kpis.porArea.ALMACEN})` : ''}`;
+      case 'ubicaciones': return 'Campamentos y Sedes';
+      case 'movimientos': return 'Movimientos Transaccionales';
+      case 'reportes': return 'Centro de Reportes Gerenciales';
+      case 'auditoria': return 'Bitácora de Auditoría';
+      case 'usuarios': return 'Control Exclusivo de Usuarios y Permisos';
+      default: return 'Almacén General';
     }
   };
 
-  const getRoleColor = (role) => {
-    switch (role) {
-      case 'Developer': return 'text-purple-400 border-purple-500 bg-purple-500/10';
-      case 'Gerente': return 'text-emerald-400 border-emerald-500 bg-emerald-500/10';
-      case 'Coordinador': return 'text-cyan-400 border-cyan-500 bg-cyan-500/10';
-      case 'Supervisor': return 'text-amber-400 border-amber-500 bg-amber-500/10';
-      default: return 'text-slate-400 border-slate-500 bg-slate-500/10';
+  const getRoleBadge = (rol) => {
+    switch (rol) {
+      case 'developer':
+        return <span className="px-2 py-0.5 rounded-full text-[10px] font-extrabold bg-amber-500/10 text-amber-600 border border-amber-500/30 uppercase tracking-wide">Developer</span>;
+      case 'admin':
+        return <span className="px-2 py-0.5 rounded-full text-[10px] font-extrabold bg-rose-100 text-rose-800 border border-rose-200 uppercase">Admin Operativo</span>;
+      case 'almacen':
+        return <span className="px-2 py-0.5 rounded-full text-[10px] font-extrabold bg-[#F28524]/20 text-[#F28524] border border-[#F28524]/30 uppercase">Almacén</span>;
+      case 'supervisor':
+        return <span className="px-2 py-0.5 rounded-full text-[10px] font-extrabold bg-blue-100 text-blue-800 border border-blue-200 uppercase">Supervisor</span>;
+      case 'gerencia':
+        return <span className="px-2 py-0.5 rounded-full text-[10px] font-extrabold bg-purple-100 text-purple-800 border border-purple-200 uppercase">Gerencia</span>;
+      default:
+        return <span className="px-2 py-0.5 rounded-full text-[10px] font-extrabold bg-slate-100 text-slate-700 border border-slate-300 uppercase">Auditor</span>;
     }
   };
+
+  // Dinámica de nomenclatura según el usuario
+  const isDev = currentRole === 'developer' || currentUser?.es_developer === 1;
+  const currentAlmacenTitle = isDev
+    ? 'ALMACÉN GENERAL'
+    : (activeCampamento?.nombre ? `ALMACÉN ${activeCampamento.nombre.toUpperCase()}` : (currentUser?.campamento_nombre ? `ALMACÉN ${currentUser.campamento_nombre.toUpperCase()}` : 'ALMACÉN GENERAL'));
 
   return (
-    <header className="h-16 border-b border-industrial-border flex items-center justify-between px-6 bg-industrial-panel bg-opacity-70 backdrop-blur-md sticky top-0 z-30">
-      
-      {/* Page Title & Breadcrumbs */}
+    <header className="h-16 bg-white/90 backdrop-blur-md border-b border-slate-200/80 sticky top-0 z-30 px-6 flex items-center justify-between">
+      {/* Title & Breadcrumbs */}
       <div>
-        <div className="flex items-center space-x-2 text-[10px] text-industrial-gray uppercase tracking-widest">
-          <span>Ingmelec</span>
-          <span>/</span>
-          <span className="text-industrial-cyan font-semibold">{activePage}</span>
+        <div className="flex items-center space-x-2 text-[11px] text-slate-400 font-semibold uppercase tracking-wider">
+          <span>INGMELEC</span>
+          <span>|</span>
+          <span className="text-[#F28524] font-bold">{currentAlmacenTitle}</span>
         </div>
-        <h1 className="text-base font-bold text-slate-800 tracking-wide mt-0.5">{getPageTitle()}</h1>
+        <h2 className="text-base font-extrabold text-slate-900 tracking-tight leading-none mt-0.5">
+          {getPageTitle(activePage)}
+        </h2>
       </div>
 
       {/* Right Controls */}
-      <div className="flex items-center space-x-6">
-        
-        {/* Real-time Telemetry (Enterprise visual wow) */}
-        <div className="hidden lg:flex items-center space-x-4 border-r border-industrial-border pr-6 text-xs text-industrial-gray font-semibold">
-          <div className="flex items-center space-x-1.5" title="Base de Datos En Línea">
-            <Activity size={12} className="text-industrial-cyan animate-pulse" />
-            <span className="text-[10px] tracking-wider uppercase text-industrial-cyan font-bold">Ingmelec Sync</span>
-          </div>
-
-          <div className="flex items-center space-x-1.5" title="Latencia del Servidor Ficticio">
-            <Wifi size={12} className="text-industrial-green" />
-            <span className="text-[10px] tracking-wide text-industrial-green">14ms ping</span>
-          </div>
-
-          <div className="flex items-center space-x-1.5" title="Hardware Monitor">
-            <Cpu size={12} className="text-industrial-gray" />
-            <span className="text-[10px] tracking-wide">CPU OK</span>
-          </div>
-        </div>
-
-        {/* Executive Demo Mode Toggle */}
-        <button
-          onClick={onToggleDemoMode}
-          className={`flex items-center space-x-1.5 px-2.5 py-1 rounded border text-xs transition-all shadow-sm ${
-            demoModeActive
-              ? 'bg-gradient-to-r from-industrial-cyan to-blue-600 border-industrial-cyan text-industrial-bg font-extrabold shadow-cyan-glow animate-pulse'
-              : 'border-industrial-border text-industrial-gray hover:text-white hover:border-industrial-cyan/40 bg-industrial-bg bg-opacity-30'
-          }`}
-        >
-          <Cpu size={12} className={demoModeActive ? 'animate-spin text-industrial-bg' : ''} />
-          <span className="uppercase tracking-wider text-[9px] font-black">Modo Demo</span>
-        </button>
-
-        {/* Role Quick Tester Tool */}
-        {(currentUser.role === 'Developer' || currentUser.role === 'Gerente') && (
-          <div className="relative">
-            <button 
-              onClick={() => setShowRoleSwapper(!showRoleSwapper)}
-              className="flex items-center space-x-2 px-3 py-1 rounded border border-dashed border-industrial-cyan/40 bg-industrial-cyan/5 text-industrial-cyan hover:bg-industrial-cyan/15 text-xs transition-colors"
+      <div className="flex items-center space-x-3">
+        {/* Multi-Campamento Switcher */}
+        {currentUser?.campamentos && currentUser.campamentos.length > 1 && (
+          <div className="flex items-center space-x-1.5 px-3 py-1 bg-slate-100 border border-slate-200 rounded-lg text-xs font-medium text-slate-700 shadow-sm">
+            <MapPin className="w-3.5 h-3.5 text-[#F28524]" />
+            <span className="text-slate-400 font-normal">Sede:</span>
+            <select
+              value={activeCampamento?.id || ''}
+              onChange={(e) => {
+                const targetId = parseInt(e.target.value);
+                const selected = currentUser.campamentos.find(c => c.id === targetId);
+                setActiveCampamento(selected || null);
+              }}
+              className="bg-transparent border-none text-xs font-bold text-slate-800 focus:outline-none cursor-pointer"
             >
-              <Shield size={12} />
-              <span className="font-semibold">Simular Rol: {currentRole}</span>
-            </button>
-
-            {showRoleSwapper && (
-              <div 
-                className="absolute right-0 mt-2 w-48 rounded-md bg-industrial-panel border border-industrial-border p-2 shadow-panel-glow z-50 animate-in fade-in slide-in-from-top-1 duration-100"
-                style={{ background: 'rgba(255, 255, 255, 0.98)', backdropFilter: 'blur(10px)' }}
-              >
-                <div className="px-2 py-1 text-[10px] text-industrial-gray uppercase font-bold tracking-widest border-b border-industrial-border mb-1">
-                  Cambiar Rol UI
-                </div>
-                {['Developer', 'Gerente', 'Coordinador', 'Supervisor'].map((r) => (
-                  <button
-                    key={r}
-                    onClick={() => {
-                      changeRole(r);
-                      setShowRoleSwapper(false);
-                    }}
-                    className={`w-full flex items-center justify-between px-2 py-1.5 rounded hover:bg-slate-100 text-left text-xs font-semibold ${
-                      currentRole === r ? 'text-industrial-cyan font-extrabold' : 'text-slate-600'
-                    }`}
-                  >
-                    <span>{r}</span>
-                    {currentRole === r && <Check size={12} />}
-                  </button>
-                ))}
-              </div>
-            )}
+              {currentUser.campamentos.map((c) => (
+                <option key={c.id} value={c.id}>
+                  {c.nombre}
+                </option>
+              ))}
+            </select>
           </div>
         )}
 
-        {/* Dynamic Notifications Center */}
-        <div className="relative">
-          <button 
-            onClick={() => {
-              setShowNotifications(!showNotifications);
-              if (!showNotifications) clearNotifications();
-            }}
-            className="p-1.5 rounded bg-industrial-bg border border-industrial-border text-industrial-gray hover:text-industrial-cyan hover:border-industrial-cyan transition-all relative"
+        {/* Environment Indicator (PRUEBAS vs PRODUCCION) */}
+        {entornoInfo?.esPruebas ? (
+          <div
+            className="hidden sm:flex items-center space-x-1.5 px-3 py-1 bg-amber-500/10 border border-amber-500/30 rounded-full text-[11px] font-bold text-amber-700 shadow-sm"
+            title={entornoInfo.aviso || 'Entorno de Pruebas: Datos sintéticos'}
           >
-            <Bell size={16} />
-            {unreadCount > 0 && (
-              <span className="absolute -top-1 -right-1 w-4 h-4 rounded-full bg-industrial-red text-[9px] text-white flex items-center justify-center font-bold animate-bounce">
-                {unreadCount}
-              </span>
-            )}
-          </button>
-
-            {showNotifications && (
-              <div 
-                className="absolute right-0 mt-2 w-80 rounded-md bg-industrial-panel border border-industrial-border p-3 shadow-panel-glow z-50 animate-in fade-in slide-in-from-top-1 duration-150"
-                style={{ background: 'rgba(255, 255, 255, 0.98)', backdropFilter: 'blur(12px)' }}
-              >
-                <div className="flex items-center justify-between border-b border-industrial-border pb-2 mb-2">
-                  <span className="text-xs font-bold text-slate-800 uppercase tracking-wider">Alertas del Sistema</span>
-                <span className="text-[10px] text-industrial-cyan hover:underline cursor-pointer" onClick={() => clearNotifications()}>
-                  Leídas todas
-                </span>
-              </div>
-              <div className="space-y-2 max-h-60 overflow-y-auto">
-                {notifications.map((n) => (
-                  <div 
-                    key={n.id} 
-                    className={`p-2 rounded text-xs border ${
-                      n.unread ? 'bg-industrial-cyan/5 border-industrial-cyan/35' : 'bg-industrial-bg bg-opacity-25 border-industrial-border'
-                    }`}
-                  >
-                    <div className="flex items-center justify-between mb-0.5">
-                      <span className={`text-[9px] font-extrabold px-1 py-0.2 rounded uppercase ${
-                        n.type === 'critical' ? 'bg-industrial-red/20 text-industrial-red border border-industrial-red/30' :
-                        n.type === 'pending' ? 'bg-industrial-yellow/20 text-industrial-yellow border border-industrial-yellow/30' :
-                        'bg-industrial-cyan/20 text-industrial-cyan border border-industrial-cyan/30'
-                      }`}>
-                        {n.type}
-                      </span>
-                      <span className="text-[9px] text-industrial-gray">{n.time}</span>
-                    </div>
-                    <p className="text-slate-600 font-medium leading-relaxed mt-1 text-[11px]">{n.text}</p>
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
-        </div>
-
-        {/* Active User Summary Card */}
-        <div className="flex items-center space-x-3 pl-4 border-l border-industrial-border">
-          <div className="w-8 h-8 rounded-full bg-industrial-border border border-industrial-border flex items-center justify-center text-industrial-cyan">
-            <User size={16} />
+            <span className="w-2 h-2 rounded-full bg-amber-500 animate-pulse"></span>
+            <FlaskConical className="w-3.5 h-3.5 text-amber-600" />
+            <span>PRUEBAS — MariaDB Local</span>
           </div>
-          <div className="hidden sm:block">
-            <div className="flex items-center space-x-1.5">
-              <span className="font-bold text-xs text-slate-800 leading-none">
-                {(currentUser.name && typeof currentUser.name === 'string') ? currentUser.name.split(' ')[0] : (currentUser.username || 'Operador')}
-              </span>
-              <span className={`text-[9px] font-bold px-1.5 py-0.2 rounded-full border uppercase tracking-wider ${getRoleColor(currentRole)}`}>
-                {currentRole}
-              </span>
-            </div>
-            <p className="text-[9px] text-industrial-gray font-medium mt-1">Lote 4 Noroeste</p>
+        ) : (
+          <div
+            className="hidden sm:flex items-center space-x-1.5 px-3 py-1 bg-emerald-50 border border-emerald-200 rounded-full text-[11px] font-semibold text-emerald-800"
+            title="Conexión en vivo con base de datos de producción"
+          >
+            <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
+            <Database className="w-3.5 h-3.5 text-emerald-600" />
+            <span>PRODUCCIÓN — Clever Cloud</span>
           </div>
-        </div>
+        )}
 
+        {/* Sync button */}
+        <button
+          onClick={refreshKpis}
+          title="Sincronizar con base de datos"
+          className="p-2 text-slate-500 hover:text-slate-800 hover:bg-slate-100 rounded-xl transition-colors"
+        >
+          <RefreshCw className={`w-4 h-4 ${kpisLoading ? 'animate-spin text-[#F28524]' : ''}`} />
+        </button>
+
+        {/* User Card */}
+        <div className="flex items-center space-x-2.5 pl-3 border-l border-slate-200">
+          <div className="text-right hidden md:block">
+            <div className="text-xs font-bold text-slate-900 leading-tight">
+              {currentUser?.nombre}
+            </div>
+            <div className="text-[11px] text-slate-400">
+              {currentUser?.cargo || currentUser?.email}
+            </div>
+          </div>
+          {getRoleBadge(currentRole)}
+        </div>
       </div>
     </header>
   );
-};
-
-export default Topbar;
+}

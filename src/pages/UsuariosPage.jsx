@@ -1,218 +1,505 @@
-import React, { useState } from 'react';
-import { useApp } from '../context/AppContext';
-import { 
-  ShieldCheck, 
-  Search, 
-  Plus, 
-  X, 
-  Save, 
-  Check, 
-  UserX, 
-  UserCheck, 
-  SlidersHorizontal,
-  ChevronDown,
-  ChevronRight,
-  GitMerge,
-  Users
+import React, { useState, useEffect } from 'react';
+import {
+  Users, UserPlus, Shield, CheckCircle2, XCircle, Clock, Mail, X,
+  Edit3, KeyRound, MapPin, CheckSquare, Square, ShieldAlert, History, Filter
 } from 'lucide-react';
+import { useApp } from '../context/AppContext';
 
-const UsuariosPage = () => {
-  const { 
-    currentRole,
-    supervisores,
-    coordinadores,
-    brigadas,
-    tecnicos,
-    usuarios,
-    saveUsuario,
-    toggleUsuarioStatus
+const AVAILABLE_PERMISSIONS = [
+  {
+    categoria: 'Inventario de Activos',
+    items: [
+      { key: 'inv:ver', label: 'Ver catálogo de activos' },
+      { key: 'inv:crear', label: 'Registrar nuevos activos' },
+      { key: 'inv:editar', label: 'Modificar datos de activos' },
+      { key: 'inv:movimientos_registrar', label: 'Registrar movimientos de stock' },
+      { key: 'inv:movimientos_ver', label: 'Consultar historial de movimientos' },
+      { key: 'inv:eliminar', label: 'Desactivar / retirar activos' }
+    ]
+  },
+  {
+    categoria: 'Levantamientos y Auditorías en Campo',
+    items: [
+      { key: 'lev:ver', label: 'Ver levantamientos de su campamento' },
+      { key: 'lev:crear', label: 'Crear nuevas sesiones de levantamiento' },
+      { key: 'lev:capturar', label: 'Capturar artículos en levantamiento' },
+      { key: 'lev:editar', label: 'Modificar artículos de la auditoría' },
+      { key: 'lev:importar', label: 'Importar lotes desde Excel' },
+      { key: 'lev:consolidar', label: 'Consolidar levantamiento al maestro' }
+    ]
+  },
+  {
+    categoria: 'Reportes y Exportación',
+    items: [
+      { key: 'rep:ver', label: 'Ver reportes consolidados' },
+      { key: 'rep:exportar', label: 'Exportar datos a Excel / CSV' },
+      { key: 'rep:imprimir', label: 'Generar impresiones y etiquetas' }
+    ]
+  },
+  {
+    categoria: 'Campamentos y Sedes Operativas',
+    items: [
+      { key: 'camp:ver', label: 'Ver listado de campamentos autorizados' },
+      { key: 'camp:stock', label: 'Ver balances y stock de campamento' },
+      { key: 'camp:operar', label: 'Gestionar almacenes y bodegas' }
+    ]
+  }
+];
+
+const DEFAULT_ROLE_PERMISSIONS = {
+  admin: [
+    'inv:ver', 'inv:crear', 'inv:editar', 'inv:movimientos_registrar', 'inv:movimientos_ver',
+    'lev:ver', 'lev:crear', 'lev:capturar', 'lev:editar', 'lev:importar', 'lev:consolidar',
+    'rep:ver', 'rep:exportar', 'rep:imprimir',
+    'camp:ver', 'camp:stock', 'camp:operar'
+  ],
+  almacen: [
+    'inv:ver', 'inv:crear', 'inv:movimientos_registrar', 'inv:movimientos_ver',
+    'lev:ver', 'lev:crear', 'lev:capturar',
+    'camp:ver', 'camp:stock'
+  ],
+  supervisor: [
+    'inv:ver', 'inv:crear', 'inv:editar', 'inv:movimientos_ver',
+    'lev:ver', 'lev:crear', 'lev:capturar', 'lev:editar', 'lev:importar', 'lev:consolidar',
+    'rep:ver', 'rep:exportar',
+    'camp:ver', 'camp:stock'
+  ],
+  auditor: [
+    'inv:ver', 'inv:movimientos_ver',
+    'lev:ver',
+    'rep:ver', 'rep:exportar', 'rep:imprimir',
+    'camp:ver', 'camp:stock'
+  ],
+  gerencia: [
+    'inv:ver', 'inv:movimientos_ver',
+    'lev:ver',
+    'rep:ver', 'rep:exportar', 'rep:imprimir',
+    'camp:ver', 'camp:stock'
+  ]
+};
+
+export default function UsuariosPage() {
+  const {
+    currentUser, currentRole, fetchUsuarios, createUsuario,
+    updateUsuario, updateUsuarioEstado, updateUsuarioPermisos,
+    recoverUsuarioPassword, fetchUsuariosAuditoria, fetchCampamentos, showToast
   } = useApp();
 
-  // Search
-  const [searchTerm, setSearchTerm] = useState('');
-  const [showNewUserModal, setShowNewUserModal] = useState(false);
-  const [operationError, setOperationError] = useState('');
-  const [operationSuccess, setOperationSuccess] = useState('');
-  const [savingUser, setSavingUser] = useState(false);
-  const [activeTab, setActiveTab] = useState('Tabla'); // 'Tabla' | 'Jerarquía'
+  const isDeveloper = currentRole === 'developer' || currentUser?.es_developer === 1;
 
-  // Read users directly from MySQL backend via context
-  const systemUsers = usuarios || [];
+  const [usuarios, setUsuarios] = useState([]);
+  const [campamentos, setCampamentos] = useState([]);
+  const [auditorias, setAuditorias] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [activeTab, setActiveTab] = useState('usuarios'); // 'usuarios' | 'auditoria'
 
-  // Form states
-  const [newUsername, setNewUsername] = useState('');
-  const [newName, setNewName] = useState('');
-  const [newRole, setNewRole] = useState('Supervisor');
-  const [newZone, setNewZone] = useState('Noroeste Lote 4');
-
-  const filteredUsers = systemUsers.filter(u => {
-    return (u.name || '').toLowerCase().includes(searchTerm.toLowerCase()) ||
-           (u.username || '').toLowerCase().includes(searchTerm.toLowerCase()) ||
-           (u.role || '').toLowerCase().includes(searchTerm.toLowerCase());
+  // Modal Crear / Editar Usuario
+  const [showUserModal, setShowUserModal] = useState(false);
+  const [editingUserId, setEditingUserId] = useState(null);
+  const [userFormData, setUserFormData] = useState({
+    nombre: '',
+    email: '',
+    password: '',
+    rol: 'almacen',
+    cargo: '',
+    area: 'Almacén',
+    campamento_id: '',
+    campamentos_adicionales: [],
+    permisos: []
   });
+  const [submittingUser, setSubmittingUser] = useState(false);
 
-  const handleToggleUserStatus = (userId) => {
-    toggleUsuarioStatus(userId);
+  // Modal Restablecer Contraseña
+  const [showPasswordModal, setShowPasswordModal] = useState(false);
+  const [passwordUserId, setPasswordUserId] = useState(null);
+  const [newPassword, setNewPassword] = useState('');
+  const [submittingPassword, setSubmittingPassword] = useState(false);
+
+  const loadAllData = async () => {
+    setLoading(true);
+    try {
+      const [uRes, cRes] = await Promise.all([
+        fetchUsuarios(),
+        fetchCampamentos()
+      ]);
+      if (uRes.success) setUsuarios(uRes.usuarios || []);
+      if (cRes.success) setCampamentos(cRes.campamentos || []);
+    } catch (err) {
+      console.error('Error loading data:', err);
+    } finally {
+      setLoading(false);
+    }
   };
 
-  const handleCreateUser = async (e) => {
-    e.preventDefault();
-    setOperationError('');
-    setOperationSuccess('');
-    if (!newUsername || !newName) {
-      setOperationError('Por favor complete todos los datos del operador.');
-      return;
+  const loadAuditorias = async () => {
+    try {
+      const res = await fetchUsuariosAuditoria();
+      if (res.success) setAuditorias(res.logs || []);
+    } catch (err) {
+      console.error('Error loading auditorias:', err);
     }
+  };
 
-    setSavingUser(true);
-    const result = await saveUsuario({
-      username: newUsername.toLowerCase().trim(),
-      name: newName,
-      role: newRole,
-      zone: newZone
+  useEffect(() => {
+    if (isDeveloper) {
+      loadAllData();
+    }
+  }, [isDeveloper]);
+
+  useEffect(() => {
+    if (activeTab === 'auditoria') {
+      loadAuditorias();
+    }
+  }, [activeTab]);
+
+  // Si no es developer, acceso denegado total
+  if (!isDeveloper) {
+    return (
+      <div className="bg-white rounded-3xl p-10 border border-slate-200 shadow-sm text-center max-w-xl mx-auto my-12 space-y-4">
+        <div className="w-16 h-16 bg-rose-50 border border-rose-200 rounded-2xl flex items-center justify-center text-rose-600 mx-auto">
+          <ShieldAlert className="w-8 h-8" />
+        </div>
+        <h2 className="text-xl font-black text-slate-900">Acceso Exclusivo Reservado</h2>
+        <p className="text-xs text-slate-500 leading-relaxed">
+          La administración centralizada de usuarios, asignación de campamentos y configuración de matriz de permisos está restringida exclusivamente para el <span className="font-bold text-slate-800">Desarrollador Principal</span> de INGMELEC.
+        </p>
+      </div>
+    );
+  }
+
+  const handleOpenCreateModal = () => {
+    setEditingUserId(null);
+    setUserFormData({
+      nombre: '',
+      email: '',
+      password: '',
+      rol: 'almacen',
+      cargo: '',
+      area: 'Almacén',
+      campamento_id: campamentos.length > 0 ? String(campamentos[0].id) : '',
+      campamentos_adicionales: [],
+      permisos: DEFAULT_ROLE_PERMISSIONS.almacen || []
     });
-
-    setSavingUser(false);
-    if (!result?.success) {
-      setOperationError(result?.message || 'No se pudo crear el operador en MySQL.');
-      return;
-    }
-
-    setOperationSuccess(result.message || 'Operador creado correctamente en MySQL.');
-    setShowNewUserModal(false);
-
-    // Clear form
-    setNewUsername('');
-    setNewName('');
-    setNewRole('Supervisor');
+    setShowUserModal(true);
   };
 
-  const getStatusColor = (status) => {
-    switch (status) {
-      case 'Activo': return 'bg-industrial-green/10 border-industrial-green/30 text-industrial-green';
-      case 'Suspendido': return 'bg-industrial-red/10 border-industrial-red/30 text-industrial-red border-dashed animate-pulse';
-      default: return 'bg-slate-500/10 border-slate-500/30 text-slate-400';
+  const handleOpenEditModal = (u) => {
+    setEditingUserId(u.id);
+    const assignedIds = (u.campamentos || []).map(c => c.id);
+    const principalId = u.campamento_id ? String(u.campamento_id) : (assignedIds.length > 0 ? String(assignedIds[0]) : '');
+    const additionalIds = assignedIds.filter(id => String(id) !== principalId);
+
+    setUserFormData({
+      nombre: u.nombre || '',
+      email: u.email || '',
+      password: '', // Dejar en blanco para no modificar
+      rol: u.rol || 'almacen',
+      cargo: u.cargo || '',
+      area: u.area || 'Almacén',
+      campamento_id: principalId,
+      campamentos_adicionales: additionalIds,
+      permisos: Array.isArray(u.permisos) ? u.permisos : (DEFAULT_ROLE_PERMISSIONS[u.rol] || [])
+    });
+    setShowUserModal(true);
+  };
+
+  const handleRoleChange = (newRole) => {
+    const suggestedPerms = DEFAULT_ROLE_PERMISSIONS[newRole] || [];
+    setUserFormData(prev => ({
+      ...prev,
+      rol: newRole,
+      permisos: suggestedPerms
+    }));
+  };
+
+  const togglePermission = (permKey) => {
+    setUserFormData(prev => {
+      const exists = prev.permisos.includes(permKey);
+      return {
+        ...prev,
+        permisos: exists
+          ? prev.permisos.filter(p => p !== permKey)
+          : [...prev.permisos, permKey]
+      };
+    });
+  };
+
+  const selectAllPermissions = () => {
+    const all = [];
+    AVAILABLE_PERMISSIONS.forEach(cat => cat.items.forEach(i => all.push(i.key)));
+    setUserFormData(prev => ({ ...prev, permisos: all }));
+  };
+
+  const toggleAdditionalCampamento = (cId) => {
+    setUserFormData(prev => {
+      const exists = prev.campamentos_adicionales.includes(cId);
+      return {
+        ...prev,
+        campamentos_adicionales: exists
+          ? prev.campamentos_adicionales.filter(id => id !== cId)
+          : [...prev.campamentos_adicionales, cId]
+      };
+    });
+  };
+
+  const handleSubmitUser = async (e) => {
+    e.preventDefault();
+    setSubmittingUser(true);
+    try {
+      const allCampamentos = [];
+      if (userFormData.campamento_id) {
+        allCampamentos.push(parseInt(userFormData.campamento_id));
+      }
+      userFormData.campamentos_adicionales.forEach(id => {
+        if (!allCampamentos.includes(id)) allCampamentos.push(id);
+      });
+
+      const payload = {
+        nombre: userFormData.nombre.trim(),
+        email: userFormData.email.trim().toLowerCase(),
+        rol: userFormData.rol,
+        cargo: userFormData.cargo.trim(),
+        area: userFormData.area.trim(),
+        campamento_id: userFormData.campamento_id ? parseInt(userFormData.campamento_id) : null,
+        campamentos: allCampamentos,
+        permisos: userFormData.permisos
+      };
+
+      if (!editingUserId) {
+        payload.password = userFormData.password;
+        const res = await createUsuario(payload);
+        if (res.success) {
+          setShowUserModal(false);
+          loadAllData();
+        }
+      } else {
+        const res = await updateUsuario(editingUserId, payload);
+        if (res.success) {
+          setShowUserModal(false);
+          loadAllData();
+        }
+      }
+    } finally {
+      setSubmittingUser(false);
+    }
+  };
+
+  const handleToggleEstado = async (u) => {
+    const nuevoEstado = u.activo === 1 ? 0 : 1;
+    const res = await updateUsuarioEstado(u.id, nuevoEstado);
+    if (res.success) {
+      loadAllData();
+    }
+  };
+
+  const handleOpenPasswordReset = (u) => {
+    setPasswordUserId(u.id);
+    setNewPassword('');
+    setShowPasswordModal(true);
+  };
+
+  const handleSubmitPasswordReset = async (e) => {
+    e.preventDefault();
+    if (!newPassword || newPassword.length < 8) {
+      showToast('La nueva contraseña debe tener mínimo 8 caracteres.', 'error');
+      return;
+    }
+    setSubmittingPassword(true);
+    try {
+      const res = await recoverUsuarioPassword(passwordUserId, newPassword);
+      if (res.success) {
+        setShowPasswordModal(false);
+      }
+    } finally {
+      setSubmittingPassword(false);
+    }
+  };
+
+  const getRoleBadge = (rol) => {
+    switch (rol) {
+      case 'developer':
+        return <span className="px-2.5 py-0.5 rounded-full text-[10px] font-extrabold bg-amber-500/10 text-amber-700 border border-amber-500/30 uppercase">Developer</span>;
+      case 'admin':
+        return <span className="px-2.5 py-0.5 rounded-full text-[10px] font-bold bg-rose-100 text-rose-800 border border-rose-200">Admin Operativo</span>;
+      case 'almacen':
+        return <span className="px-2.5 py-0.5 rounded-full text-[10px] font-bold bg-[#F28524]/20 text-[#F28524] border border-[#F28524]/30">Almacén</span>;
+      case 'supervisor':
+        return <span className="px-2.5 py-0.5 rounded-full text-[10px] font-bold bg-blue-100 text-blue-800 border border-blue-200">Supervisor</span>;
+      case 'gerencia':
+        return <span className="px-2.5 py-0.5 rounded-full text-[10px] font-bold bg-purple-100 text-purple-800 border border-purple-200">Gerencia</span>;
+      default:
+        return <span className="px-2.5 py-0.5 rounded-full text-[10px] font-bold bg-slate-100 text-slate-700 border border-slate-300">Auditor</span>;
     }
   };
 
   return (
     <div className="space-y-6">
-      {(operationError || operationSuccess) && (
-        <div className={`glass-panel rounded-lg p-3 border text-xs font-bold ${
-          operationError
-            ? 'border-industrial-red text-industrial-red bg-industrial-red/5'
-            : 'border-industrial-green text-industrial-green bg-industrial-green/5'
-        }`}>
-          {operationError || operationSuccess}
-        </div>
-      )}
-      
-      {/* Tab Selectors & Search bar */}
-      <div className="flex flex-col md:flex-row gap-4 items-center justify-between border-b border-industrial-border pb-4">
-        
-        {/* Toggle between hierarchy view and list view */}
-        <div className="flex space-x-1 p-1 bg-industrial-bg bg-opacity-70 rounded border border-industrial-border font-semibold self-start">
-          <button
-            onClick={() => setActiveTab('Tabla')}
-            className={`px-4 py-1.5 rounded text-xs tracking-wider uppercase transition-all ${
-              activeTab === 'Tabla' 
-                ? 'bg-industrial-cyan text-industrial-bg font-extrabold'
-                : 'text-industrial-gray hover:text-white'
-            }`}
-          >
-            Usuarios y Seguridad
-          </button>
-          <button
-            onClick={() => setActiveTab('Jerarquía')}
-            className={`px-4 py-1.5 rounded text-xs tracking-wider uppercase transition-all ${
-              activeTab === 'Jerarquía' 
-                ? 'bg-industrial-cyan text-industrial-bg font-extrabold'
-                : 'text-industrial-gray hover:text-white'
-            }`}
-          >
-            Visor Jerárquico
-          </button>
-        </div>
-
-        {activeTab === 'Tabla' && (
-          <div className="flex space-x-2 w-full md:w-auto justify-end">
-            <div className="relative w-full sm:w-64">
-              <span className="absolute inset-y-0 left-0 pl-3 flex items-center text-industrial-gray">
-                <Search size={12} />
-              </span>
-              <input
-                type="text"
-                placeholder="Buscar operador por nombre o rol..."
-                value={searchTerm}
-                onChange={(e) => setSearchTerm(e.target.value)}
-                className="w-full bg-industrial-bg bg-opacity-70 border border-industrial-border rounded px-3 py-1 text-xs text-white focus:outline-none focus:border-industrial-cyan"
-              />
-            </div>
-
-            <button
-              onClick={() => setShowNewUserModal(true)}
-              className="flex items-center space-x-1 px-3 py-1 rounded bg-gradient-to-r from-industrial-cyan to-blue-600 hover:from-cyan-400 hover:to-blue-500 text-industrial-bg text-xs font-extrabold uppercase tracking-wider transition-all shadow-cyan-glow"
-            >
-              <Plus size={12} />
-              <span>Crear</span>
-            </button>
+      {/* Header Banner */}
+      <div className="bg-slate-900 text-white p-6 rounded-3xl shadow-sm border border-slate-800 flex flex-col md:flex-row md:items-center justify-between gap-4">
+        <div className="space-y-1">
+          <div className="inline-flex items-center space-x-2 px-3 py-0.5 bg-amber-500/20 border border-amber-500/30 rounded-full text-[11px] font-bold text-amber-400 uppercase tracking-wider">
+            <span>Control Exclusivo del Desarrollador Principal</span>
           </div>
-        )}
+          <h1 className="text-2xl font-black tracking-tight text-white flex items-center space-x-2">
+            <Users className="w-6 h-6 text-[#F28524]" />
+            <span>Administración Central de Usuarios y Multi-Almacén</span>
+          </h1>
+          <p className="text-xs text-slate-300 leading-relaxed max-w-2xl">
+            Gestión integral de credenciales, roles operativos, asignación territorial por campamentos y matriz granular de permisos para INGMELEC ALMACÉN GENERAL.
+          </p>
+        </div>
 
+        <div className="flex items-center space-x-2">
+          <button
+            onClick={handleOpenCreateModal}
+            className="px-4 py-2.5 bg-[#F28524] hover:bg-[#d87019] text-white rounded-xl text-xs font-bold shadow-lg shadow-[#F28524]/25 flex items-center space-x-2 transition-all"
+          >
+            <UserPlus className="w-4 h-4" />
+            <span>Crear Nuevo Usuario</span>
+          </button>
+        </div>
       </div>
 
-      {/* Tab 1: Access List */}
-      {activeTab === 'Tabla' ? (
-        <div className="glass-panel rounded-lg overflow-hidden border-opacity-40">
+      {/* Navigation Tabs */}
+      <div className="flex items-center space-x-2 border-b border-slate-200 pb-2">
+        <button
+          onClick={() => setActiveTab('usuarios')}
+          className={`px-4 py-2 rounded-xl text-xs font-bold transition-all flex items-center space-x-2 ${
+            activeTab === 'usuarios'
+              ? 'bg-[#F28524] text-white shadow-md shadow-[#F28524]/20'
+              : 'text-slate-600 hover:text-slate-900 hover:bg-slate-100'
+          }`}
+        >
+          <Users className="w-4 h-4" />
+          <span>Usuarios Activos ({usuarios.length})</span>
+        </button>
+        <button
+          onClick={() => setActiveTab('auditoria')}
+          className={`px-4 py-2 rounded-xl text-xs font-bold transition-all flex items-center space-x-2 ${
+            activeTab === 'auditoria'
+              ? 'bg-[#F28524] text-white shadow-md shadow-[#F28524]/20'
+              : 'text-slate-600 hover:text-slate-900 hover:bg-slate-100'
+          }`}
+        >
+          <History className="w-4 h-4" />
+          <span>Bitácora de Modificaciones de Acceso</span>
+        </button>
+      </div>
+
+      {/* Main Tab: Usuarios List */}
+      {activeTab === 'usuarios' && (
+        <div className="bg-white rounded-2xl shadow-sm border border-slate-200/80 overflow-hidden">
           <div className="overflow-x-auto">
-            <table className="w-full text-left text-xs border-collapse">
+            <table className="w-full text-left text-xs">
               <thead>
-                <tr className="bg-industrial-bg bg-opacity-80 text-industrial-gray font-bold uppercase tracking-wider border-b border-industrial-border text-[9px]">
-                  <th className="p-4">Código Operador / Nombre</th>
-                  <th className="p-4">Rol en Sistema</th>
-                  <th className="p-4">Lote / Zona Asignada</th>
-                  <th className="p-4">Seguridad Acceso</th>
-                  <th className="p-4">Estado</th>
-                  <th className="p-4 text-right">Acciones</th>
+                <tr className="bg-slate-50 border-b border-slate-100 text-slate-600 font-bold uppercase tracking-wider">
+                  <th className="py-3 px-4">Usuario / Cargo</th>
+                  <th className="py-3 px-4">Correo Institucional</th>
+                  <th className="py-3 px-4">Rol Operativo</th>
+                  <th className="py-3 px-4">Campamentos Asignados</th>
+                  <th className="py-3 px-4 text-center">Permisos</th>
+                  <th className="py-3 px-4 text-center">Estado</th>
+                  <th className="py-3 px-4 text-right">Acciones</th>
                 </tr>
               </thead>
-              <tbody className="divide-y divide-industrial-border font-semibold">
-                {filteredUsers.map((u) => (
-                  <tr key={u.id} className="hover:bg-industrial-border hover:bg-opacity-20 transition-all">
-                    <td className="p-4">
-                      <div className="font-bold text-white text-sm">@{u.username}</div>
-                      <div className="text-[10px] text-industrial-gray font-bold uppercase tracking-wider mt-0.5">{u.name}</div>
+              <tbody className="divide-y divide-slate-100">
+                {loading ? (
+                  <tr>
+                    <td colSpan="7" className="py-12 text-center text-slate-400">
+                      Cargando listado de usuarios...
                     </td>
-                    <td className="p-4">
-                      <span className="bg-industrial-border px-2 py-0.5 rounded text-[10px] text-industrial-cyan uppercase tracking-wider">
-                        {u.role}
+                  </tr>
+                ) : usuarios.map(u => (
+                  <tr key={u.id} className={`hover:bg-slate-50/70 transition-colors ${u.activo === 0 ? 'bg-slate-50/50 opacity-60' : ''}`}>
+                    <td className="py-3 px-4">
+                      <div className="font-bold text-slate-900 flex items-center space-x-1.5">
+                        <span>{u.nombre}</span>
+                        {u.es_developer === 1 && (
+                          <span className="text-[10px] bg-amber-500 text-white font-mono px-1.5 py-0.2 rounded font-bold">DEV</span>
+                        )}
+                      </div>
+                      <div className="text-[11px] text-slate-400">{u.cargo || 'Funcionario'}</div>
+                    </td>
+                    <td className="py-3 px-4 text-slate-700 font-mono text-[11px]">
+                      {u.email}
+                    </td>
+                    <td className="py-3 px-4 whitespace-nowrap">
+                      {getRoleBadge(u.rol)}
+                    </td>
+                    <td className="py-3 px-4">
+                      <div className="flex flex-wrap gap-1 max-w-xs">
+                        {u.es_developer === 1 ? (
+                          <span className="inline-flex items-center px-2 py-0.5 rounded-md text-[10px] font-bold bg-amber-50 text-amber-700 border border-amber-200">
+                            Acceso Global a Todas las Sedes
+                          </span>
+                        ) : (u.campamentos && u.campamentos.length > 0) ? (
+                          u.campamentos.map(c => (
+                            <span
+                              key={c.id}
+                              className={`inline-flex items-center px-2 py-0.5 rounded-md text-[10px] font-medium border ${
+                                c.es_principal
+                                  ? 'bg-[#F28524]/10 text-[#F28524] border-[#F28524]/30 font-bold'
+                                  : 'bg-slate-100 text-slate-700 border-slate-200'
+                              }`}
+                            >
+                              <MapPin className="w-2.5 h-2.5 mr-0.5" />
+                              {c.nombre} {c.es_principal ? '(Principal)' : ''}
+                            </span>
+                          ))
+                        ) : (
+                          <span className="text-[10px] text-slate-400 italic">Sin sede asignada</span>
+                        )}
+                      </div>
+                    </td>
+                    <td className="py-3 px-4 text-center">
+                      <span className="px-2 py-0.5 rounded-full text-[10px] font-mono font-bold bg-slate-100 text-slate-700 border border-slate-200">
+                        {u.permisos?.includes('*') ? 'TOTAL (*)' : `${(u.permisos || []).length} asignados`}
                       </span>
                     </td>
-                    <td className="p-4 text-white text-[11px]">{u.zone}</td>
-                    <td className="p-4">
-                      <span className="text-[10px] text-industrial-gray font-semibold">Cifrado de Sesión: SHA-256</span>
-                    </td>
-                    <td className="p-4">
-                      <span className={`px-2 py-0.5 border rounded text-[9px] uppercase font-bold tracking-wider ${getStatusColor(u.status)}`}>
-                        {u.status}
-                      </span>
-                    </td>
-                    <td className="p-4 text-right">
-                      {(currentRole === 'Developer' || currentRole === 'Gerente') && u.username !== 'dev' ? (
+                    <td className="py-3 px-4 text-center">
+                      {u.es_developer === 1 ? (
+                        <span className="inline-flex items-center text-emerald-700 font-bold text-[11px]">
+                          <CheckCircle2 className="w-3.5 h-3.5 mr-1" /> Activo Permanente
+                        </span>
+                      ) : (
                         <button
-                          onClick={() => handleToggleUserStatus(u.id)}
-                          className={`px-2 py-1 rounded text-[9px] font-extrabold uppercase tracking-wider transition-colors inline-flex items-center space-x-1 ${
-                            u.status === 'Activo' 
-                              ? 'bg-industrial-red/10 border border-industrial-red/35 text-industrial-red hover:bg-industrial-red/20' 
-                              : 'bg-industrial-green/10 border border-industrial-green/35 text-industrial-green hover:bg-industrial-green/20'
+                          onClick={() => handleToggleEstado(u)}
+                          title={`Click para ${u.activo === 1 ? 'desactivar' : 'activar'} cuenta`}
+                          className={`inline-flex items-center px-2.5 py-1 rounded-full text-[11px] font-bold transition-all border ${
+                            u.activo === 1
+                              ? 'bg-emerald-50 text-emerald-700 border-emerald-200 hover:bg-rose-50 hover:text-rose-700 hover:border-rose-200'
+                              : 'bg-rose-50 text-rose-700 border-rose-200 hover:bg-emerald-50 hover:text-emerald-700 hover:border-emerald-200'
                           }`}
                         >
-                          {u.status === 'Activo' ? <UserX size={10} /> : <UserCheck size={10} />}
-                          <span>{u.status === 'Activo' ? 'Suspender' : 'Activar'}</span>
+                          {u.activo === 1 ? (
+                            <>
+                              <CheckCircle2 className="w-3 h-3 mr-1" /> Activo
+                            </>
+                          ) : (
+                            <>
+                              <XCircle className="w-3 h-3 mr-1" /> Inactivo
+                            </>
+                          )}
                         </button>
-                      ) : (
-                        <span className="text-[10px] text-industrial-gray font-semibold">Bloqueado</span>
                       )}
+                    </td>
+                    <td className="py-3 px-4 text-right">
+                      <div className="flex items-center justify-end space-x-1.5">
+                        <button
+                          onClick={() => handleOpenPasswordReset(u)}
+                          title="Restablecer Contraseña"
+                          className="p-1.5 text-slate-500 hover:text-slate-800 hover:bg-slate-100 rounded-lg transition-colors"
+                        >
+                          <KeyRound className="w-4 h-4" />
+                        </button>
+                        <button
+                          onClick={() => handleOpenEditModal(u)}
+                          title="Editar Datos y Permisos"
+                          className="p-1.5 text-slate-500 hover:text-[#F28524] hover:bg-slate-100 rounded-lg transition-colors"
+                        >
+                          <Edit3 className="w-4 h-4" />
+                        </button>
+                      </div>
                     </td>
                   </tr>
                 ))}
@@ -220,194 +507,281 @@ const UsuariosPage = () => {
             </table>
           </div>
         </div>
-      ) : (
-        
-        /* Tab 2: Visual hierarchical operational tree visualizer */
-        <div className="glass-panel rounded-lg p-8 space-y-8 relative overflow-hidden border-opacity-40">
-          
-          <div className="flex items-center justify-between border-b border-industrial-border pb-3 mb-6">
-            <div className="flex items-center space-x-2 text-industrial-cyan">
-              <GitMerge size={16} />
-              <h4 className="text-xs font-bold text-white uppercase tracking-wider">Esquema Jerárquico de Control Operativo Lote 4</h4>
-            </div>
-            <span className="text-[9px] text-industrial-gray font-semibold">Actualizado: En Vivo</span>
+      )}
+
+      {/* Tab: Auditoria de Usuarios */}
+      {activeTab === 'auditoria' && (
+        <div className="bg-white rounded-2xl shadow-sm border border-slate-200/80 overflow-hidden">
+          <div className="p-4 border-b border-slate-100 flex items-center justify-between">
+            <h3 className="font-bold text-xs uppercase tracking-wider text-slate-600">
+              Registro Trazable de Operaciones de Administración
+            </h3>
+            <span className="text-[11px] text-slate-400 font-mono">Últimas {auditorias.length} entradas</span>
           </div>
-
-          {/* Hierarchy Roots */}
-          <div className="space-y-6 max-w-2xl mx-auto font-semibold">
-            
-            {/* Level 1: Coordinador William */}
-            <div className="p-4 bg-industrial-cyan bg-opacity-5 border border-industrial-cyan rounded-lg shadow-cyan-glow flex items-center justify-between">
-              <div className="flex items-center space-x-3">
-                <div className="w-8 h-8 rounded-full bg-industrial-cyan flex items-center justify-center font-bold text-sm text-industrial-bg">
-                  W
-                </div>
-                <div>
-                  <h5 className="font-extrabold text-sm text-white leading-none">Coordinador William</h5>
-                  <span className="text-[9px] text-industrial-gray uppercase font-bold mt-1 block">Roster General Lote 4 Noroeste</span>
-                </div>
-              </div>
-              <span className="text-[9px] bg-industrial-border px-2 py-0.5 rounded text-white font-bold uppercase tracking-wider">Nivel 2 Jerárquico</span>
-            </div>
-
-            {/* Down Connector branch */}
-            <div className="w-0.5 h-6 bg-gradient-to-b from-industrial-cyan to-industrial-orange ml-8" />
-
-            {/* Level 2: Supervisors branch Grid */}
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-8 pl-4">
-              
-              {/* Supervisor 1 Branch: Isaac */}
-              <div className="space-y-4">
-                <div className="p-3 bg-industrial-orange bg-opacity-5 border border-industrial-orange rounded-lg shadow-orange-glow flex items-center space-x-3">
-                  <div className="w-7 h-7 rounded-full bg-industrial-orange flex items-center justify-center font-bold text-xs text-industrial-bg">
-                    I
-                  </div>
-                  <div>
-                    <h5 className="font-extrabold text-xs text-white leading-none">Supervisor Isaac G.</h5>
-                    <span className="text-[8px] text-industrial-gray uppercase font-bold mt-0.5 block">Supervisor TCT</span>
-                  </div>
-                </div>
-
-                {/* Connectors to Brigades */}
-                <div className="pl-6 space-y-2 border-l border-industrial-orange/30 ml-4 py-2">
-                  {brigadas
-                    .filter(b => b.supervisorId === 'SUP-001')
-                    .map(b => (
-                      <div key={b.id} className="p-2 bg-industrial-bg bg-opacity-40 border border-industrial-border rounded flex items-center justify-between text-[11px] hover:border-industrial-orange transition-colors">
-                        <div>
-                          <span className="text-white font-bold block">{b.id}</span>
-                          <span className="text-[8px] text-industrial-gray uppercase font-semibold">{b.tipo} | Veh: {b.vehiculo}</span>
-                        </div>
-                        <span className="text-[9px] text-industrial-orange font-bold uppercase tracking-wider">Roster Ok</span>
-                      </div>
-                    ))}
-                </div>
-              </div>
-
-              {/* Supervisor 2 Branch: Cristian */}
-              <div className="space-y-4">
-                <div className="p-3 bg-industrial-orange bg-opacity-5 border border-industrial-orange rounded-lg shadow-orange-glow flex items-center space-x-3">
-                  <div className="w-7 h-7 rounded-full bg-industrial-orange flex items-center justify-center font-bold text-xs text-industrial-bg">
-                    C
-                  </div>
-                  <div>
-                    <h5 className="font-extrabold text-xs text-white leading-none">Supervisor Cristian P.</h5>
-                    <span className="text-[8px] text-industrial-gray uppercase font-bold mt-0.5 block">Supervisor Mantenimiento</span>
-                  </div>
-                </div>
-
-                {/* Connectors to Brigades */}
-                <div className="pl-6 space-y-2 border-l border-industrial-orange/30 ml-4 py-2">
-                  {brigadas
-                    .filter(b => b.supervisorId === 'SUP-002')
-                    .map(b => (
-                      <div key={b.id} className="p-2 bg-industrial-bg bg-opacity-40 border border-industrial-border rounded flex items-center justify-between text-[11px] hover:border-industrial-orange transition-colors">
-                        <div>
-                          <span className="text-white font-bold block">{b.id}</span>
-                          <span className="text-[8px] text-industrial-gray uppercase font-semibold">{b.tipo} | Veh: {b.vehiculo}</span>
-                        </div>
-                        <span className="text-[9px] text-industrial-orange font-bold uppercase tracking-wider">Roster Ok</span>
-                      </div>
-                    ))}
-                </div>
-              </div>
-
-            </div>
-
+          <div className="overflow-x-auto">
+            <table className="w-full text-left text-xs">
+              <thead>
+                <tr className="bg-slate-50 border-b border-slate-100 text-slate-600 font-bold uppercase tracking-wider">
+                  <th className="py-2.5 px-4">Fecha / Hora</th>
+                  <th className="py-2.5 px-4">Ejecutado Por</th>
+                  <th className="py-2.5 px-4">Acción</th>
+                  <th className="py-2.5 px-4">Usuario Afectado</th>
+                  <th className="py-2.5 px-4">Detalles</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-100 font-mono text-[11px]">
+                {auditorias.length === 0 ? (
+                  <tr>
+                    <td colSpan="5" className="py-8 text-center text-slate-400">
+                      No hay registros recientes en la bitácora de usuarios.
+                    </td>
+                  </tr>
+                ) : auditorias.map(log => (
+                  <tr key={log.id} className="hover:bg-slate-50/70">
+                    <td className="py-2.5 px-4 text-slate-500">
+                      {new Date(log.fecha).toLocaleString('es-DO')}
+                    </td>
+                    <td className="py-2.5 px-4 font-bold text-slate-800">
+                      {log.usuario_nombre}
+                    </td>
+                    <td className="py-2.5 px-4">
+                      <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-amber-50 text-amber-800 border border-amber-200">
+                        {log.accion}
+                      </span>
+                    </td>
+                    <td className="py-2.5 px-4 text-slate-700">
+                      ID #{log.entidad_id}
+                    </td>
+                    <td className="py-2.5 px-4 text-slate-600 max-w-md truncate font-sans text-xs">
+                      {log.detalles_nuevos || log.detalles_previos || '-'}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
           </div>
-
         </div>
       )}
 
-      {/* -------------------- MODAL: CREAR NUEVO OPERADOR -------------------- */}
-      {showNewUserModal && (
-        <div className="fixed inset-0 bg-black bg-opacity-70 backdrop-blur-sm z-50 flex items-center justify-center p-4">
-          <div 
-            className="w-full max-w-md glass-panel rounded-lg p-6 border-neon-cyan"
-            style={{ background: 'rgba(13, 21, 39, 0.95)' }}
-          >
-            <div className="flex items-center justify-between border-b border-industrial-border pb-3 mb-4">
-              <div className="flex items-center space-x-2 text-white">
-                <ShieldCheck size={18} className="text-industrial-cyan" />
-                <h3 className="font-extrabold text-sm uppercase tracking-wider">CREAR NUEVO OPERADOR DE ERP</h3>
+      {/* Modal Crear / Editar Usuario */}
+      {showUserModal && (
+        <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-sm flex items-center justify-center p-4 overflow-y-auto">
+          <div className="bg-white rounded-3xl shadow-2xl w-full max-w-3xl overflow-hidden border border-slate-200 my-8">
+            <div className="bg-slate-900 text-white p-5 flex items-center justify-between">
+              <div>
+                <h3 className="font-bold text-base flex items-center space-x-2">
+                  <Shield className="w-5 h-5 text-[#F28524]" />
+                  <span>{editingUserId ? 'Modificar Usuario y Permisos Granulares' : 'Alta de Nuevo Usuario'}</span>
+                </h3>
+                <p className="text-xs text-slate-400">Configuración territorial y matriz de privilegios en MySQL</p>
               </div>
-              <button onClick={() => setShowNewUserModal(false)} className="text-industrial-gray hover:text-white">
-                <X size={18} />
+              <button onClick={() => setShowUserModal(false)} className="text-slate-400 hover:text-white">
+                <X className="w-5 h-5" />
               </button>
             </div>
 
-            <form onSubmit={handleCreateUser} className="space-y-4 text-xs font-semibold">
-              {operationError && (
-                <div className="p-3 rounded border border-industrial-red bg-industrial-red/10 text-industrial-red font-bold">
-                  {operationError}
+            <form onSubmit={handleSubmitUser} className="p-6 space-y-6 text-xs max-h-[80vh] overflow-y-auto">
+              {/* Sección 1: Datos Básicos */}
+              <div className="space-y-4">
+                <h4 className="text-xs font-bold text-slate-800 uppercase tracking-wider border-b border-slate-100 pb-1">
+                  1. Datos de Cuenta y Perfil
+                </h4>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                  <div>
+                    <label className="block font-semibold text-slate-700 mb-1">Nombre Completo *</label>
+                    <input
+                      type="text"
+                      required
+                      placeholder="Ej. Ing. Rafael Mejía"
+                      value={userFormData.nombre}
+                      onChange={e => setUserFormData({ ...userFormData, nombre: e.target.value })}
+                      className="w-full px-3 py-2 border border-slate-300 rounded-xl focus:ring-2 focus:ring-[#F28524] focus:outline-none"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block font-semibold text-slate-700 mb-1">Correo Electrónico *</label>
+                    <input
+                      type="email"
+                      required
+                      placeholder="usuario@ingmelec.com"
+                      value={userFormData.email}
+                      onChange={e => setUserFormData({ ...userFormData, email: e.target.value })}
+                      className="w-full px-3 py-2 border border-slate-300 rounded-xl focus:ring-2 focus:ring-[#F28524] focus:outline-none"
+                    />
+                  </div>
+
+                  {!editingUserId && (
+                    <div>
+                      <label className="block font-semibold text-slate-700 mb-1">Contraseña Inicial *</label>
+                      <input
+                        type="password"
+                        required
+                        placeholder="Mínimo 8 caracteres..."
+                        value={userFormData.password}
+                        onChange={e => setUserFormData({ ...userFormData, password: e.target.value })}
+                        className="w-full px-3 py-2 border border-slate-300 rounded-xl focus:ring-2 focus:ring-[#F28524] focus:outline-none"
+                      />
+                    </div>
+                  )}
+
+                  <div>
+                    <label className="block font-semibold text-slate-700 mb-1">Rol Operativo *</label>
+                    <select
+                      value={userFormData.rol}
+                      onChange={e => handleRoleChange(e.target.value)}
+                      className="w-full px-3 py-2 border border-slate-300 rounded-xl focus:ring-2 focus:ring-[#F28524] focus:outline-none font-semibold text-slate-800"
+                    >
+                      <option value="almacen">Almacén (Encargado de inventario)</option>
+                      <option value="supervisor">Supervisor de Operaciones</option>
+                      <option value="admin">Administrador Operativo (Sin gestión de usuarios)</option>
+                      <option value="auditor">Auditor de Control Interno</option>
+                      <option value="gerencia">Gerencia General</option>
+                    </select>
+                  </div>
+
+                  <div>
+                    <label className="block font-semibold text-slate-700 mb-1">Cargo Institucional</label>
+                    <input
+                      type="text"
+                      placeholder="Ej. Encargado Almacén San Cristóbal"
+                      value={userFormData.cargo}
+                      onChange={e => setUserFormData({ ...userFormData, cargo: e.target.value })}
+                      className="w-full px-3 py-2 border border-slate-300 rounded-xl focus:ring-2 focus:ring-[#F28524] focus:outline-none"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block font-semibold text-slate-700 mb-1">Área Funcional</label>
+                    <input
+                      type="text"
+                      placeholder="Ej. Almacén Central, Logística..."
+                      value={userFormData.area}
+                      onChange={e => setUserFormData({ ...userFormData, area: e.target.value })}
+                      className="w-full px-3 py-2 border border-slate-300 rounded-xl focus:ring-2 focus:ring-[#F28524] focus:outline-none"
+                    />
+                  </div>
                 </div>
-              )}
-              
-              <div>
-                <label className="block text-[9px] text-industrial-gray uppercase font-bold tracking-widest mb-1">Nombre Completo del Operador *</label>
-                <input
-                  type="text"
-                  value={newName}
-                  onChange={(e) => setNewName(e.target.value)}
-                  placeholder="Ej. Manuel Alejandro Santos..."
-                  className="w-full bg-industrial-bg border border-industrial-border text-xs text-white rounded p-2 focus:outline-none focus:border-industrial-cyan"
-                  required
-                />
               </div>
 
-              <div className="grid grid-cols-2 gap-4">
-                <div>
-                  <label className="block text-[9px] text-industrial-gray uppercase font-bold tracking-widest mb-1">Código de Usuario *</label>
-                  <input
-                    type="text"
-                    value={newUsername}
-                    onChange={(e) => setNewUsername(e.target.value)}
-                    placeholder="Ej. manuel..."
-                    className="w-full bg-industrial-bg border border-industrial-border text-xs text-white rounded p-2 focus:outline-none focus:border-industrial-cyan font-mono"
-                    required
-                  />
-                </div>
-                <div>
-                  <label className="block text-[9px] text-industrial-gray uppercase font-bold tracking-widest mb-1">Rol Operacional *</label>
-                  <select
-                    value={newRole}
-                    onChange={(e) => setNewRole(e.target.value)}
-                    className="w-full bg-industrial-bg border border-industrial-border text-xs text-white rounded p-2 focus:outline-none focus:border-industrial-cyan"
-                    required
-                  >
-                    <option value="Coordinador">Coordinador de Lote</option>
-                    <option value="Supervisor TCT">Supervisor TCT</option>
-                    <option value="Supervisor Mantenimiento">Supervisor Mantenimiento</option>
-                    <option value="Gerente">Gerente Administrativo</option>
-                  </select>
+              {/* Sección 2: Asignación de Campamentos */}
+              <div className="space-y-4 pt-2">
+                <h4 className="text-xs font-bold text-slate-800 uppercase tracking-wider border-b border-slate-100 pb-1">
+                  2. Asignación Territorial de Campamentos
+                </h4>
+
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                  <div>
+                    <label className="block font-semibold text-slate-700 mb-1">Campamento Principal *</label>
+                    <select
+                      value={userFormData.campamento_id}
+                      onChange={e => setUserFormData({ ...userFormData, campamento_id: e.target.value })}
+                      className="w-full px-3 py-2 border border-slate-300 rounded-xl focus:ring-2 focus:ring-[#F28524] focus:outline-none font-medium"
+                    >
+                      <option value="">-- Seleccionar Sede Principal --</option>
+                      {campamentos.map(c => (
+                        <option key={c.id} value={c.id}>
+                          {c.nombre} ({c.provincia || 'Sede'})
+                        </option>
+                      ))}
+                    </select>
+                    <p className="text-[10px] text-slate-400 mt-1">Sede predeterminada al iniciar sesión.</p>
+                  </div>
+
+                  <div>
+                    <label className="block font-semibold text-slate-700 mb-1">Sedes Autorizadas Adicionales</label>
+                    <div className="p-3 border border-slate-200 rounded-xl space-y-2 max-h-32 overflow-y-auto bg-slate-50/50">
+                      {campamentos
+                        .filter(c => String(c.id) !== String(userFormData.campamento_id))
+                        .map(c => {
+                          const isChecked = userFormData.campamentos_adicionales.includes(c.id);
+                          return (
+                            <label key={c.id} className="flex items-center space-x-2 cursor-pointer text-slate-700 hover:text-slate-900">
+                              <input
+                                type="checkbox"
+                                checked={isChecked}
+                                onChange={() => toggleAdditionalCampamento(c.id)}
+                                className="rounded text-[#F28524] focus:ring-[#F28524]"
+                              />
+                              <span className="font-medium">{c.nombre}</span>
+                            </label>
+                          );
+                        })}
+                    </div>
+                  </div>
                 </div>
               </div>
 
-              <div>
-                <label className="block text-[9px] text-industrial-gray uppercase font-bold tracking-widest mb-1">Lote / Zona Asignada</label>
-                <input
-                  type="text"
-                  value={newZone}
-                  onChange={(e) => setNewZone(e.target.value)}
-                  className="w-full bg-industrial-bg border border-industrial-border text-xs text-white rounded p-2 focus:outline-none focus:border-industrial-cyan"
-                />
+              {/* Sección 3: Matriz de Permisos */}
+              <div className="space-y-4 pt-2">
+                <div className="flex items-center justify-between border-b border-slate-100 pb-1">
+                  <h4 className="text-xs font-bold text-slate-800 uppercase tracking-wider">
+                    3. Matriz Granular de Privilegios (Mínimo Privilegio)
+                  </h4>
+                  <div className="flex items-center space-x-2">
+                    <button
+                      type="button"
+                      onClick={() => handleRoleChange(userFormData.rol)}
+                      className="text-[11px] text-[#F28524] hover:underline font-semibold"
+                    >
+                      Restaurar valores del rol
+                    </button>
+                    <span className="text-slate-300">|</span>
+                    <button
+                      type="button"
+                      onClick={selectAllPermissions}
+                      className="text-[11px] text-slate-600 hover:text-slate-900 font-semibold"
+                    >
+                      Seleccionar todos
+                    </button>
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  {AVAILABLE_PERMISSIONS.map(cat => (
+                    <div key={cat.categoria} className="p-3 bg-slate-50 border border-slate-200 rounded-xl space-y-2">
+                      <div className="font-bold text-slate-800 text-[11px] flex items-center space-x-1">
+                        <CheckSquare className="w-3.5 h-3.5 text-[#F28524]" />
+                        <span>{cat.categoria}</span>
+                      </div>
+                      <div className="space-y-1 pl-1">
+                        {cat.items.map(item => {
+                          const isChecked = userFormData.permisos.includes(item.key) || userFormData.permisos.includes('*');
+                          return (
+                            <label key={item.key} className="flex items-center space-x-2 cursor-pointer text-slate-700 hover:text-slate-900 text-[11px]">
+                              <input
+                                type="checkbox"
+                                checked={isChecked}
+                                onChange={() => togglePermission(item.key)}
+                                className="rounded text-[#F28524] focus:ring-[#F28524]"
+                              />
+                              <span className="font-mono text-[10px] text-slate-400">{item.key}</span>
+                              <span>·</span>
+                              <span>{item.label}</span>
+                            </label>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  ))}
+                </div>
               </div>
 
-              <div className="flex space-x-2 pt-2">
+              {/* Action Buttons */}
+              <div className="flex justify-end space-x-2 pt-4 border-t border-slate-100">
                 <button
                   type="button"
-                  onClick={() => setShowNewUserModal(false)}
-                  className="w-1/2 py-2 rounded bg-industrial-border hover:bg-opacity-60 text-white font-extrabold text-[10px] uppercase tracking-wider"
+                  onClick={() => setShowUserModal(false)}
+                  className="px-4 py-2 border border-slate-200 text-slate-700 rounded-xl hover:bg-slate-50 font-semibold"
                 >
                   Cancelar
                 </button>
                 <button
                   type="submit"
-                  disabled={savingUser}
-                  className="w-1/2 py-2 rounded bg-industrial-cyan text-industrial-bg hover:bg-cyan-400 font-extrabold text-[10px] uppercase tracking-wider flex items-center justify-center space-x-1"
+                  disabled={submittingUser}
+                  className="px-6 py-2 bg-[#F28524] hover:bg-[#d87019] text-white rounded-xl font-bold shadow-md shadow-[#F28524]/20"
                 >
-                  <Save size={12} />
-                  <span>{savingUser ? 'Creando...' : 'Crear Operador'}</span>
+                  {submittingUser ? 'Guardando en MySQL...' : (editingUserId ? 'Guardar Cambios' : 'Crear Usuario')}
                 </button>
               </div>
             </form>
@@ -415,8 +789,57 @@ const UsuariosPage = () => {
         </div>
       )}
 
+      {/* Modal Restablecer Contraseña */}
+      {showPasswordModal && (
+        <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="bg-white rounded-2xl shadow-2xl w-full max-w-sm overflow-hidden border border-slate-200">
+            <div className="bg-slate-900 text-white p-4 flex items-center justify-between">
+              <h3 className="font-bold text-sm flex items-center space-x-2">
+                <KeyRound className="w-4 h-4 text-[#F28524]" />
+                <span>Restablecer Contraseña Directa</span>
+              </h3>
+              <button onClick={() => setShowPasswordModal(false)} className="text-slate-400 hover:text-white">
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <form onSubmit={handleSubmitPasswordReset} className="p-5 space-y-4 text-xs">
+              <p className="text-slate-500 text-[11px]">
+                Introduzca la nueva contraseña institucional. El hash PBKDF2 se generará de manera segura en MariaDB.
+              </p>
+
+              <div>
+                <label className="block font-semibold text-slate-700 mb-1">Nueva Contraseña *</label>
+                <input
+                  type="password"
+                  required
+                  placeholder="Mínimo 8 caracteres..."
+                  value={newPassword}
+                  onChange={e => setNewPassword(e.target.value)}
+                  className="w-full px-3 py-2 border border-slate-300 rounded-xl focus:ring-2 focus:ring-[#F28524] focus:outline-none"
+                />
+              </div>
+
+              <div className="flex justify-end space-x-2 pt-2 border-t border-slate-100">
+                <button
+                  type="button"
+                  onClick={() => setShowPasswordModal(false)}
+                  className="px-3 py-1.5 border border-slate-200 text-slate-700 rounded-lg hover:bg-slate-50"
+                >
+                  Cancelar
+                </button>
+                <button
+                  type="submit"
+                  disabled={submittingPassword}
+                  className="px-4 py-1.5 bg-[#F28524] hover:bg-[#d87019] text-white rounded-lg font-bold shadow"
+                >
+                  {submittingPassword ? 'Aplicando...' : 'Aplicar Nueva Clave'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
     </div>
   );
-};
-
-export default UsuariosPage;
+}

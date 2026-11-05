@@ -1,172 +1,162 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { AppProvider, useApp } from './context/AppContext';
 import Sidebar from './components/layout/Sidebar';
 import Topbar from './components/layout/Topbar';
 
-// Page Imports
+// Enterprise Inventory Pages
 import LoginPage from './pages/LoginPage';
 import DashboardPage from './pages/DashboardPage';
-import BrigadasPage from './pages/BrigadasPage';
-import TecnicosPage from './pages/TecnicosPage';
-import PersonalPage from './pages/PersonalPage';
-import InventarioPage from './pages/InventarioPage';
-import ActasPage from './pages/ActasPage';
-import ReposicionesPage from './pages/ReposicionesPage';
-import SwapsPage from './pages/SwapsPage';
-import DevolucionesPage from './pages/DevolucionesPage';
-import UsuariosPage from './pages/UsuariosPage';
-import AuditoriaPage from './pages/AuditoriaPage';
+import InventarioGeneralPage from './pages/InventarioGeneralPage';
+import InformaticaPage from './pages/InformaticaPage';
+import OficinasPage from './pages/OficinasPage';
+import CocinaPage from './pages/CocinaPage';
+import AlmacenPage from './pages/AlmacenPage';
+import LevantamientosPage from './pages/LevantamientosPage';
+import UbicacionesPage from './pages/UbicacionesPage';
+import MovimientosPage from './pages/MovimientosPage';
 import ReportesPage from './pages/ReportesPage';
-import SecurityCenterPage from './pages/SecurityCenterPage';
-import ExecutiveDemoStepper from './components/demo/ExecutiveDemoStepper';
-import ErrorBoundary from './components/common/ErrorBoundary';
-
+import AuditoriaPage from './pages/AuditoriaPage';
+import UsuariosPage from './pages/UsuariosPage';
 
 const AppContent = () => {
   const { currentUser, currentRole } = useApp();
-  
-  // Navigation states
+
+  // Navigation State & URL parameters
   const [activePage, setActivePage] = useState('dashboard');
+  const [pageParams, setPageParams] = useState({});
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
-  const [demoModeActive, setDemoModeActive] = useState(false);
 
-  // Cross-linking parameter: when clicking a tech, we load their profile
-  const [selectedTechId, setSelectedTechId] = useState(null);
+  // Sync state from URL
+  const syncFromUrl = useCallback(() => {
+    const path = window.location.pathname.replace(/^\//, '').toLowerCase();
+    const searchParams = new URLSearchParams(window.location.search);
+    const params = {};
+    for (const [key, value] of searchParams.entries()) {
+      params[key] = value;
+    }
 
-  // Reset active page to dashboard when user session changes to prevent session state leaks
-  React.useEffect(() => {
-    setActivePage('dashboard');
-    setSelectedTechId(null);
-  }, [currentUser?.username]);
+    const validPages = [
+      'dashboard', 'inventario', 'informatica', 'oficinas',
+      'cocina', 'almacen', 'levantamientos', 'ubicaciones', 'movimientos',
+      'reportes', 'auditoria', 'usuarios'
+    ];
 
-  // If no user is authenticated, lock under LoginPage
+    const targetPage = validPages.includes(path) ? path : 'dashboard';
+    setActivePage(targetPage);
+    setPageParams(params);
+  }, []);
+
+  useEffect(() => {
+    syncFromUrl();
+    const handlePopState = () => {
+      syncFromUrl();
+    };
+    window.addEventListener('popstate', handlePopState);
+    return () => window.removeEventListener('popstate', handlePopState);
+  }, [syncFromUrl]);
+
+  // Navigate function that pushes URL with search parameters
+  const navigateTo = (page, params = {}) => {
+    const query = new URLSearchParams();
+    Object.entries(params).forEach(([k, v]) => {
+      if (v !== undefined && v !== null && v !== '' && v !== 'TODOS') {
+        query.append(k, v);
+      }
+    });
+    const queryString = query.toString();
+    const newUrl = `/${page}${queryString ? `?${queryString}` : ''}`;
+    window.history.pushState({ page, params }, '', newUrl);
+    setActivePage(page);
+    setPageParams(params);
+  };
+
+  // If not authenticated, display enterprise LoginPage
   if (!currentUser) {
     return <LoginPage />;
   }
 
-  // Active view router with robust Gated Role Access checks
+  // Active view router with gated role access
   const renderActivePage = () => {
     switch (activePage) {
       case 'dashboard':
-        return <DashboardPage setActivePage={setActivePage} />;
-      case 'security-center':
-        return <SecurityCenterPage />;
-      case 'brigadas':
         return (
-          <BrigadasPage 
-            setActivePage={setActivePage} 
-            setSelectedTechId={setSelectedTechId} 
-          />
-        );
-      case 'tecnicos':
-        return (
-          <TecnicosPage 
-            selectedTechId={selectedTechId} 
-            setSelectedTechId={setSelectedTechId} 
-          />
-        );
-      case 'personal':
-        // Gated: only Developer, Gerente, Coordinador, Supervisor
-        if (currentRole !== 'Developer' && currentRole !== 'Gerente' && currentRole !== 'Coordinador' && !currentRole?.startsWith('Supervisor')) {
-          return <DashboardPage setActivePage={setActivePage} />;
-        }
-        return (
-          <PersonalPage 
-            setActivePage={setActivePage} 
-            setSelectedTechId={setSelectedTechId} 
+          <DashboardPage
+            setActivePage={setActivePage}
+            navigateTo={navigateTo}
           />
         );
       case 'inventario':
-        return <InventarioPage />;
-      case 'actas':
-        return <ActasPage />;
-      case 'reposiciones':
-        return <ReposicionesPage />;
-      case 'swaps':
-        return <SwapsPage />;
-      case 'devoluciones':
-        return <DevolucionesPage />;
-      case 'usuarios':
-        // Gated: only Developer, Gerente, Coordinador
-        if (currentRole !== 'Developer' && currentRole !== 'Gerente' && currentRole !== 'Coordinador') {
-          return <DashboardPage setActivePage={setActivePage} />;
-        }
-        return <UsuariosPage />;
+        return (
+          <InventarioGeneralPage
+            initialFilters={pageParams}
+            onNavigateBack={() => navigateTo('dashboard')}
+          />
+        );
+      case 'informatica':
+        return <InformaticaPage />;
+      case 'oficinas':
+        return <OficinasPage />;
+      case 'cocina':
+        return <CocinaPage />;
+      case 'almacen':
+        return <AlmacenPage />;
+      case 'levantamientos':
+        return <LevantamientosPage navigateTo={navigateTo} pageParams={pageParams} />;
+      case 'ubicaciones':
+        return <UbicacionesPage />;
+      case 'movimientos':
+        return <MovimientosPage />;
+      case 'reportes':
+        return <ReportesPage />;
       case 'auditoria':
-        // Gated: only Developer
-        if (currentRole !== 'Developer') {
-          return <DashboardPage setActivePage={setActivePage} />;
+        if (currentRole !== 'developer' && currentUser?.es_developer !== 1 && currentRole !== 'admin' && currentRole !== 'auditor' && currentRole !== 'gerencia') {
+          return <DashboardPage setActivePage={setActivePage} navigateTo={navigateTo} />;
         }
         return <AuditoriaPage />;
-      case 'reportes':
-        // Gated: only Developer, Gerente
-        if (currentRole !== 'Developer' && currentRole !== 'Gerente') {
-          return <DashboardPage setActivePage={setActivePage} />;
+      case 'usuarios':
+        if (currentRole !== 'developer' && currentUser?.es_developer !== 1) {
+          return <DashboardPage setActivePage={setActivePage} navigateTo={navigateTo} />;
         }
-        return <ReportesPage />;
+        return <UsuariosPage />;
       default:
-        return <DashboardPage setActivePage={setActivePage} />;
+        return <DashboardPage setActivePage={setActivePage} navigateTo={navigateTo} />;
     }
   };
 
   return (
-    <div className="min-h-screen bg-industrial-bg flex relative">
-      
-      {/* Sidebar navigation */}
-      <Sidebar 
-        activePage={activePage} 
-        setActivePage={(page) => {
-          // If we navigate to technical files, keep selection or clear it
-          if (page !== 'tecnicos') {
-            setSelectedTechId(null);
-          }
-          setActivePage(page);
-        }} 
-        collapsed={sidebarCollapsed} 
-        setCollapsed={setSidebarCollapsed} 
+    <div className="min-h-screen bg-[#F8FAFC] flex relative text-slate-800 font-sans">
+      {/* Sidebar Navigation */}
+      <Sidebar
+        activePage={activePage}
+        setActivePage={(page) => navigateTo(page)}
+        collapsed={sidebarCollapsed}
+        setCollapsed={setSidebarCollapsed}
       />
 
-      {/* Main workspace frame */}
-      <div 
+      {/* Main Container */}
+      <div
         className={`flex-grow min-h-screen flex flex-col transition-all duration-300 ${
           sidebarCollapsed ? 'pl-20' : 'pl-64'
         }`}
       >
-        <Topbar 
-          activePage={activePage} 
-          demoModeActive={demoModeActive}
-          onToggleDemoMode={() => setDemoModeActive(!demoModeActive)}
+        <Topbar
+          activePage={activePage}
+          setActivePage={(page) => navigateTo(page)}
         />
-        
-        {/* Page contents wrap */}
-        <main className="p-6 flex-grow bg-transparent relative z-10">
+
+        {/* Workspace Canvas */}
+        <main className="p-4 sm:p-6 lg:p-8 flex-grow bg-transparent relative z-10 max-w-7xl w-full mx-auto">
           {renderActivePage()}
         </main>
       </div>
-
-      {demoModeActive && (
-        <ExecutiveDemoStepper 
-          activePage={activePage}
-          setActivePage={setActivePage}
-          onClose={() => setDemoModeActive(false)}
-          onTriggerDemoAction={(step) => {
-            window.dispatchEvent(new CustomEvent('demo-step-trigger', { detail: { step } }));
-          }}
-        />
-      )}
-
     </div>
   );
 };
 
-const App = () => {
+export default function App() {
   return (
     <AppProvider>
-      <ErrorBoundary>
-        <AppContent />
-      </ErrorBoundary>
+      <AppContent />
     </AppProvider>
   );
-};
-
-export default App;
+}
