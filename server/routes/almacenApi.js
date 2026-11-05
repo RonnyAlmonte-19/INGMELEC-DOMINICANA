@@ -1,5 +1,6 @@
 import express from 'express';
 import crypto from 'crypto';
+import argon2 from 'argon2';
 import { getPool } from '../database/db.js';
 import { validateAndGetJwtSecret } from '../config/auth.js';
 
@@ -8,21 +9,54 @@ const router = express.Router();
 // Centralized and strictly validated JWT secret (fails startup if missing or weak)
 const SECRET_KEY = validateAndGetJwtSecret();
 
-// Password Verification
-function verifyPassword(password, stored) {
-  if (!stored) return false;
-  if (!stored.includes(':')) {
-    return password === stored;
-  }
-  const [salt, hash] = stored.split(':');
-  const checkHash = crypto.pbkdf2Sync(password, salt, 1000, 64, 'sha512').toString('hex');
-  return hash === checkHash;
+// Configuración robusta de almacenamiento de contraseñas (Argon2id - OWASP 2023/2026)
+const ARGON2_CONFIG = {
+  type: argon2.argon2id,
+  memoryCost: 65536, // 64 MiB
+  timeCost: 3,       // 3 iteraciones
+  parallelism: 1     // 1 hilo para evitar saturación de CPU en servidor web
+};
+
+// Generación de hash moderno Argon2id
+async function hashPassword(password) {
+  return await argon2.hash(password, ARGON2_CONFIG);
 }
 
-function hashPassword(password) {
-  const salt = crypto.randomBytes(16).toString('hex');
-  const hash = crypto.pbkdf2Sync(password, salt, 1000, 64, 'sha512').toString('hex');
-  return `${salt}:${hash}`;
+// Verificación multi-formato con migración progresiva transparente
+async function verifyPassword(password, stored) {
+  if (!stored || !password) {
+    return { valid: false, needsUpgrade: false };
+  }
+
+  // 1. Formato Principal: Argon2id ($argon2id$...)
+  if (stored.startsWith('$argon2')) {
+    try {
+      const valid = await argon2.verify(stored, password);
+      return { valid, needsUpgrade: false };
+    } catch (e) {
+      return { valid: false, needsUpgrade: false };
+    }
+  }
+
+  // 2. Formato Legado: PBKDF2-SHA512 (salt:hash)
+  if (stored.includes(':')) {
+    try {
+      const [salt, hash] = stored.split(':');
+      const checkHash = crypto.pbkdf2Sync(password, salt, 1000, 64, 'sha512').toString('hex');
+      const hashBuf = Buffer.from(hash, 'hex');
+      const checkBuf = Buffer.from(checkHash, 'hex');
+      const valid = hashBuf.length === checkBuf.length && crypto.timingSafeEqual(hashBuf, checkBuf);
+      return { valid, needsUpgrade: valid }; // Si es válida, requiere auto-upgrade a Argon2id
+    } catch (e) {
+      return { valid: false, needsUpgrade: false };
+    }
+  }
+
+  // 3. Formato Legado Plano (prototipos iniciales no hasheados)
+  const passBuf = Buffer.from(password);
+  const storedBuf = Buffer.from(stored);
+  const valid = passBuf.length === storedBuf.length && crypto.timingSafeEqual(passBuf, storedBuf);
+  return { valid, needsUpgrade: valid };
 }
 
 // Canonical Physical States for INGMELEC Enterprise
@@ -300,8 +334,20 @@ router.post('/auth/login', rateLimitLogin, async (req, res) => {
       return res.status(403).json({ success: false, message: 'Su cuenta se encuentra desactivada o suspendida. Contacte al Desarrollador Principal.' });
     }
 
-    if (!verifyPassword(password, user.password_hash)) {
+    const authCheck = await verifyPassword(password, user.password_hash);
+    if (!authCheck.valid) {
       return res.status(401).json({ success: false, message: 'Credenciales inválidas.' });
+    }
+
+    // Migración progresiva transparente a Argon2id en inicio de sesión exitoso
+    if (authCheck.needsUpgrade) {
+      try {
+        const upgradedHash = await hashPassword(password);
+        await db.query('UPDATE inv_usuarios SET password_hash = ? WHERE id = ?', [upgradedHash, user.id]);
+        console.log(`[AUTH-MIGRATION] Contraseña del usuario ${user.email} (ID: ${user.id}) migrada transparentemente a Argon2id.`);
+      } catch (upgradeErr) {
+        console.error('[AUTH-MIGRATION] Advertencia: Error en auto-actualización a Argon2id:', upgradeErr.message);
+      }
     }
 
     await db.query('UPDATE inv_usuarios SET ultimo_acceso = NOW() WHERE id = ?', [user.id]);
@@ -2219,7 +2265,7 @@ router.get('/usuarios', requireAuth, requireDeveloper, async (req, res) => {
     const [rows] = await db.query(`
       SELECT u.id, u.nombre, u.email, u.rol, u.cargo, u.area, u.activo,
              u.es_developer, u.campamento_id, u.almacen_id, u.permisos_json,
-             u.ultimo_acceso, u.creado_en
+             u.ultimo_acceso, COALESCE(u.fecha_creacion, NOW()) as creado_en
       FROM inv_usuarios u
       ORDER BY u.es_developer DESC, u.id ASC
     `);
@@ -2302,7 +2348,7 @@ router.post('/usuarios', requireAuth, requireDeveloper, async (req, res) => {
       return res.status(409).json({ success: false, message: 'El correo electrónico ya se encuentra registrado.' });
     }
 
-    const hash = hashPassword(password);
+    const hash = await hashPassword(password);
     const permisosStr = JSON.stringify(Array.isArray(permisos) ? permisos : []);
 
     const [result] = await db.query(
@@ -2559,7 +2605,7 @@ router.post('/usuarios/:id/recuperar', requireAuth, requireDeveloper, async (req
       return res.status(404).json({ success: false, message: 'Usuario no encontrado.' });
     }
 
-    const hash = hashPassword(nuevaPassword.trim());
+    const hash = await hashPassword(nuevaPassword.trim());
     await db.query('UPDATE inv_usuarios SET password_hash = ? WHERE id = ?', [hash, targetId]);
 
     await logAudit(db, {
@@ -3136,7 +3182,7 @@ router.get('/levantamientos', requireAuth, requirePermission('lev:ver'), async (
       LEFT JOIN inv_almacenes a ON l.almacen_id = a.id
       LEFT JOIN inv_usuarios u ON l.creado_por = u.id
       WHERE ${conditions.join(' AND ')}
-      ORDER BY l.creado_en DESC
+      ORDER BY l.id DESC
     `;
 
     const [rows] = await db.query(query, params);

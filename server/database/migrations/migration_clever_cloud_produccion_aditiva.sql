@@ -1,301 +1,395 @@
--- ==============================================================================
--- INGMELEC | ALMACÉN GENERAL — PLAN DE MIGRACIÓN ADITIVA PARA CLEVER CLOUD (MYSQL 8)
--- Fecha: Noviembre 2026
--- Regla Absoluta: 100 % ADITIVA. Prohibido borrar, truncar o sobrescribir
---                 los 434 artículos reales de producción en inv_articulos.
--- ==============================================================================
+-- =================================================================================
+-- INGMELEC | ALMACÉN GENERAL (v2.0.0)
+-- MIGRACIÓN ADITIVA CONSOLIDADA PARA PRODUCCIÓN (MySQL 8.0 / Clever Cloud)
+-- VERSIÓN AUDITADA Y PROBADA CONTRA RESPALDO REAL CLEVER CLOUD DEL 04-NOV-2026
+-- =================================================================================
+-- NOTA ARQUITECTÓNICA:
+-- Para mayor control operativo en producción, esta migración también se ha separado
+-- en dos archivos independientes dentro de esta misma carpeta:
+--   1) migration_01_estructural_ddl_clever_cloud.sql  (100% DDL estructural, cero DML)
+--   2) migration_02_datos_homologacion_clever_cloud.sql (DML controlado sobre sedes y metadatos)
+-- =================================================================================
 
--- ------------------------------------------------------------------------------
--- FASE 1: CREACIÓN DE TABLAS NUEVAS (SI NO EXISTEN)
--- ------------------------------------------------------------------------------
+-- =================================================================================
+-- PARTE I: MIGRACIÓN PURAMENTE ESTRUCTURAL (DDL — CERO MODIFICACIÓN DE DATOS)
+-- =================================================================================
 
--- 1.1 Catálogo Dinámico de Categorías por Área
+-- 1.1 Nuevas tablas de soporte (no existen aún en el respaldo de Clever Cloud)
 CREATE TABLE IF NOT EXISTS inv_categorias (
-  id INT AUTO_INCREMENT PRIMARY KEY,
-  area VARCHAR(50) NOT NULL,
-  nombre VARCHAR(100) NOT NULL,
-  activo TINYINT DEFAULT 1,
-  es_sintetico TINYINT(1) NOT NULL DEFAULT 0,
-  creado_en TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  UNIQUE KEY uq_area_nombre (area, nombre)
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    area VARCHAR(50) NOT NULL,
+    nombre VARCHAR(100) NOT NULL,
+    activo TINYINT(1) NOT NULL DEFAULT 1,
+    es_sintetico TINYINT(1) NOT NULL DEFAULT 0,
+    creado_en TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE KEY uk_area_categoria (area, nombre),
+    INDEX idx_cat_area (area)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
--- 1.2 Catálogo Dinámico de Custodios y Responsables
 CREATE TABLE IF NOT EXISTS inv_custodios (
-  id INT AUTO_INCREMENT PRIMARY KEY,
-  nombre VARCHAR(150) NOT NULL,
-  cargo VARCHAR(100) NULL,
-  departamento VARCHAR(100) NULL,
-  telefono VARCHAR(50) NULL,
-  activo TINYINT DEFAULT 1,
-  es_sintetico TINYINT(1) NOT NULL DEFAULT 0,
-  creado_en TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  UNIQUE KEY uq_custodio_nombre (nombre)
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    nombre VARCHAR(150) NOT NULL UNIQUE,
+    cargo VARCHAR(100) NULL,
+    activo TINYINT(1) NOT NULL DEFAULT 1,
+    es_sintetico TINYINT(1) NOT NULL DEFAULT 0,
+    creado_en TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_cust_nombre (nombre)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
--- 1.3 Tabla de Campamentos / Sedes Independientes
-CREATE TABLE IF NOT EXISTS inv_campamentos (
-  id INT AUTO_INCREMENT PRIMARY KEY,
-  nombre VARCHAR(150) NOT NULL UNIQUE,
-  codigo VARCHAR(50) DEFAULT NULL,
-  provincia VARCHAR(100) DEFAULT NULL,
-  direccion VARCHAR(255) DEFAULT NULL,
-  responsable VARCHAR(150) DEFAULT NULL,
-  telefono VARCHAR(50) DEFAULT NULL,
-  activo TINYINT(1) DEFAULT 1,
-  clasificacion_sede ENUM('CONFIRMADO', 'PENDIENTE_VALIDACION', 'SINTETICO_PRUEBA', 'DUPLICADO_EQUIVALENTE') NOT NULL DEFAULT 'PENDIENTE_VALIDACION',
-  es_sintetico TINYINT(1) NOT NULL DEFAULT 0,
-  origen_registro VARCHAR(100) DEFAULT 'MANUAL',
-  ubicacion_historica_equivalente VARCHAR(150) DEFAULT NULL,
-  fecha_creacion DATETIME DEFAULT CURRENT_TIMESTAMP,
-  INDEX idx_camp_nombre (nombre)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-
--- 1.4 Tabla de Almacenes / Bodegas Internas por Campamento
-CREATE TABLE IF NOT EXISTS inv_almacenes (
-  id INT AUTO_INCREMENT PRIMARY KEY,
-  campamento_id INT NOT NULL,
-  nombre VARCHAR(150) NOT NULL,
-  codigo VARCHAR(50) DEFAULT NULL,
-  tipo VARCHAR(80) DEFAULT 'General',
-  encargado VARCHAR(150) DEFAULT NULL,
-  descripcion TEXT DEFAULT NULL,
-  activo TINYINT(1) DEFAULT 1,
-  es_sintetico TINYINT(1) NOT NULL DEFAULT 0,
-  estado_verificacion ENUM('CONFIRMADO', 'PENDIENTE_VALIDACION', 'SINTETICO_PRUEBA') NOT NULL DEFAULT 'PENDIENTE_VALIDACION',
-  origen_registro VARCHAR(100) DEFAULT 'MANUAL',
-  fecha_creacion DATETIME DEFAULT CURRENT_TIMESTAMP,
-  FOREIGN KEY (campamento_id) REFERENCES inv_campamentos(id) ON DELETE CASCADE,
-  INDEX idx_alm_camp (campamento_id),
-  INDEX idx_alm_nombre (nombre)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-
--- 1.5 Relación Muchos-a-Muchos: Usuarios <-> Campamentos Autorizados
 CREATE TABLE IF NOT EXISTS inv_usuario_campamentos (
-  id INT AUTO_INCREMENT PRIMARY KEY,
-  usuario_id INT NOT NULL,
-  campamento_id INT NOT NULL,
-  es_principal TINYINT(1) DEFAULT 0,
-  creado_en TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  UNIQUE KEY uq_usuario_campamento (usuario_id, campamento_id),
-  INDEX idx_uc_usuario (usuario_id),
-  INDEX idx_uc_campamento (campamento_id)
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    usuario_id INT NOT NULL,
+    campamento_id INT NOT NULL,
+    es_principal TINYINT(1) NOT NULL DEFAULT 0,
+    asignado_en TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE KEY uk_usuario_campamento (usuario_id, campamento_id),
+    INDEX idx_uc_usuario (usuario_id),
+    INDEX idx_uc_campamento (campamento_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
--- 1.6 Relación Muchos-a-Muchos: Usuarios <-> Almacenes Autorizados
 CREATE TABLE IF NOT EXISTS inv_usuario_almacenes (
-  id INT AUTO_INCREMENT PRIMARY KEY,
-  usuario_id INT NOT NULL,
-  almacen_id INT NOT NULL,
-  creado_en TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  UNIQUE KEY uq_usuario_almacen (usuario_id, almacen_id),
-  INDEX idx_ua_usuario (usuario_id),
-  INDEX idx_ua_almacen (almacen_id)
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    usuario_id INT NOT NULL,
+    almacen_id INT NOT NULL,
+    asignado_en TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE KEY uk_usuario_almacen (usuario_id, almacen_id),
+    INDEX idx_ua_usuario (usuario_id),
+    INDEX idx_ua_almacen (almacen_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
--- 1.7 Tabla de Sesiones de Levantamiento Físico
-CREATE TABLE IF NOT EXISTS inv_levantamientos (
-  id INT AUTO_INCREMENT PRIMARY KEY,
-  codigo_levantamiento VARCHAR(60) UNIQUE NOT NULL,
-  titulo VARCHAR(200) NOT NULL,
-  campamento_id INT NOT NULL,
-  almacen_id INT DEFAULT NULL,
-  fecha_inicio DATE NOT NULL,
-  fecha_fin DATE DEFAULT NULL,
-  responsable_levantamiento VARCHAR(150) NOT NULL,
-  equipo_auditor VARCHAR(255) DEFAULT NULL,
-  estado ENUM('En preparación', 'En proceso', 'Pendiente de revisión', 'Finalizado') DEFAULT 'En proceso',
-  notas TEXT DEFAULT NULL,
-  total_articulos_capturados INT DEFAULT 0,
-  consolidado_por INT DEFAULT NULL,
-  fecha_consolidacion DATETIME DEFAULT NULL,
-  creado_por INT NOT NULL,
-  es_sintetico TINYINT(1) NOT NULL DEFAULT 0,
-  origen_registro VARCHAR(100) DEFAULT 'MANUAL',
-  fecha_creacion DATETIME DEFAULT CURRENT_TIMESTAMP,
-  fecha_actualizacion DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-  FOREIGN KEY (campamento_id) REFERENCES inv_campamentos(id) ON DELETE RESTRICT,
-  INDEX idx_lev_codigo (codigo_levantamiento),
-  INDEX idx_lev_estado (estado),
-  INDEX idx_lev_camp (campamento_id)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-
--- 1.8 Tabla de Ítems Capturados en Levantamientos Físicos
-CREATE TABLE IF NOT EXISTS inv_levantamiento_items (
-  id INT AUTO_INCREMENT PRIMARY KEY,
-  levantamiento_id INT NOT NULL,
-  codigo_original VARCHAR(100) DEFAULT NULL,
-  area ENUM('INFORMATICA', 'OFICINAS', 'COCINA', 'ALMACEN', 'OTRA') NOT NULL DEFAULT 'ALMACEN',
-  categoria VARCHAR(100) NOT NULL,
-  articulo_nombre VARCHAR(255) NOT NULL,
-  marca VARCHAR(150) DEFAULT NULL,
-  modelo_caracteristicas VARCHAR(255) DEFAULT NULL,
-  serie_imei VARCHAR(150) DEFAULT NULL,
-  cantidad DECIMAL(10,2) NOT NULL DEFAULT 1.00,
-  unidad_medida VARCHAR(50) DEFAULT 'Unidad',
-  estado_fisico ENUM('Bueno', 'Regular', 'Dañado', 'Fuera de servicio', 'Pendiente de verificación') NOT NULL DEFAULT 'Bueno',
-  propietario VARCHAR(100) DEFAULT 'INGMELEC',
-  responsable_custodio VARCHAR(150) DEFAULT NULL,
-  ubicacion_exacta VARCHAR(150) DEFAULT NULL,
-  fecha_revision DATE DEFAULT NULL,
-  observaciones TEXT DEFAULT NULL,
-  evidencia_foto MEDIUMTEXT DEFAULT NULL,
-  consolidado TINYINT(1) DEFAULT 0,
-  articulo_maestro_id INT DEFAULT NULL,
-  creado_por INT DEFAULT NULL,
-  es_sintetico TINYINT(1) NOT NULL DEFAULT 0,
-  fecha_captura DATETIME DEFAULT CURRENT_TIMESTAMP,
-  fecha_actualizacion DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-  FOREIGN KEY (levantamiento_id) REFERENCES inv_levantamientos(id) ON DELETE CASCADE,
-  INDEX idx_item_lev (levantamiento_id),
-  INDEX idx_item_area (area),
-  INDEX idx_item_serie (serie_imei),
-  INDEX idx_item_codigo (codigo_original)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-
--- ------------------------------------------------------------------------------
--- FASE 2: ALTERACIONES ADITIVAS DE COLUMNAS EN TABLAS PREEXISTENTES
--- ------------------------------------------------------------------------------
-
--- 2.1 Ampliar inv_usuarios para soportar rol 'developer', permisos_json y campamento_id
+-- 1.2 Columnas aditivas en tablas existentes de Clever Cloud
+-- A. inv_usuarios (cargo ya existe en Clever Cloud; es_developer = 0 por defecto)
 ALTER TABLE inv_usuarios MODIFY COLUMN rol VARCHAR(50) NOT NULL DEFAULT 'almacen';
+ALTER TABLE inv_usuarios MODIFY COLUMN cargo VARCHAR(100) NULL;
+ALTER TABLE inv_usuarios ADD COLUMN es_developer TINYINT(1) NOT NULL DEFAULT 0;
 ALTER TABLE inv_usuarios ADD COLUMN campamento_id INT NULL;
 ALTER TABLE inv_usuarios ADD COLUMN almacen_id INT NULL;
 ALTER TABLE inv_usuarios ADD COLUMN permisos_json JSON NULL;
-ALTER TABLE inv_usuarios ADD COLUMN es_developer TINYINT(1) NOT NULL DEFAULT 0;
-ALTER TABLE inv_usuarios ADD COLUMN bloqueado_hasta DATETIME NULL;
 
--- 2.2 Ampliar inv_campamentos e inv_almacenes si ya existían de la Fase 1
-ALTER TABLE inv_campamentos ADD COLUMN clasificacion_sede ENUM('CONFIRMADO', 'PENDIENTE_VALIDACION', 'SINTETICO_PRUEBA', 'DUPLICADO_EQUIVALENTE') NOT NULL DEFAULT 'PENDIENTE_VALIDACION';
+-- B. inv_campamentos e inv_almacenes
+ALTER TABLE inv_campamentos ADD COLUMN clasificacion_sede ENUM('CONFIRMADO', 'PROPUESTO', 'SINTETICO_PRUEBA', 'HISTORICO_NO_HOMOLOGADO', 'DUPLICADO_EQUIVALENTE') NOT NULL DEFAULT 'PROPUESTO';
 ALTER TABLE inv_campamentos ADD COLUMN es_sintetico TINYINT(1) NOT NULL DEFAULT 0;
-ALTER TABLE inv_campamentos ADD COLUMN origen_registro VARCHAR(100) DEFAULT 'MANUAL';
-ALTER TABLE inv_campamentos ADD COLUMN ubicacion_historica_equivalente VARCHAR(150) DEFAULT NULL;
+ALTER TABLE inv_campamentos ADD COLUMN origen_registro VARCHAR(100) NOT NULL DEFAULT 'SISTEMA_INICIAL';
+ALTER TABLE inv_campamentos ADD COLUMN ubicacion_historica_equivalente VARCHAR(150) NULL;
 
-ALTER TABLE inv_almacenes ADD COLUMN codigo VARCHAR(50) DEFAULT NULL;
 ALTER TABLE inv_almacenes ADD COLUMN es_sintetico TINYINT(1) NOT NULL DEFAULT 0;
-ALTER TABLE inv_almacenes ADD COLUMN estado_verificacion ENUM('CONFIRMADO', 'PENDIENTE_VALIDACION', 'SINTETICO_PRUEBA') NOT NULL DEFAULT 'PENDIENTE_VALIDACION';
-ALTER TABLE inv_almacenes ADD COLUMN origen_registro VARCHAR(100) DEFAULT 'MANUAL';
 
--- 2.3 Ampliar inv_articulos (conservando intactos los 434 registros productivos)
-ALTER TABLE inv_articulos MODIFY COLUMN cantidad_num DECIMAL(12,2) NULL DEFAULT NULL;
+-- C. inv_articulos (preserva intactos los 434 artículos productivos)
 ALTER TABLE inv_articulos ADD COLUMN campamento_id INT NULL;
 ALTER TABLE inv_articulos ADD COLUMN almacen_id INT NULL;
+ALTER TABLE inv_articulos MODIFY COLUMN cantidad_verificada TINYINT(1) NOT NULL DEFAULT 1;
+ALTER TABLE inv_articulos ADD COLUMN estado_cantidad ENUM('VERIFICADO', 'PENDIENTE_VERIFICACION', 'TEXTO_NO_NUMERICO') NOT NULL DEFAULT 'VERIFICADO';
 ALTER TABLE inv_articulos ADD COLUMN es_sintetico TINYINT(1) NOT NULL DEFAULT 0;
-ALTER TABLE inv_articulos ADD COLUMN origen_datos ENUM('HISTORICO_EXCEL', 'OPERATIVO_REAL', 'SINTETICO_PRUEBA') NOT NULL DEFAULT 'HISTORICO_EXCEL';
-ALTER TABLE inv_articulos ADD COLUMN estado_vinculacion_sede ENUM('CONFIRMADO', 'ALMACEN_CONFIRMADO', 'UBICACION_HISTORICA_COMPATIBLE', 'SEDE_AMBIGUA', 'PENDIENTE_ASIGNACION', 'SINTETICO') NOT NULL DEFAULT 'PENDIENTE_ASIGNACION';
+ALTER TABLE inv_articulos ADD COLUMN origen_datos ENUM('HISTORICO_EXCEL', 'OPERATIVO_REAL', 'SINTETICO_PRUEBA') NOT NULL DEFAULT 'OPERATIVO_REAL';
+ALTER TABLE inv_articulos ADD COLUMN estado_vinculacion_sede ENUM('CONFIRMADO', 'PROPUESTO', 'SEDE_AMBIGUA', 'SIN_SEDE') NOT NULL DEFAULT 'CONFIRMADO';
 
-CREATE INDEX idx_articulos_campamento ON inv_articulos (campamento_id);
-CREATE INDEX idx_articulos_sintetico ON inv_articulos (es_sintetico);
-CREATE INDEX idx_articulos_vinculacion ON inv_articulos (estado_vinculacion_sede);
+CREATE INDEX idx_art_campamento_id ON inv_articulos (campamento_id);
+CREATE INDEX idx_art_es_sintetico ON inv_articulos (es_sintetico);
+CREATE INDEX idx_art_cantidad_verificada ON inv_articulos (cantidad_verificada);
 
--- 2.4 Ampliar tablas operativas restantes con es_sintetico
+-- D. inv_levantamientos, inv_levantamiento_items e inv_movimientos
+ALTER TABLE inv_levantamientos ADD COLUMN codigo VARCHAR(50) NULL;
 ALTER TABLE inv_levantamientos ADD COLUMN es_sintetico TINYINT(1) NOT NULL DEFAULT 0;
-ALTER TABLE inv_levantamientos ADD COLUMN origen_registro VARCHAR(100) DEFAULT 'MANUAL';
+ALTER TABLE inv_levantamiento_items ADD COLUMN estado_verificacion VARCHAR(40) NOT NULL DEFAULT 'VERIFICADO';
 ALTER TABLE inv_levantamiento_items ADD COLUMN es_sintetico TINYINT(1) NOT NULL DEFAULT 0;
+
 ALTER TABLE inv_movimientos ADD COLUMN es_sintetico TINYINT(1) NOT NULL DEFAULT 0;
-ALTER TABLE inv_custodios ADD COLUMN es_sintetico TINYINT(1) NOT NULL DEFAULT 0;
-ALTER TABLE inv_categorias ADD COLUMN es_sintetico TINYINT(1) NOT NULL DEFAULT 0;
 
--- ------------------------------------------------------------------------------
--- FASE 3: CONFIGURACIÓN DE LOS 3 CAMPAMENTOS INDEPENDIENTES CONFIRMADOS
--- ------------------------------------------------------------------------------
 
--- 3.1 Homologar ALMACÉN 27 DE FEBRERO (ID 3 en Clever Cloud)
+-- =================================================================================
+-- PARTE II: OPERACIONES CONTROLADAS SOBRE DATOS (DML CON MANEJO EXPLÍCITO DE EXCEPCIONES)
+-- =================================================================================
+
+DELIMITER $$
+
+DROP PROCEDURE IF EXISTS sp_ejecutar_migracion_02_homologacion$$
+
+CREATE PROCEDURE sp_ejecutar_migracion_02_homologacion()
+proc_main: BEGIN
+    DECLARE v_total_articulos INT DEFAULT 0;
+    DECLARE v_total_cantidad DECIMAL(14,2) DEFAULT 0.00;
+    DECLARE v_cant_27feb INT DEFAULT 0;
+    DECLARE v_cant_opl INT DEFAULT 0;
+    DECLARE v_cant_m633 INT DEFAULT 0;
+    DECLARE v_cant_sin_sede INT DEFAULT 0;
+    DECLARE v_sqlstate VARCHAR(5) DEFAULT '00000';
+    DECLARE v_msg TEXT DEFAULT '';
+
+    -- Manejador de excepciones: Cualquier error aborta y ejecuta ROLLBACK total
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+    BEGIN
+        GET DIAGNOSTICS CONDITION 1
+            v_sqlstate = RETURNED_SQLSTATE,
+            v_msg = MESSAGE_TEXT;
+        ROLLBACK;
+        SELECT 'ERROR_ROLLBACK' AS estado_transaccion,
+               v_sqlstate AS codigo_sqlstate,
+               v_msg AS mensaje_error,
+               'Se detectó un fallo durante la migración DML. Se ha ejecutado ROLLBACK total. Cero datos alterados.' AS resolucion;
+        RESIGNAL;
+    END;
+
+    START TRANSACTION;
+
+    -- 2.1 Homologar las 3 sedes confirmadas por Gerencia
 UPDATE inv_campamentos
 SET nombre = 'ALMACÉN 27 DE FEBRERO',
     codigo = 'ALM-27FEB',
-    provincia = 'Distrito Nacional',
-    direccion = 'AV. 27 DE FEBRERO, DISTRITO NACIONAL',
+    provincia = COALESCE(provincia, 'Distrito Nacional'),
+    direccion = COALESCE(direccion, 'Av. 27 de Febrero, Santo Domingo'),
     clasificacion_sede = 'CONFIRMADO',
     es_sintetico = 0,
-    origen_registro = 'CONFIRMADO_GERENCIA',
+    origen_registro = 'EXCEL_HISTORICO',
     ubicacion_historica_equivalente = 'DISTRITO NACIONAL 27 DE FEBRERO',
     activo = 1
-WHERE id = 3 OR codigo = 'ALM-27FEB';
+WHERE codigo IN ('ALM-27FEB', 'DN-27FEB')
+   OR UPPER(TRIM(nombre)) IN ('ALMACÉN 27 DE FEBRERO', 'ALMACEN 27 DE FEBRERO', 'DISTRITO NACIONAL 27 DE FEBRERO');
 
--- 3.2 Crear / actualizar sede independiente OPL
-INSERT INTO inv_campamentos (nombre, codigo, provincia, direccion, responsable, activo, clasificacion_sede, es_sintetico, origen_registro, ubicacion_historica_equivalente)
-VALUES ('OPL', 'CAMP-OPL', 'Santo Domingo Oeste', 'KM 19 AUTOPISTA DUARTE', 'JONATHAN HERNANDEZ', 1, 'CONFIRMADO', 0, 'CONFIRMADO_GERENCIA', 'KM 19 AUTOPISTA DUARTE OPL')
-ON DUPLICATE KEY UPDATE
-  codigo = 'CAMP-OPL',
-  clasificacion_sede = 'CONFIRMADO',
-  es_sintetico = 0,
-  ubicacion_historica_equivalente = 'KM 19 AUTOPISTA DUARTE OPL',
-  activo = 1;
+INSERT INTO inv_campamentos (
+    nombre, codigo, provincia, direccion, responsable,
+    clasificacion_sede, es_sintetico, origen_registro, ubicacion_historica_equivalente, activo
+)
+SELECT
+    'ALMACÉN 27 DE FEBRERO', 'ALM-27FEB', 'Distrito Nacional',
+    'Av. 27 de Febrero, Santo Domingo', 'Encargado de Almacén 27 de Febrero',
+    'CONFIRMADO', 0, 'EXCEL_HISTORICO', 'DISTRITO NACIONAL 27 DE FEBRERO', 1
+FROM DUAL
+WHERE NOT EXISTS (
+    SELECT 1 FROM inv_campamentos
+    WHERE codigo IN ('ALM-27FEB', 'DN-27FEB')
+       OR UPPER(TRIM(nombre)) IN ('ALMACÉN 27 DE FEBRERO', 'ALMACEN 27 DE FEBRERO', 'DISTRITO NACIONAL 27 DE FEBRERO')
+);
 
--- 3.3 Crear / actualizar sede independiente MANTENIMIENTO 633
-INSERT INTO inv_campamentos (nombre, codigo, provincia, direccion, responsable, activo, clasificacion_sede, es_sintetico, origen_registro, ubicacion_historica_equivalente)
-VALUES ('MANTENIMIENTO 633', 'MANT-633', 'Santo Domingo', 'MANTENIMIENTO 633', 'WILLIAM ALMANZAR', 1, 'CONFIRMADO', 0, 'CONFIRMADO_GERENCIA', 'MANTENIMIENTO 633')
-ON DUPLICATE KEY UPDATE
-  codigo = 'MANT-633',
-  clasificacion_sede = 'CONFIRMADO',
-  es_sintetico = 0,
-  ubicacion_historica_equivalente = 'MANTENIMIENTO 633',
-  activo = 1;
-
--- 3.4 Marcar San Cristóbal, Azua y Pedernales como PENDIENTE_VALIDACION
 UPDATE inv_campamentos
-SET clasificacion_sede = 'PENDIENTE_VALIDACION', es_sintetico = 0
-WHERE codigo IN ('CAMP-SC', 'CAMP-AZUA', 'CAMP-AZ', 'CAMP-PED') OR nombre IN ('San Cristóbal', 'Campamento San Cristóbal', 'Azua', 'Campamento Azua', 'Pedernales', 'Campamento Pedernales');
+SET nombre = 'OPL',
+    codigo = 'CAMP-OPL',
+    provincia = COALESCE(provincia, 'Santo Domingo Oeste'),
+    direccion = COALESCE(direccion, 'Km 19 Autopista Duarte (Sede Independiente OPL)'),
+    clasificacion_sede = 'CONFIRMADO',
+    es_sintetico = 0,
+    origen_registro = 'GERENCIA_CONFIRMADO',
+    ubicacion_historica_equivalente = 'KM 19 AUTOPISTA DUARTE OPL',
+    activo = 1
+WHERE codigo IN ('CAMP-OPL', 'KM19-OPL')
+   OR UPPER(TRIM(nombre)) IN ('OPL', 'KM 19 AUTOPISTA DUARTE OPL');
 
--- 3.5 Si existe el registro agrupado antiguo 'Campamento Base Central KM 19' (CAMP-KM19), marcarlo como DUPLICADO_EQUIVALENTE e inactivo
+INSERT INTO inv_campamentos (
+    nombre, codigo, provincia, direccion, responsable,
+    clasificacion_sede, es_sintetico, origen_registro, ubicacion_historica_equivalente, activo
+)
+SELECT
+    'OPL', 'CAMP-OPL', 'Santo Domingo Oeste',
+    'Km 19 Autopista Duarte (Sede Independiente OPL)', 'Encargado de Operaciones OPL',
+    'CONFIRMADO', 0, 'GERENCIA_CONFIRMADO', 'KM 19 AUTOPISTA DUARTE OPL', 1
+FROM DUAL
+WHERE NOT EXISTS (
+    SELECT 1 FROM inv_campamentos
+    WHERE codigo IN ('CAMP-OPL', 'KM19-OPL')
+       OR UPPER(TRIM(nombre)) IN ('OPL', 'KM 19 AUTOPISTA DUARTE OPL')
+);
+
 UPDATE inv_campamentos
-SET clasificacion_sede = 'DUPLICADO_EQUIVALENTE', activo = 0
-WHERE codigo = 'CAMP-KM19' OR nombre LIKE '%Base Central KM 19%';
+SET nombre = 'MANTENIMIENTO 633',
+    codigo = 'CAMP-M633',
+    provincia = COALESCE(provincia, 'Santo Domingo'),
+    direccion = COALESCE(direccion, 'Km 19 Autopista Duarte (Sede Independiente Mantenimiento 633)'),
+    clasificacion_sede = 'CONFIRMADO',
+    es_sintetico = 0,
+    origen_registro = 'GERENCIA_CONFIRMADO',
+    ubicacion_historica_equivalente = 'MANTENIMIENTO 633',
+    activo = 1
+WHERE codigo IN ('CAMP-M633', 'MANT-633')
+   OR UPPER(TRIM(nombre)) = 'MANTENIMIENTO 633';
 
--- ------------------------------------------------------------------------------
--- FASE 4: VINCULACIÓN NO DESTRUCTIVA DE ARTÍCULOS CON SEDES CONFIRMADAS
--- (Respeta códigos, cantidades y ubicaciones históricas; NO borra ningún artículo)
--- ------------------------------------------------------------------------------
+INSERT INTO inv_campamentos (
+    nombre, codigo, provincia, direccion, responsable,
+    clasificacion_sede, es_sintetico, origen_registro, ubicacion_historica_equivalente, activo
+)
+SELECT
+    'MANTENIMIENTO 633', 'CAMP-M633', 'Santo Domingo',
+    'Km 19 Autopista Duarte (Sede Independiente Mantenimiento 633)', 'Encargado de Mantenimiento 633',
+    'CONFIRMADO', 0, 'GERENCIA_CONFIRMADO', 'MANTENIMIENTO 633', 1
+FROM DUAL
+WHERE NOT EXISTS (
+    SELECT 1 FROM inv_campamentos
+    WHERE codigo IN ('CAMP-M633', 'MANT-633')
+       OR UPPER(TRIM(nombre)) = 'MANTENIMIENTO 633'
+);
 
--- 4.1 Aislar cualquier registro sintético de prueba (ej. COC-001 de test-fase2-integrity.js)
+-- Almacenes principales por defecto (sin duplicar)
+INSERT INTO inv_almacenes (campamento_id, nombre, tipo, encargado, descripcion, activo, es_sintetico)
+SELECT c.id, 'Almacén Principal 27 de Febrero', 'General', c.responsable, 'Bodega principal de Almacén 27 de Febrero', 1, 0
+FROM inv_campamentos c
+WHERE c.codigo = 'ALM-27FEB'
+  AND NOT EXISTS (SELECT 1 FROM inv_almacenes a WHERE a.campamento_id = c.id AND a.activo = 1);
+
+INSERT INTO inv_almacenes (campamento_id, nombre, tipo, encargado, descripcion, activo, es_sintetico)
+SELECT c.id, 'Almacén Principal OPL', 'General', c.responsable, 'Bodega principal de sede OPL', 1, 0
+FROM inv_campamentos c
+WHERE c.codigo = 'CAMP-OPL'
+  AND NOT EXISTS (SELECT 1 FROM inv_almacenes a WHERE a.campamento_id = c.id AND a.activo = 1);
+
+INSERT INTO inv_almacenes (campamento_id, nombre, tipo, encargado, descripcion, activo, es_sintetico)
+SELECT c.id, 'Almacén Principal Mantenimiento 633', 'Taller', c.responsable, 'Bodega principal de sede Mantenimiento 633', 1, 0
+FROM inv_campamentos c
+WHERE c.codigo = 'CAMP-M633'
+  AND NOT EXISTS (SELECT 1 FROM inv_almacenes a WHERE a.campamento_id = c.id AND a.activo = 1);
+
+UPDATE inv_campamentos
+SET clasificacion_sede = 'PROPUESTO',
+    es_sintetico = 0
+WHERE codigo NOT IN ('ALM-27FEB', 'CAMP-OPL', 'CAMP-M633');
+
+-- 2.2 Trazabilidad de origen y verificación de cantidades
 UPDATE inv_articulos
-SET es_sintetico = 1,
-    origen_datos = 'SINTETICO_PRUEBA',
-    estado_vinculacion_sede = 'SINTETICO'
-WHERE (area = 'COCINA' AND codigo_original IN ('COC-001', 'COC-002'))
-   OR observaciones LIKE '%[REGISTRO SINTÉTICO%'
-   OR articulo_nombre LIKE '%E2E-%';
+SET origen_datos = 'HISTORICO_EXCEL',
+    es_sintetico = 0
+WHERE hoja_origen IN ('INFORMATICA', 'OFICINAS', 'COCINA', 'ALMACEN')
+  AND (observaciones IS NULL OR observaciones NOT LIKE '%[REGISTRO SINTÉTICO%');
 
--- 4.2 Vincular artículos de DISTRITO NACIONAL 27 DE FEBRERO -> ALMACÉN 27 DE FEBRERO
+UPDATE inv_articulos
+SET origen_datos = 'OPERATIVO_REAL',
+    es_sintetico = 0
+WHERE (hoja_origen IS NULL OR hoja_origen NOT IN ('INFORMATICA', 'OFICINAS', 'COCINA', 'ALMACEN'))
+  AND (observaciones IS NULL OR observaciones NOT LIKE '%[REGISTRO SINTÉTICO%');
+
+UPDATE inv_articulos
+SET cantidad_verificada = CASE WHEN cantidad_num IS NULL THEN 0 ELSE 1 END,
+    estado_cantidad = CASE
+        WHEN cantidad_num IS NULL AND cantidad_texto IS NOT NULL AND TRIM(cantidad_texto) != '' THEN 'TEXTO_NO_NUMERICO'
+        WHEN cantidad_num IS NULL THEN 'PENDIENTE_VERIFICACION'
+        ELSE 'VERIFICADO'
+    END;
+
+-- 2.3 Vincular campamento_id y estado_vinculacion_sede
 UPDATE inv_articulos a
 JOIN inv_campamentos c ON c.codigo = 'ALM-27FEB'
 SET a.campamento_id = c.id,
-    a.estado_vinculacion_sede = 'UBICACION_HISTORICA_COMPATIBLE'
-WHERE a.es_sintetico = 0
-  AND UPPER(TRIM(a.ubicacion_nombre)) = 'DISTRITO NACIONAL 27 DE FEBRERO';
+    a.estado_vinculacion_sede = 'CONFIRMADO'
+WHERE UPPER(TRIM(a.ubicacion_nombre)) IN ('DISTRITO NACIONAL 27 DE FEBRERO', 'ALMACEN 27 DE FEBRERO', 'ALMACÉN 27 DE FEBRERO');
 
--- 4.3 Vincular artículos de KM 19 AUTOPISTA DUARTE OPL -> OPL
 UPDATE inv_articulos a
 JOIN inv_campamentos c ON c.codigo = 'CAMP-OPL'
 SET a.campamento_id = c.id,
-    a.estado_vinculacion_sede = 'UBICACION_HISTORICA_COMPATIBLE'
-WHERE a.es_sintetico = 0
-  AND UPPER(TRIM(a.ubicacion_nombre)) = 'KM 19 AUTOPISTA DUARTE OPL';
+    a.estado_vinculacion_sede = 'CONFIRMADO'
+WHERE UPPER(TRIM(a.ubicacion_nombre)) IN ('KM 19 AUTOPISTA DUARTE OPL', 'OPL');
 
--- 4.4 Vincular artículos de MANTENIMIENTO 633 -> MANTENIMIENTO 633
 UPDATE inv_articulos a
-JOIN inv_campamentos c ON c.codigo = 'MANT-633'
+JOIN inv_campamentos c ON c.codigo = 'CAMP-M633'
 SET a.campamento_id = c.id,
-    a.estado_vinculacion_sede = 'UBICACION_HISTORICA_COMPATIBLE'
-WHERE a.es_sintetico = 0
-  AND UPPER(TRIM(a.ubicacion_nombre)) = 'MANTENIMIENTO 633';
+    a.estado_vinculacion_sede = 'CONFIRMADO'
+WHERE UPPER(TRIM(a.ubicacion_nombre)) = 'MANTENIMIENTO 633';
 
--- 4.5 Mantener los 104 artículos de KM 19 AUT DUARTE como SEDE_AMBIGUA (campamento_id = NULL)
 UPDATE inv_articulos
 SET campamento_id = NULL,
-    almacen_id = NULL,
     estado_vinculacion_sede = 'SEDE_AMBIGUA'
-WHERE es_sintetico = 0
-  AND UPPER(TRIM(ubicacion_nombre)) = 'KM 19 AUT DUARTE';
+WHERE UPPER(TRIM(ubicacion_nombre)) IN ('KM 19 AUT DUARTE', 'ALMACEN KM 19 AUDITADO');
 
--- 4.6 Poblar catálogos dinámicos desde los registros reales existentes
+-- 2.4 Poblar catálogos dinámicos
 INSERT IGNORE INTO inv_categorias (area, nombre, activo, es_sintetico)
 SELECT DISTINCT UPPER(TRIM(area)), TRIM(categoria), 1, 0
 FROM inv_articulos
-WHERE activo = 1 AND es_sintetico = 0 AND categoria IS NOT NULL AND TRIM(categoria) <> '';
+WHERE activo = 1 AND es_sintetico = 0
+  AND area IS NOT NULL AND TRIM(area) != ''
+  AND categoria IS NOT NULL AND TRIM(categoria) != '';
 
-INSERT IGNORE INTO inv_custodios (nombre, activo, es_sintetico)
-SELECT DISTINCT TRIM(asignado_a), 1, 0
+INSERT IGNORE INTO inv_custodios (nombre, cargo, activo, es_sintetico)
+SELECT DISTINCT TRIM(asignado_a), 'Personal Operativo / Custodio', 1, 0
 FROM inv_articulos
-WHERE activo = 1 AND es_sintetico = 0 AND asignado_a IS NOT NULL AND TRIM(asignado_a) <> '';
+WHERE activo = 1 AND es_sintetico = 0
+  AND asignado_a IS NOT NULL AND TRIM(asignado_a) != ''
+  AND UPPER(TRIM(asignado_a)) NOT IN ('N/A', 'SIN ASIGNAR', 'NONE', '-');
+
+-- 2.5 Permisos base para roles operativos (es_developer = 0)
+UPDATE inv_usuarios
+SET es_developer = 0,
+    permisos_json = JSON_ARRAY(
+      'inv:ver', 'inv:crear', 'inv:editar', 'inv:movimientos_registrar', 'inv:movimientos_ver',
+      'lev:ver', 'lev:crear', 'lev:capturar', 'lev:editar', 'lev:importar', 'lev:consolidar',
+      'rep:ver', 'rep:exportar', 'rep:imprimir',
+      'camp:ver', 'camp:stock', 'camp:operar'
+    )
+WHERE rol = 'admin' AND es_developer = 0 AND permisos_json IS NULL;
+
+UPDATE inv_usuarios
+SET es_developer = 0,
+    permisos_json = JSON_ARRAY(
+      'inv:ver', 'inv:crear', 'inv:movimientos_registrar', 'inv:movimientos_ver',
+      'lev:ver', 'lev:crear', 'lev:capturar',
+      'camp:ver', 'camp:stock'
+    )
+WHERE rol = 'almacen' AND es_developer = 0 AND permisos_json IS NULL;
+
+UPDATE inv_usuarios
+SET es_developer = 0,
+    permisos_json = JSON_ARRAY(
+      'inv:ver', 'inv:crear', 'inv:editar', 'inv:movimientos_ver',
+      'lev:ver', 'lev:crear', 'lev:capturar', 'lev:editar', 'lev:importar', 'lev:consolidar',
+      'rep:ver', 'rep:exportar',
+      'camp:ver', 'camp:stock'
+    )
+WHERE rol = 'supervisor' AND es_developer = 0 AND permisos_json IS NULL;
+
+UPDATE inv_usuarios
+SET es_developer = 0,
+    permisos_json = JSON_ARRAY(
+      'inv:ver', 'inv:movimientos_ver',
+      'lev:ver',
+      'rep:ver', 'rep:exportar', 'rep:imprimir',
+      'camp:ver', 'camp:stock'
+    )
+WHERE rol IN ('auditor', 'gerencia') AND es_developer = 0 AND permisos_json IS NULL;
+
+    -- -----------------------------------------------------------------------------
+    -- BLOQUE DE VERIFICACIÓN ESTRICTA DE INTEGRIDAD PRE-COMMIT (ASSERTIONS)
+    -- -----------------------------------------------------------------------------
+    SELECT COUNT(*), COALESCE(SUM(cantidad_num), 0)
+    INTO v_total_articulos, v_total_cantidad
+    FROM inv_articulos;
+
+    IF v_total_articulos < 434 THEN
+        SIGNAL SQLSTATE '45000'
+        SET MESSAGE_TEXT = 'FALLO INTEGRIDAD: El total de artículos es inferior a 434. Se revierte la migración con ROLLBACK.';
+    END IF;
+
+    IF v_total_cantidad < 1964.00 THEN
+        SIGNAL SQLSTATE '45000'
+        SET MESSAGE_TEXT = 'FALLO INTEGRIDAD: La suma total de cantidades es inferior a 1964 unidades. Se revierte la migración con ROLLBACK.';
+    END IF;
+
+    SELECT COUNT(*) INTO v_cant_27feb FROM inv_campamentos WHERE codigo = 'ALM-27FEB' AND activo = 1;
+    SELECT COUNT(*) INTO v_cant_opl FROM inv_campamentos WHERE codigo = 'CAMP-OPL' AND activo = 1;
+    SELECT COUNT(*) INTO v_cant_m633 FROM inv_campamentos WHERE codigo = 'CAMP-M633' AND activo = 1;
+
+    IF v_cant_27feb = 0 OR v_cant_opl = 0 OR v_cant_m633 = 0 THEN
+        SIGNAL SQLSTATE '45000'
+        SET MESSAGE_TEXT = 'FALLO INTEGRIDAD: No se homologaron satisfactoriamente las 3 sedes independientes requeridas.';
+    END IF;
+
+    SELECT COUNT(*) INTO v_cant_27feb FROM inv_articulos a JOIN inv_campamentos c ON a.campamento_id = c.id WHERE c.codigo = 'ALM-27FEB';
+    SELECT COUNT(*) INTO v_cant_opl FROM inv_articulos a JOIN inv_campamentos c ON a.campamento_id = c.id WHERE c.codigo = 'CAMP-OPL';
+    SELECT COUNT(*) INTO v_cant_m633 FROM inv_articulos a JOIN inv_campamentos c ON a.campamento_id = c.id WHERE c.codigo = 'CAMP-M633';
+    SELECT COUNT(*) INTO v_cant_sin_sede FROM inv_articulos WHERE campamento_id IS NULL;
+
+    -- CONFIRMACIÓN ATÓMICA
+    COMMIT;
+
+    -- RESULTADO AUDITABLE
+    SELECT 'MIGRACION_DML_EXITOSA' AS resultado,
+           'Todos los datos fueron homologados e inspeccionados con éxito. Cero pérdidas.' AS detalle,
+           v_total_articulos AS total_articulos,
+           v_total_cantidad AS total_unidades,
+           v_cant_27feb AS articulos_27_febrero,
+           v_cant_opl AS articulos_opl,
+           v_cant_m633 AS articulos_mantenimiento_633,
+           v_cant_sin_sede AS articulos_sin_sede_ambiguos;
+
+END proc_main$$
+
+DELIMITER ;
+
+-- Ejecución controlada
+CALL sp_ejecutar_migracion_02_homologacion();
+
+-- Limpieza del procedimiento transaccional
+DROP PROCEDURE IF EXISTS sp_ejecutar_migracion_02_homologacion;

@@ -47,14 +47,15 @@ server/scripts/*.json
 
 # Entornos de prueba aislados, scripts de QA, Playwright y carpetas temporales
 scratch/
-scripts/
+/scripts/
 archive/
 e2e/
 playwright-report/
 test-results/
 playwright.config.js
 server/tests/
-server/scripts/
+server/scripts/*
+!server/scripts/recovery-developer.js
 server/start-test-server.js
 server/test-hash.js
 server/check-db.js

@@ -6,7 +6,8 @@
 !.env.example
 backups/
 tests/
-scripts/
+scripts/*
+!scripts/recovery-developer.js
 data/*.xlsx
 start-test-server.js
 test-hash.js
