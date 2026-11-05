@@ -114,7 +114,7 @@ export default function LoginPage() {
         <div className="text-center text-[11px] text-slate-400 space-y-1">
           <div className="flex items-center justify-center space-x-1.5 font-medium">
             <Database className="w-3.5 h-3.5 text-emerald-500" />
-            <span>Base de datos MySQL activa · Conexión segura PBKDF2</span>
+            <span>Base de datos MySQL activa · Autenticación segura Argon2id</span>
           </div>
           <div>INGMELEC DOMINICANA © 2026 · Todos los derechos reservados</div>
         </div>
