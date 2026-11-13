@@ -81,6 +81,9 @@ app.use((req, res, next) => {
   next();
 });
 
+// Serve static assets from the React production build directory (antes del control CORS de API)
+app.use(express.static(path.join(__dirname, '..', 'dist')));
+
 // Control estricto de CORS por lista blanca (sin fallback abierto *)
 app.use((req, res, next) => {
   const origin = req.headers.origin;
@@ -114,9 +117,6 @@ app.post('/api/v2/levantamientos/:id/import-items', json10mb);
 app.use(json1mb);
 
 app.use(morgan('dev'));
-
-// Serve static assets from the React production build directory
-app.use(express.static(path.join(__dirname, '..', 'dist')));
 
 // Healthcheck ligero para Render / balanceadores de carga
 app.get('/health', (req, res) => {
