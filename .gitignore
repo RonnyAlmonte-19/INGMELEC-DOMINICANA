@@ -30,6 +30,7 @@ server/.env.*
 !server/.env.example
 !**/.env.example
 *.pem
+!server/certs/clever-cloud-mysql-ca.pem
 *.key
 *.crt
 
@@ -39,11 +40,13 @@ backups/
 *.bak
 *.sql.gz
 *.dump
+*privado*.sql
 gridops_mysql_dump.sql
 server/data/*.xlsx
 *.xlsx
 *.xls
 server/scripts/*.json
+!server/database/migrations/*.sql
 
 # Entornos de prueba aislados, scripts de QA, Playwright y carpetas temporales
 scratch/

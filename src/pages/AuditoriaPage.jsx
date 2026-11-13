@@ -1,6 +1,7 @@
-import React, { useState, useEffect } from 'react';
-import { ShieldCheck, History, User, Clock, Terminal, Search } from 'lucide-react';
+import { useState, useEffect } from 'react';
+import { ShieldCheck } from 'lucide-react';
 import { useApp } from '../context/AppContext';
+import { formatAuditDetails, toSafeDisplayString } from '../utils/jsonFormat';
 
 export default function AuditoriaPage() {
   const { fetchAuditoria } = useApp();
@@ -20,9 +21,9 @@ export default function AuditoriaPage() {
     if (!search) return true;
     const q = search.toLowerCase();
     return (
-      (l.accion || '').toLowerCase().includes(q) ||
-      (l.usuario_nombre || '').toLowerCase().includes(q) ||
-      (l.entidad || '').toLowerCase().includes(q)
+      toSafeDisplayString(l.accion, '').toLowerCase().includes(q) ||
+      toSafeDisplayString(l.usuario_nombre, '').toLowerCase().includes(q) ||
+      toSafeDisplayString(l.entidad, '').toLowerCase().includes(q)
     );
   });
 
@@ -86,36 +87,47 @@ export default function AuditoriaPage() {
                   </td>
                 </tr>
               ) : (
-                filteredLogs.map(log => (
-                  <tr key={log.id} className="hover:bg-slate-50/60 transition-colors">
-                    <td className="py-3 px-4 text-slate-500 font-mono whitespace-nowrap text-[11px]">
-                      {new Date(log.fecha).toLocaleString('es-DO')}
-                    </td>
-                    <td className="py-3 px-4">
-                      <span className="font-bold text-slate-800">{log.usuario_nombre}</span>
-                    </td>
-                    <td className="py-3 px-4 whitespace-nowrap">
-                      <span className="px-2 py-0.5 rounded text-[11px] font-mono font-bold bg-slate-900 text-white">
-                        {log.accion}
-                      </span>
-                    </td>
-                    <td className="py-3 px-4 font-mono text-slate-600">
-                      {log.entidad} {log.entidad_id && `#${log.entidad_id}`}
-                    </td>
-                    <td className="py-3 px-4 max-w-md">
-                      {log.detalles_nuevos ? (
-                        <div className="font-mono text-[10px] text-slate-600 bg-slate-50 p-1.5 rounded border border-slate-100 truncate" title={JSON.stringify(log.detalles_nuevos)}>
-                          {typeof log.detalles_nuevos === 'string' ? log.detalles_nuevos : JSON.stringify(log.detalles_nuevos)}
-                        </div>
-                      ) : (
-                        <span className="text-slate-300">—</span>
-                      )}
-                    </td>
-                    <td className="py-3 px-4 text-slate-400 font-mono text-[11px]">
-                      {log.ip_origen || '127.0.0.1'}
-                    </td>
-                  </tr>
-                ))
+                filteredLogs.map(log => {
+                  const hasDetails = Boolean(log.detalles_nuevos || log.detalles_previos);
+                  const formattedDetails = formatAuditDetails(log.detalles_nuevos, log.detalles_previos, '');
+                  const prevRaw = log.detalles_previos ? `Previo: ${toSafeDisplayString(log.detalles_previos, '')}` : '';
+                  const newRaw = log.detalles_nuevos ? `Nuevo: ${toSafeDisplayString(log.detalles_nuevos, '')}` : '';
+                  const tooltipText = [prevRaw, newRaw].filter(Boolean).join(' | ');
+
+                  return (
+                    <tr key={log.id} className="hover:bg-slate-50/60 transition-colors">
+                      <td className="py-3 px-4 text-slate-500 font-mono whitespace-nowrap text-[11px]">
+                        {log.fecha ? new Date(log.fecha).toLocaleString('es-DO') : '—'}
+                      </td>
+                      <td className="py-3 px-4">
+                        <span className="font-bold text-slate-800">{toSafeDisplayString(log.usuario_nombre, 'Sistema')}</span>
+                      </td>
+                      <td className="py-3 px-4 whitespace-nowrap">
+                        <span className="px-2 py-0.5 rounded text-[11px] font-mono font-bold bg-slate-900 text-white">
+                          {toSafeDisplayString(log.accion, 'EVENTO')}
+                        </span>
+                      </td>
+                      <td className="py-3 px-4 font-mono text-slate-600">
+                        {toSafeDisplayString(log.entidad, '—')} {log.entidad_id ? `#${toSafeDisplayString(log.entidad_id, '')}` : ''}
+                      </td>
+                      <td className="py-3 px-4 max-w-md">
+                        {hasDetails && formattedDetails ? (
+                          <div
+                            className="font-mono text-[10px] text-slate-600 bg-slate-50 p-1.5 rounded border border-slate-100 truncate"
+                            title={tooltipText || formattedDetails}
+                          >
+                            {formattedDetails}
+                          </div>
+                        ) : (
+                          <span className="text-slate-300">—</span>
+                        )}
+                      </td>
+                      <td className="py-3 px-4 text-slate-400 font-mono text-[11px]">
+                        {toSafeDisplayString(log.ip_origen, '127.0.0.1')}
+                      </td>
+                    </tr>
+                  );
+                })
               )}
             </tbody>
           </table>

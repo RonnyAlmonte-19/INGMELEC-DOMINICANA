@@ -1,5 +1,6 @@
-import React, { useState, useEffect, useRef, useMemo } from 'react';
+import { useState, useEffect, useRef, useMemo } from 'react';
 import { ChevronDown, Search, Plus, Check, X, Loader2 } from 'lucide-react';
+import { toSafeDisplayString } from '../../utils/jsonFormat';
 
 /**
  * Modern Searchable Select Component with In-line Creation for INGMELEC Enterprise
@@ -40,15 +41,23 @@ export default function SearchableSelect({
 
   // Normalize options to { label, value, sublabel, badge }
   const normalizedOptions = useMemo(() => {
-    return options.map(opt => {
-      if (typeof opt === 'string') {
-        return { label: opt, value: opt, sublabel: null, badge: null };
+    const list = Array.isArray(options) ? options : [];
+    return list.map(opt => {
+      if (typeof opt === 'string' || typeof opt === 'number') {
+        const safeStr = toSafeDisplayString(opt, '');
+        return { label: safeStr, value: opt, sublabel: null, badge: null };
       }
+      if (!opt || typeof opt !== 'object') {
+        const safeStr = toSafeDisplayString(opt, '');
+        return { label: safeStr, value: safeStr, sublabel: null, badge: null };
+      }
+      const rawLabel = opt.label ?? opt.nombre ?? opt.value ?? '';
+      const rawSub = opt.sublabel ?? opt.cargo ?? opt.tipo ?? null;
       return {
-        label: opt.label || opt.nombre || opt.value,
-        value: opt.value !== undefined ? opt.value : (opt.nombre || opt.label),
-        sublabel: opt.sublabel || opt.cargo || opt.tipo || null,
-        badge: opt.badge || null
+        label: toSafeDisplayString(rawLabel, ''),
+        value: opt.value !== undefined ? opt.value : (opt.nombre ?? opt.label ?? ''),
+        sublabel: rawSub !== null && rawSub !== undefined ? toSafeDisplayString(rawSub, '') : null,
+        badge: opt.badge !== undefined && opt.badge !== null ? toSafeDisplayString(opt.badge, '') : null
       };
     });
   }, [options]);
@@ -174,20 +183,26 @@ export default function SearchableSelect({
         <div className="truncate flex items-center space-x-1.5 flex-1 pr-2">
           {selectedOption ? (
             <div className="truncate flex items-center space-x-1.5">
-              <span className="font-semibold text-slate-800 truncate">{selectedOption.label}</span>
+              <span className="font-semibold text-slate-800 truncate">
+                {toSafeDisplayString(selectedOption.label, toSafeDisplayString(value, placeholder))}
+              </span>
               {selectedOption.sublabel && (
-                <span className="text-[10px] text-slate-400 font-normal">({selectedOption.sublabel})</span>
+                <span className="text-[10px] text-slate-400 font-normal">
+                  ({toSafeDisplayString(selectedOption.sublabel, '')})
+                </span>
               )}
             </div>
-          ) : value ? (
-            <span className="font-semibold text-slate-800 truncate">{value}</span>
+          ) : value !== undefined && value !== null && value !== '' ? (
+            <span className="font-semibold text-slate-800 truncate">
+              {toSafeDisplayString(value, '')}
+            </span>
           ) : (
-            <span className="text-slate-400">{placeholder}</span>
+            <span className="text-slate-400">{toSafeDisplayString(placeholder, '')}</span>
           )}
         </div>
 
         <div className="flex items-center space-x-1 flex-shrink-0 text-slate-400">
-          {value && !disabled && (
+          {value !== undefined && value !== null && value !== '' && !disabled && (
             <button
               type="button"
               onClick={handleClear}
@@ -246,7 +261,7 @@ export default function SearchableSelect({
 
                 return (
                   <div
-                    key={`${opt.value}-${idx}`}
+                    key={`${toSafeDisplayString(opt.value, 'opt')}-${idx}`}
                     onClick={() => handleSelect(opt)}
                     onMouseEnter={() => setHighlightedIndex(idx)}
                     className={`px-3 py-2 cursor-pointer flex items-center justify-between transition-colors ${
@@ -256,9 +271,9 @@ export default function SearchableSelect({
                     }`}
                   >
                     <div className="truncate flex flex-col pr-2">
-                      <span className="truncate">{opt.label}</span>
+                      <span className="truncate">{toSafeDisplayString(opt.label, '—')}</span>
                       {opt.sublabel && (
-                        <span className="text-[10px] text-slate-400">{opt.sublabel}</span>
+                        <span className="text-[10px] text-slate-400">{toSafeDisplayString(opt.sublabel, '')}</span>
                       )}
                     </div>
                     {isSelected && <Check className="w-3.5 h-3.5 text-[#F28524] flex-shrink-0" />}

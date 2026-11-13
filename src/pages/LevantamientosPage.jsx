@@ -6,6 +6,7 @@ import {
 } from 'lucide-react';
 import { useApp } from '../context/AppContext';
 import LevantamientoWorkspace from '../components/levantamientos/LevantamientoWorkspace';
+import { userHasPermission } from '../utils/permissions';
 
 export default function LevantamientosPage({ navigateTo, pageParams }) {
   const {
@@ -14,10 +15,14 @@ export default function LevantamientosPage({ navigateTo, pageParams }) {
     createCampamento,
     createAlmacen,
     createLevantamiento,
-    currentRole,
+    activeCampamento,
     currentUser,
     showToast
   } = useApp();
+
+  const canCreateLevantamiento = userHasPermission(currentUser, 'lev:crear');
+  const canViewCampamentos = userHasPermission(currentUser, 'camp:ver');
+  const canOperateCampamentos = userHasPermission(currentUser, 'camp:operar');
 
   // Active view: null (list) or levantamientoId (workspace)
   const [activeLevantamientoId, setActiveLevantamientoId] = useState(() => {
@@ -56,10 +61,15 @@ export default function LevantamientosPage({ navigateTo, pageParams }) {
     loadData();
   };
 
-  // Filters
+  // Filters (propagación territorial activeCampamento C08)
+  const activeCampIdStr = activeCampamento?.id ? String(activeCampamento.id) : 'TODOS';
   const [estadoFilter, setEstadoFilter] = useState('TODOS');
-  const [campamentoFilter, setCampamentoFilter] = useState('TODOS');
+  const [campamentoFilter, setCampamentoFilter] = useState(activeCampIdStr);
   const [searchQuery, setSearchQuery] = useState('');
+
+  useEffect(() => {
+    setCampamentoFilter(activeCampIdStr);
+  }, [activeCampIdStr]);
 
   // Modals
   const [showNuevoModal, setShowNuevoModal] = useState(false);
@@ -108,7 +118,9 @@ export default function LevantamientosPage({ navigateTo, pageParams }) {
       setLoading(true);
       const [levRes, campRes] = await Promise.all([
         fetchLevantamientos(),
-        fetchCampamentos()
+        canViewCampamentos
+          ? fetchCampamentos()
+          : Promise.resolve({ success: true, campamentos: currentUser?.campamentos || [] })
       ]);
 
       if (levRes.success) {
@@ -123,7 +135,7 @@ export default function LevantamientosPage({ navigateTo, pageParams }) {
     } finally {
       setLoading(false);
     }
-  }, [fetchLevantamientos, fetchCampamentos, showToast]);
+  }, [fetchLevantamientos, fetchCampamentos, canViewCampamentos, currentUser, showToast]);
 
   useEffect(() => {
     loadData();
@@ -211,7 +223,13 @@ export default function LevantamientosPage({ navigateTo, pageParams }) {
       setCreatingCamp(true);
       const payload = {
         ...nuevoCampForm,
-        almacenes: nuevoCampForm.almacen_inicial ? [nuevoCampForm.almacen_inicial] : ['Almacén Central']
+        almacenesIniciales: [
+          {
+            nombre: nuevoCampForm.almacen_inicial?.trim() || 'Almacén Central',
+            tipo: 'General',
+            encargado: nuevoCampForm.responsable?.trim() || null
+          }
+        ]
       };
       const res = await createCampamento(payload);
       if (res.success) {
@@ -292,18 +310,20 @@ export default function LevantamientosPage({ navigateTo, pageParams }) {
 
         {/* Action Buttons */}
         <div className="flex items-center space-x-2.5 flex-wrap">
-          <button
-            onClick={() => {
-              setCampsModalTab('list');
-              setShowCampsModal(true);
-            }}
-            className="inline-flex items-center space-x-2 px-3.5 py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-bold rounded-xl transition-all"
-          >
-            <Building2 className="w-4 h-4 text-slate-600" />
-            <span>Campamentos y Almacenes</span>
-          </button>
+          {(canViewCampamentos || canOperateCampamentos) && (
+            <button
+              onClick={() => {
+                setCampsModalTab(canViewCampamentos ? 'list' : 'new_camp');
+                setShowCampsModal(true);
+              }}
+              className="inline-flex items-center space-x-2 px-3.5 py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-bold rounded-xl transition-all"
+            >
+              <Building2 className="w-4 h-4 text-slate-600" />
+              <span>Campamentos y Almacenes</span>
+            </button>
+          )}
 
-          {['admin', 'supervisor', 'almacen', 'auditor', 'developer'].includes(currentRole) && (
+          {canCreateLevantamiento && (
             <button
               onClick={() => setShowNuevoModal(true)}
               className="inline-flex items-center space-x-2 px-4 py-2.5 bg-[#F28524] hover:bg-[#d9731b] text-white text-xs font-bold rounded-xl shadow-lg shadow-[#F28524]/25 transition-all"
@@ -418,7 +438,7 @@ export default function LevantamientosPage({ navigateTo, pageParams }) {
               ? 'No se encontraron resultados con los filtros aplicados.'
               : 'Comience creando una nueva sesión de auditoría para su campamento o almacén.'}
           </p>
-          {['admin', 'supervisor', 'almacen', 'auditor', 'developer'].includes(currentRole) && (
+          {canCreateLevantamiento && (
             <button
               onClick={() => setShowNuevoModal(true)}
               className="px-4 py-2 bg-[#F28524] text-white text-xs font-bold rounded-xl hover:bg-[#d9731b]"
@@ -496,7 +516,7 @@ export default function LevantamientosPage({ navigateTo, pageParams }) {
       )}
 
       {/* MODAL: NUEVO LEVANTAMIENTO */}
-      {showNuevoModal && (
+      {showNuevoModal && canCreateLevantamiento && (
         <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm z-50 flex items-center justify-center p-4">
           <div className="bg-white rounded-2xl max-w-lg w-full p-6 shadow-2xl space-y-4">
             <div className="flex items-center justify-between border-b border-slate-100 pb-3">
@@ -623,7 +643,7 @@ export default function LevantamientosPage({ navigateTo, pageParams }) {
       )}
 
       {/* MODAL: GESTIONAR CAMPAMENTOS Y ALMACENES */}
-      {showCampsModal && (
+      {showCampsModal && (canViewCampamentos || canOperateCampamentos) && (
         <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm z-50 flex items-center justify-center p-4">
           <div className="bg-white rounded-2xl max-w-2xl w-full p-6 shadow-2xl space-y-4 max-h-[90vh] flex flex-col">
             <div className="flex items-center justify-between border-b border-slate-100 pb-3">
@@ -638,34 +658,40 @@ export default function LevantamientosPage({ navigateTo, pageParams }) {
 
             {/* Sub-tabs */}
             <div className="flex items-center space-x-2 border-b border-slate-100 pb-2 text-xs">
-              <button
-                onClick={() => setCampsModalTab('list')}
-                className={`px-3 py-1.5 rounded-lg font-bold transition-all ${
-                  campsModalTab === 'list' ? 'bg-slate-900 text-white' : 'text-slate-600 hover:bg-slate-100'
-                }`}
-              >
-                Campamentos ({campamentos.length})
-              </button>
-              <button
-                onClick={() => setCampsModalTab('new_camp')}
-                className={`px-3 py-1.5 rounded-lg font-bold transition-all ${
-                  campsModalTab === 'new_camp' ? 'bg-[#F28524] text-white' : 'text-slate-600 hover:bg-slate-100'
-                }`}
-              >
-                + Registrar Campamento
-              </button>
-              <button
-                onClick={() => setCampsModalTab('new_alm')}
-                className={`px-3 py-1.5 rounded-lg font-bold transition-all ${
-                  campsModalTab === 'new_alm' ? 'bg-[#F28524] text-white' : 'text-slate-600 hover:bg-slate-100'
-                }`}
-              >
-                + Añadir Almacén
-              </button>
+              {canViewCampamentos && (
+                <button
+                  onClick={() => setCampsModalTab('list')}
+                  className={`px-3 py-1.5 rounded-lg font-bold transition-all ${
+                    campsModalTab === 'list' ? 'bg-slate-900 text-white' : 'text-slate-600 hover:bg-slate-100'
+                  }`}
+                >
+                  Campamentos ({campamentos.length})
+                </button>
+              )}
+              {canOperateCampamentos && (
+                <button
+                  onClick={() => setCampsModalTab('new_camp')}
+                  className={`px-3 py-1.5 rounded-lg font-bold transition-all ${
+                    campsModalTab === 'new_camp' ? 'bg-[#F28524] text-white' : 'text-slate-600 hover:bg-slate-100'
+                  }`}
+                >
+                  + Registrar Campamento
+                </button>
+              )}
+              {canOperateCampamentos && (
+                <button
+                  onClick={() => setCampsModalTab('new_alm')}
+                  className={`px-3 py-1.5 rounded-lg font-bold transition-all ${
+                    campsModalTab === 'new_alm' ? 'bg-[#F28524] text-white' : 'text-slate-600 hover:bg-slate-100'
+                  }`}
+                >
+                  + Añadir Almacén
+                </button>
+              )}
             </div>
 
             {/* TAB CONTENT: LIST */}
-            {campsModalTab === 'list' && (
+            {campsModalTab === 'list' && canViewCampamentos && (
               <div className="overflow-y-auto flex-1 space-y-3 pr-1 text-xs">
                 {campamentos.map(camp => (
                   <div key={camp.id} className="p-3.5 bg-slate-50 rounded-xl border border-slate-200 space-y-2">
@@ -704,7 +730,7 @@ export default function LevantamientosPage({ navigateTo, pageParams }) {
             )}
 
             {/* TAB CONTENT: NEW CAMP */}
-            {campsModalTab === 'new_camp' && (
+            {campsModalTab === 'new_camp' && canOperateCampamentos && (
               <form onSubmit={handleCreateCampamento} className="space-y-3 text-xs overflow-y-auto flex-1 pr-1">
                 <div className="grid grid-cols-3 gap-2.5">
                   <div className="col-span-2">

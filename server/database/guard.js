@@ -7,22 +7,103 @@
  * la base de datos de producción (Clever Cloud o entornos no aislados).
  */
 
+const ALLOWED_LOCAL_HOSTS = new Set(['localhost', '127.0.0.1', '::1']);
+
+function normalizeValue(value) {
+  return String(value ?? '').trim().toLowerCase();
+}
+
+function isCleverCloudHost(host) {
+  return (
+    host.includes('clever-cloud.com') ||
+    host.includes('cleverapps.io') ||
+    host.includes('services.clever')
+  );
+}
+
+function isLocalHost(host) {
+  return ALLOWED_LOCAL_HOSTS.has(host);
+}
+
+function hasPermittedProductionMode(config) {
+  return (
+    config?.allowProductionDbName === true ||
+    normalizeValue(process.env.ALLOW_LOCAL_PRODUCTION_DB) === 'true'
+  );
+}
+
+/**
+ * Valida en modo librería que un destino de base de datos sea estrictamente local
+ * y aislado (sin matar procesos con process.exit). Lanza Error explícito ante
+ * hosts vacíos, remotos, de Clever Cloud o apuntando a producción sin autorización.
+ */
+export function assertLocalIsolatedTarget(config = {}, contextLabel = 'Operación de BD aislada') {
+  const safeConfig = config && typeof config === 'object' ? config : {};
+  const rawHost = Object.prototype.hasOwnProperty.call(safeConfig, 'host')
+    ? safeConfig.host
+    : process.env.DB_HOST;
+
+  let rawDbName;
+  if (Object.prototype.hasOwnProperty.call(safeConfig, 'database')) {
+    rawDbName = safeConfig.database;
+  } else if (Object.prototype.hasOwnProperty.call(safeConfig, 'dbName')) {
+    rawDbName = safeConfig.dbName;
+  } else if (safeConfig.allowEmptyDatabase === true) {
+    rawDbName = '';
+  } else {
+    rawDbName = process.env.DB_NAME;
+  }
+
+  const host = normalizeValue(rawHost);
+  const dbName = normalizeValue(rawDbName);
+
+  if (!host) {
+    throw new Error(
+      `[BLOQUEO DE SEGURIDAD - ${contextLabel}] DB_HOST vacío o no definido. Se requiere un host local explícito (localhost, 127.0.0.1 o ::1).`
+    );
+  }
+
+  if (isCleverCloudHost(host)) {
+    throw new Error(
+      `[BLOQUEO DE SEGURIDAD - ${contextLabel}] Conexión bloqueada hacia Clever Cloud ("${String(rawHost)}"). Prohibido operar contra producción en modo aislado.`
+    );
+  }
+
+  if (!isLocalHost(host)) {
+    throw new Error(
+      `[BLOQUEO DE SEGURIDAD - ${contextLabel}] Host no local bloqueado ("${String(rawHost)}"). Solo se permiten localhost, 127.0.0.1 o ::1.`
+    );
+  }
+
+  if (dbName === 'gridops_enterprise' && !hasPermittedProductionMode(safeConfig)) {
+    throw new Error(
+      `[BLOQUEO DE SEGURIDAD - ${contextLabel}] Base de datos "gridops_enterprise" bloqueada sin modo permitido explícito en entorno aislado.`
+    );
+  }
+
+  return { host, database: dbName || null };
+}
+
 export function assertSafeDatabaseTarget(scriptName = 'Operación de BD') {
-  const host = (process.env.DB_HOST || '').toLowerCase();
-  const dbName = (process.env.DB_NAME || '').toLowerCase();
-  const nodeEnv = (process.env.NODE_ENV || '').toLowerCase();
+  const host = normalizeValue(process.env.DB_HOST);
+  const dbName = normalizeValue(process.env.DB_NAME);
+  const nodeEnv = normalizeValue(process.env.NODE_ENV);
   const allowDestructive = process.env.ALLOW_DESTRUCTIVE_OPERATIONS === 'true';
-  const environment = (process.env.ENVIRONMENT || '').toLowerCase();
+  const environment = normalizeValue(process.env.ENVIRONMENT);
 
-  // 1. REGLA INQUEBRANTABLE: Prohibición absoluta de hosts remotos o Clever Cloud
-  const isCleverCloud = host.includes('clever-cloud.com') || host.includes('cleverapps.io') || host.includes('services.clever');
-  const isRemote = host !== 'localhost' && host !== '127.0.0.1' && host !== '::1' && host !== '';
+  // 1. REGLA INQUEBRANTABLE: Prohibición absoluta de hosts vacíos, remotos o Clever Cloud
+  const isCleverCloud = isCleverCloudHost(host);
+  const isRemote = !isLocalHost(host);
 
-  if (isCleverCloud || isRemote) {
+  if (!host || isCleverCloud || isRemote) {
     console.error('\n' + '='.repeat(80));
     console.error(`🚨 [BLOQUEO DE SEGURIDAD CRÍTICO] - ${scriptName.toUpperCase()}`);
     console.error('='.repeat(80));
-    console.error(`DETECCIÓN: El host configurado es remoto/producción: "${process.env.DB_HOST}"`);
+    console.error(
+      !host
+        ? 'DETECCIÓN: DB_HOST está vacío o no definido.'
+        : `DETECCIÓN: El host configurado es remoto/producción: "${process.env.DB_HOST}"`
+    );
     console.error('REGLA VIOLADA: Está terminantemente prohibido ejecutar scripts destructivos,');
     console.error('reinicializaciones de tablas o pruebas de escritura sobre bases de producción.');
     console.error('ACCIÓN: Operación abortada de inmediato. Los 414 registros maestros están a salvo.');
