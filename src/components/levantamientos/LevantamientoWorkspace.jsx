@@ -2,15 +2,18 @@ import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react'
 import {
   ArrowLeft, Plus, Save, Trash2, Edit3, Search, UploadCloud,
   CheckCircle2, AlertTriangle, FileSpreadsheet, Eye, X,
-  RotateCcw, Sparkles, ShieldAlert, Check, RefreshCw
+  RotateCcw, Sparkles, ShieldAlert, Check, RefreshCw, Printer
 } from 'lucide-react';
 import { useApp } from '../../context/AppContext';
 import SearchableSelect from '../common/SearchableSelect';
-import * as XLSX from 'xlsx';
+import { readSpreadsheetFileToSheets, downloadXlsxWorkbook } from '../../utils/exportUtils';
+import { userHasPermission } from '../../utils/permissions';
 
 const ESTADOS_FISICOS = ['Bueno', 'Regular', 'Dañado', 'Fuera de servicio', 'Pendiente de verificación'];
 const AREAS = ['ALMACEN', 'INFORMATICA', 'OFICINAS', 'COCINA', 'OTRA'];
 const UNIDADES = ['Unidad', 'Juego', 'Par', 'Metro', 'Rollo', 'Caja', 'Pieza', 'Kit', 'Litro'];
+
+const normalizeEstadoBadgeKey = (val) => String(val || 'Bueno').trim().toUpperCase();
 
 export default function LevantamientoWorkspace({ levantamientoId, onBack, onConsolidated }) {
   const {
@@ -22,15 +25,20 @@ export default function LevantamientoWorkspace({ levantamientoId, onBack, onCons
     deleteLevantamientoItem,
     importLevantamientoItems,
     consolidarLevantamiento,
+    fetchLevantamientoConciliacion,
     fetchArticulos,
     fetchCategorias,
     createCategoria,
     fetchCustodios,
     createCustodio,
-    currentRole,
     currentUser,
     showToast
   } = useApp();
+
+  const canCapture = userHasPermission(currentUser, 'lev:capturar');
+  const canEditItems = userHasPermission(currentUser, 'lev:editar');
+  const canImportExcel = userHasPermission(currentUser, 'lev:importar');
+  const canConsolidar = userHasPermission(currentUser, 'lev:consolidar');
 
   // Session data
   const [levantamiento, setLevantamiento] = useState(null);
@@ -85,6 +93,17 @@ export default function LevantamientoWorkspace({ levantamientoId, onBack, onCons
   const [parsedWorkbook, setParsedWorkbook] = useState(null);
   const [previewItems, setPreviewItems] = useState([]);
   const [importingExcel, setImportingExcel] = useState(false);
+  const [excelParseError, setExcelParseError] = useState('');
+  const [excelRowErrors, setExcelRowErrors] = useState([]);
+  const [excelServerErrors, setExcelServerErrors] = useState([]);
+  const [lastImportWarnings, setLastImportWarnings] = useState([]);
+
+  // Conciliación físico vs teórico modal state (solo lectura)
+  const [showConciliacionModal, setShowConciliacionModal] = useState(false);
+  const [loadingConciliacion, setLoadingConciliacion] = useState(false);
+  const [conciliacionData, setConciliacionData] = useState(null);
+  const [conciliacionError, setConciliacionError] = useState('');
+  const [conciliacionTab, setConciliacionTab] = useState('diferencias');
 
   // Consolidation modal state
   const [showConsolidarModal, setShowConsolidarModal] = useState(false);
@@ -106,6 +125,7 @@ export default function LevantamientoWorkspace({ levantamientoId, onBack, onCons
 
   // Load Categories on area change
   useEffect(() => {
+    if (!canCapture) return;
     let isCancelled = false;
     setLoadingCategorias(true);
     fetchCategorias(formData.area).then(res => {
@@ -116,10 +136,11 @@ export default function LevantamientoWorkspace({ levantamientoId, onBack, onCons
       if (!isCancelled) setLoadingCategorias(false);
     });
     return () => { isCancelled = true; };
-  }, [formData.area, fetchCategorias]);
+  }, [formData.area, fetchCategorias, canCapture]);
 
   // Load Custodios on mount
   useEffect(() => {
+    if (!canCapture) return;
     let isCancelled = false;
     setLoadingCustodios(true);
     fetchCustodios().then(res => {
@@ -134,7 +155,7 @@ export default function LevantamientoWorkspace({ levantamientoId, onBack, onCons
       if (!isCancelled) setLoadingCustodios(false);
     });
     return () => { isCancelled = true; };
-  }, [fetchCustodios]);
+  }, [fetchCustodios, canCapture]);
 
   // Load session and items
   const loadSession = useCallback(async () => {
@@ -211,12 +232,13 @@ export default function LevantamientoWorkspace({ levantamientoId, onBack, onCons
       ...prev,
       articulo_nombre: art.articulo_nombre || '',
       categoria: art.categoria || prev.categoria,
-      marca: art.marca || prev.marca,
-      modelo_caracteristicas: art.modelo_caracteristicas || prev.modelo_caracteristicas,
+      marca: art.marca_modelo || art.marca || prev.marca,
+      modelo_caracteristicas: art.tipo_caracteristicas || art.modelo_caracteristicas || prev.modelo_caracteristicas,
       area: art.area ? art.area.toUpperCase() : prev.area,
       unidad_medida: art.unidad_medida || prev.unidad_medida,
       propietario: art.propietario || prev.propietario,
-      responsable_custodio: art.responsable_custodio || prev.responsable_custodio
+      responsable_custodio: art.asignado_a || art.responsable_custodio || prev.responsable_custodio,
+      codigo_original: art.codigo_original || art.codigo_interno || prev.codigo_original
     }));
     setMasterSearchQuery('');
     setShowMasterDropdown(false);
@@ -236,9 +258,18 @@ export default function LevantamientoWorkspace({ levantamientoId, onBack, onCons
       return;
     }
 
+    const parsedCant = Number(String(formData.cantidad ?? '').replace(',', '.').trim());
+    if (!Number.isFinite(parsedCant) || parsedCant <= 0) {
+      showToast('La cantidad debe ser un número mayor que cero.', 'error');
+      return;
+    }
+
     try {
       setSavingItem(true);
-      const res = await addLevantamientoItem(levantamientoId, formData);
+      const res = await addLevantamientoItem(levantamientoId, {
+        ...formData,
+        cantidad: Number(parsedCant.toFixed(2))
+      });
 
       if (res.success) {
         // Refresh items list
@@ -316,73 +347,101 @@ export default function LevantamientoWorkspace({ levantamientoId, onBack, onCons
     }
   };
 
-  // Excel File Upload & Client Parsing
-  const handleExcelFileUpload = (e) => {
-    const file = e.target.files[0];
+  // Excel / CSV File Upload & Client Parsing (read-excel-file + RFC-4180 CSV sin SheetJS A11)
+  const handleExcelFileUpload = async (e) => {
+    const file = e.target.files?.[0];
     if (!file) return;
 
-    const reader = new FileReader();
-    reader.onload = (evt) => {
-      try {
-        const bstr = evt.target.result;
-        const wb = XLSX.read(bstr, { type: 'binary' });
-        setParsedWorkbook(wb);
-        setExcelSheets(wb.SheetNames);
-        if (wb.SheetNames.length > 0) {
-          // Select first sheet or sheet matching current area
-          const matchAreaSheet = wb.SheetNames.find(s => s.toUpperCase() === formData.area) || wb.SheetNames[0];
-          setSelectedSheet(matchAreaSheet);
-          parseSheetRows(wb, matchAreaSheet);
-        }
-      } catch (err) {
-        showToast('Error leyendo el archivo Excel.', 'error');
+    setExcelParseError('');
+    setExcelRowErrors([]);
+    setExcelServerErrors([]);
+
+    try {
+      const sheets = await readSpreadsheetFileToSheets(file);
+      const sheetNames = sheets.map(s => s.sheet);
+      setParsedWorkbook(sheets);
+      setExcelSheets(sheetNames);
+      if (sheetNames.length > 0) {
+        const matchAreaSheet = sheetNames.find(s => s.toUpperCase() === formData.area) || sheetNames[0];
+        setSelectedSheet(matchAreaSheet);
+        parseSheetRows(sheets, matchAreaSheet);
+      } else {
+        setExcelParseError('El archivo seleccionado no contiene hojas legibles.');
       }
-    };
-    reader.readAsBinaryString(file);
+    } catch (err) {
+      const msg = err?.message || 'No se pudo leer el archivo Excel o CSV. Verifique el formato.';
+      setExcelParseError(msg);
+      showToast(msg, 'error');
+    }
   };
 
-  const parseSheetRows = (wb, sheetName) => {
-    const ws = wb.Sheets[sheetName];
-    if (!ws) return;
+  const parseSheetRows = (workbookSheets, sheetName) => {
+    const foundSheet = Array.isArray(workbookSheets)
+      ? workbookSheets.find(s => s.sheet === sheetName)
+      : null;
+    if (!foundSheet) return;
 
-    const rawRows = XLSX.utils.sheet_to_json(ws, { defval: '' });
+    setExcelRowErrors([]);
+    setExcelServerErrors([]);
+
+    const rawRows = foundSheet.objects || [];
     if (!rawRows || rawRows.length === 0) {
       setPreviewItems([]);
       return;
     }
 
-    // Auto-detect and normalize columns
-    const normalized = rawRows.map(row => {
+    const rowErrors = [];
+    const validRows = [];
+    const sheetAreaUpper = String(sheetName || '').trim().toUpperCase();
+
+    rawRows.forEach((row, idx) => {
+      const excelRowNum = idx + 2;
       const getVal = (patterns) => {
         for (const k of Object.keys(row)) {
           const lower = k.toLowerCase().trim();
           if (patterns.some(p => lower.includes(p))) {
-            return String(row[k] || '').trim();
+            return String(row[k] ?? '').trim();
           }
         }
         return '';
       };
 
       const nombre = getVal(['articulo', 'artículo', 'descripcion', 'descripción', 'nombre', 'equipo', 'bien']);
+      if (!nombre) return; // Ignorar filas vacías
+
+      const rawCantStr = getVal(['cantidad', 'cant', 'qty']);
+      let cantidad = 1;
+      if (rawCantStr !== '') {
+        const parsedCant = Number(rawCantStr.replace(',', '.'));
+        if (!Number.isFinite(parsedCant) || parsedCant <= 0) {
+          rowErrors.push(`Fila #${excelRowNum} ("${nombre}"): cantidad "${rawCantStr}" inválida o menor/igual a cero.`);
+          return;
+        }
+        cantidad = Number(parsedCant.toFixed(2));
+      }
+
+      const rawAreaCell = getVal(['area', 'área']);
+      const cleanArea = rawAreaCell
+        ? rawAreaCell.toUpperCase()
+        : (AREAS.includes(sheetAreaUpper) ? sheetAreaUpper : 'ALMACEN');
+      if (!AREAS.includes(cleanArea)) {
+        rowErrors.push(`Fila #${excelRowNum} ("${nombre}"): área "${rawAreaCell}" no permitida (use ALMACEN, INFORMATICA, OFICINAS, COCINA u OTRA).`);
+        return;
+      }
+
       const codigo = getVal(['codigo', 'código', 'cod', 'id']);
       const marca = getVal(['marca', 'fabricante']);
       const modelo = getVal(['modelo', 'caracteristicas', 'especificaciones']);
       const serie = getVal(['serie', 'serial', 'imei']);
-      const cantidad = parseInt(getVal(['cantidad', 'cant', 'qty']) || '1', 10) || 1;
       const estado = getVal(['estado', 'condicion', 'condición']) || 'Bueno';
       const responsable = getVal(['responsable', 'custodio', 'asignado', 'tecnico']);
       const ubicacion = getVal(['ubicacion', 'ubicación', 'lugar', 'deposito', 'estante']);
       const obs = getVal(['observacion', 'observaciones', 'nota', 'comentario']);
 
-      let cleanArea = sheetName.toUpperCase();
-      if (!AREAS.includes(cleanArea)) {
-        cleanArea = 'ALMACEN';
-      }
-
-      return {
+      validRows.push({
         area: cleanArea,
         codigo_original: codigo,
-        articulo_nombre: nombre || 'Sin descripción',
+        articulo_nombre: nombre,
         marca,
         modelo_caracteristicas: modelo,
         serie_imei: serie,
@@ -393,10 +452,11 @@ export default function LevantamientoWorkspace({ levantamientoId, onBack, onCons
         responsable_custodio: responsable,
         ubicacion_exacta: ubicacion,
         observaciones: obs
-      };
-    }).filter(it => it.articulo_nombre && it.articulo_nombre !== 'Sin descripción');
+      });
+    });
 
-    setPreviewItems(normalized);
+    setExcelRowErrors(rowErrors);
+    setPreviewItems(validRows);
   };
 
   const handleExecuteImportExcel = async () => {
@@ -407,12 +467,21 @@ export default function LevantamientoWorkspace({ levantamientoId, onBack, onCons
 
     try {
       setImportingExcel(true);
+      setExcelServerErrors([]);
       const res = await importLevantamientoItems(levantamientoId, previewItems);
       if (res.success) {
+        const warns = Array.isArray(res.warnings) ? res.warnings : [];
+        setLastImportWarnings(warns);
+        if (warns.length > 0) {
+          showToast(`Importación completada con ${warns.length} advertencia(s) de serial.`, 'info');
+        }
         setShowExcelModal(false);
         setPreviewItems([]);
         setParsedWorkbook(null);
+        setExcelRowErrors([]);
         await loadSession();
+      } else if (Array.isArray(res?.errores) && res.errores.length > 0) {
+        setExcelServerErrors(res.errores);
       }
     } catch (err) {
       showToast('Error al importar archivo.', 'error');
@@ -464,6 +533,81 @@ export default function LevantamientoWorkspace({ levantamientoId, onBack, onCons
     }
   };
 
+  const handleOpenConciliacion = async () => {
+    setShowConciliacionModal(true);
+    setLoadingConciliacion(true);
+    setConciliacionError('');
+    try {
+      const res = await fetchLevantamientoConciliacion(levantamientoId);
+      if (res?.success) {
+        setConciliacionData(res);
+      } else {
+        setConciliacionError(res?.message || 'No se pudo calcular la conciliación físico vs teórico.');
+      }
+    } catch {
+      setConciliacionError('Error de conexión al calcular la conciliación físico vs teórico.');
+    } finally {
+      setLoadingConciliacion(false);
+    }
+  };
+
+  const handleExportActaXlsx = async () => {
+    if (!levantamiento) return;
+    try {
+      const code = levantamiento.codigo_levantamiento || `LEV-${levantamientoId}`;
+      const actaRows = [
+        ['Código Sesión', code],
+        ['Título', levantamiento.titulo || ''],
+        ['Campamento / Sede', levantamiento.campamento_nombre || ''],
+        ['Almacén', levantamiento.almacen_nombre || 'General'],
+        ['Estado Sesión', levantamiento.estado || ''],
+        ['Responsable', levantamiento.responsable_levantamiento || ''],
+        ['Total Ítems Capturados', items.length],
+        ['Fecha Exportación', new Date().toISOString().slice(0, 19).replace('T', ' ')]
+      ];
+      const itemHeaders = [
+        'ID Ítem', 'Código', 'Área', 'Categoría', 'Artículo', 'Marca',
+        'Modelo/Espec.', 'Serie/IMEI', 'Cantidad', 'Unidad', 'Estado Físico',
+        'Custodio', 'Ubicación Exacta', 'Consolidado', 'Observaciones'
+      ];
+      const itemRows = items.map((it) => [
+        it.id ?? '',
+        it.codigo_original || '',
+        it.area || '',
+        it.categoria || '',
+        it.articulo_nombre || '',
+        it.marca || '',
+        it.modelo_caracteristicas || '',
+        it.serie_imei || '',
+        it.cantidad !== null && it.cantidad !== undefined ? Number(it.cantidad) : 1,
+        it.unidad_medida || 'Unidad',
+        it.estado_fisico || '',
+        it.responsable_custodio || '',
+        it.ubicacion_exacta || '',
+        Number(it.consolidado) === 1 ? 'Sí' : Number(it.consolidado) === 2 ? 'Omitido' : 'Pendiente',
+        it.observaciones || ''
+      ]);
+
+      await downloadXlsxWorkbook(`acta_levantamiento_${code}_${new Date().toISOString().slice(0, 10)}.xlsx`, [
+        {
+          sheetName: 'Resumen Acta',
+          headers: ['Campo', 'Valor'],
+          rows: actaRows,
+          columnWidths: [28, 52]
+        },
+        {
+          sheetName: 'Artículos Capturados',
+          headers: itemHeaders,
+          rows: itemRows,
+          columnWidths: [10, 14, 14, 22, 32, 18, 22, 18, 12, 12, 18, 22, 22, 14, 30]
+        }
+      ]);
+      showToast('Acta Excel (.xlsx) generada correctamente.', 'success');
+    } catch {
+      showToast('Error generando acta Excel de la sesión.', 'error');
+    }
+  };
+
   // Filtered items list
   const filteredItems = useMemo(() => {
     return items.filter(it => {
@@ -484,10 +628,10 @@ export default function LevantamientoWorkspace({ levantamientoId, onBack, onCons
     const areasCount = {};
     const estadosCount = {};
     items.forEach(it => {
-      const a = it.area || 'OTRA';
-      areasCount[a] = (areasCount[a] || 0) + (Number(it.cantidad) || 1);
-      const e = it.estado_fisico || 'BUENO';
-      estadosCount[e] = (estadosCount[e] || 0) + (Number(it.cantidad) || 1);
+      const a = String(it.area || 'OTRA').trim().toUpperCase();
+      areasCount[a] = Number(((areasCount[a] || 0) + (Number(it.cantidad) || 1)).toFixed(2));
+      const e = normalizeEstadoBadgeKey(it.estado_fisico);
+      estadosCount[e] = Number(((estadosCount[e] || 0) + (Number(it.cantidad) || 1)).toFixed(2));
     });
     return { total, areasCount, estadosCount };
   }, [items]);
@@ -560,9 +704,9 @@ export default function LevantamientoWorkspace({ levantamientoId, onBack, onCons
         </div>
 
         {/* Action Buttons */}
-        <div className="flex items-center space-x-2.5 flex-wrap">
+        <div className="flex items-center space-x-2.5 flex-wrap no-print">
           {/* Status Select */}
-          {!isFinalizado && (
+          {!isFinalizado && (canEditItems || canCapture) && (
             <select
               value={levantamiento.estado}
               onChange={(e) => handleChangeStatus(e.target.value)}
@@ -574,8 +718,37 @@ export default function LevantamientoWorkspace({ levantamientoId, onBack, onCons
             </select>
           )}
 
+          {/* Exportar Acta Excel y/o Imprimir Acta (A08) */}
+          <button
+            type="button"
+            onClick={handleExportActaXlsx}
+            className="inline-flex items-center space-x-1.5 px-3 py-2 bg-emerald-50 text-emerald-800 hover:bg-emerald-100 border border-emerald-200 text-xs font-bold rounded-xl transition-all"
+          >
+            <FileSpreadsheet className="w-4 h-4 text-emerald-600" />
+            <span>Acta Excel (.xlsx)</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => window.print()}
+            className="inline-flex items-center space-x-1.5 px-3 py-2 bg-slate-100 text-slate-700 hover:bg-slate-200 text-xs font-bold rounded-xl transition-all"
+          >
+            <Printer className="w-4 h-4 text-slate-600" />
+            <span>Imprimir Acta</span>
+          </button>
+
+          {/* Conciliación Físico vs Teórico (Solo Lectura) */}
+          <button
+            type="button"
+            onClick={handleOpenConciliacion}
+            className="inline-flex items-center space-x-1.5 px-3.5 py-2 bg-indigo-50 text-indigo-700 hover:bg-indigo-100 border border-indigo-200 text-xs font-bold rounded-xl transition-all"
+          >
+            <Eye className="w-4 h-4 text-indigo-600" />
+            <span>Conciliación Físico vs Teórico</span>
+          </button>
+
           {/* Import Excel */}
-          {!isFinalizado && (
+          {!isFinalizado && canImportExcel && (
             <button
               onClick={() => setShowExcelModal(true)}
               className="inline-flex items-center space-x-1.5 px-3.5 py-2 bg-slate-100 text-slate-700 hover:bg-slate-200 text-xs font-bold rounded-xl transition-all"
@@ -586,7 +759,7 @@ export default function LevantamientoWorkspace({ levantamientoId, onBack, onCons
           )}
 
           {/* Consolidate Button */}
-          {!isFinalizado && ['admin', 'supervisor', 'almacen', 'developer'].includes(currentRole) && (
+          {!isFinalizado && canConsolidar && (
             <button
               onClick={() => {
                 setConfirmConsolidarChecked(false);
@@ -612,6 +785,30 @@ export default function LevantamientoWorkspace({ levantamientoId, onBack, onCons
           )}
         </div>
       </div>
+
+      {/* Last Excel import warnings */}
+      {lastImportWarnings.length > 0 && (
+        <div className="bg-amber-50 border border-amber-300 rounded-xl p-4 text-xs text-amber-900 space-y-1.5">
+          <div className="flex items-center justify-between font-bold">
+            <span className="flex items-center space-x-1.5">
+              <AlertTriangle className="w-4 h-4 text-amber-600" />
+              <span>Advertencias detectadas en última importación ({lastImportWarnings.length})</span>
+            </span>
+            <button
+              type="button"
+              onClick={() => setLastImportWarnings([])}
+              className="text-amber-700 hover:text-amber-950 font-semibold"
+            >
+              Descartar
+            </button>
+          </div>
+          <ul className="list-disc pl-5 space-y-0.5 max-h-24 overflow-y-auto">
+            {lastImportWarnings.map((w, idx) => (
+              <li key={idx}>{w}</li>
+            ))}
+          </ul>
+        </div>
+      )}
 
       {/* KPI Cards / Progress Tracker */}
       <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
@@ -660,321 +857,324 @@ export default function LevantamientoWorkspace({ levantamientoId, onBack, onCons
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
         {/* Left Column (5 cols): Fast Capture Form for Laptop Typing */}
         {!isFinalizado ? (
-          <div className="lg:col-span-5 bg-white rounded-2xl p-5 border border-slate-200 shadow-sm flex flex-col">
-            <div className="flex items-center justify-between pb-3 mb-4 border-b border-slate-100">
-              <div className="flex items-center space-x-2">
-                <div className="w-2.5 h-2.5 rounded-full bg-[#F28524]" />
-                <h2 className="text-sm font-black text-slate-900 uppercase tracking-wider">
-                  Captura Rápida de Campo
-                </h2>
+          canCapture ? (
+            <div className="lg:col-span-5 bg-white rounded-2xl p-5 border border-slate-200 shadow-sm flex flex-col">
+              <div className="flex items-center justify-between pb-3 mb-4 border-b border-slate-100">
+                <div className="flex items-center space-x-2">
+                  <div className="w-2.5 h-2.5 rounded-full bg-[#F28524]" />
+                  <h2 className="text-sm font-black text-slate-900 uppercase tracking-wider">
+                    Captura Rápida de Campo
+                  </h2>
+                </div>
+                <span className="text-[10px] text-slate-400 font-mono">
+                  Tab: Navegar | Ctrl+Enter: Guardar
+                </span>
               </div>
-              <span className="text-[10px] text-slate-400 font-mono">
-                Tab: Navegar | Ctrl+Enter: Guardar
-              </span>
-            </div>
 
-            {/* Quick Master Catalog Search / Autocomplete Box */}
-            <div className="relative mb-4">
-              <label className="block text-[11px] font-bold text-slate-600 mb-1">
-                Autocompletar desde Inventario Maestro (Opcional):
-              </label>
-              <div className="relative">
-                <Search className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-2.5" />
-                <input
-                  type="text"
-                  value={masterSearchQuery}
-                  onChange={(e) => setMasterSearchQuery(e.target.value)}
-                  placeholder="Escriba ej: Taladro, Laptop Dell, Multímetro..."
-                  className="w-full pl-8 pr-3 py-1.5 text-xs bg-slate-50 border border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-[#F28524]"
-                />
-                {isSearchingMaster && (
-                  <RefreshCw className="w-3.5 h-3.5 text-[#F28524] animate-spin absolute right-3 top-2.5" />
+              {/* Quick Master Catalog Search / Autocomplete Box */}
+              <div className="relative mb-4">
+                <label className="block text-[11px] font-bold text-slate-600 mb-1">
+                  Autocompletar desde Inventario Maestro (Opcional):
+                </label>
+                <div className="relative">
+                  <Search className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-2.5" />
+                  <input
+                    type="text"
+                    value={masterSearchQuery}
+                    onChange={(e) => setMasterSearchQuery(e.target.value)}
+                    placeholder="Escriba ej: Taladro, Laptop Dell, Multímetro..."
+                    className="w-full pl-8 pr-3 py-1.5 text-xs bg-slate-50 border border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-[#F28524]"
+                  />
+                  {isSearchingMaster && (
+                    <RefreshCw className="w-3.5 h-3.5 text-[#F28524] animate-spin absolute right-3 top-2.5" />
+                  )}
+                </div>
+
+                {/* Autocomplete Dropdown */}
+                {showMasterDropdown && masterSearchResults.length > 0 && (
+                  <div className="absolute left-0 right-0 top-full mt-1 bg-white border border-slate-200 rounded-xl shadow-xl z-30 max-h-48 overflow-y-auto">
+                    <div className="p-1.5 text-[10px] font-bold text-slate-400 uppercase bg-slate-50 border-b border-slate-100">
+                      Artículos existentes encontrados
+                    </div>
+                    {masterSearchResults.map(art => (
+                      <button
+                        key={art.id}
+                        type="button"
+                        onClick={() => handleSelectMaster(art)}
+                        className="w-full text-left p-2 hover:bg-orange-50 border-b border-slate-100 last:border-0 flex items-center justify-between text-xs"
+                      >
+                        <div>
+                          <div className="font-bold text-slate-800">{art.articulo_nombre}</div>
+                          <div className="text-[10px] text-slate-500">
+                            {art.categoria} • {art.marca_modelo || art.marca || 'S/M'} {(art.tipo_caracteristicas || art.modelo_caracteristicas) ? `(${art.tipo_caracteristicas || art.modelo_caracteristicas})` : ''}
+                          </div>
+                        </div>
+                        <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-slate-100 text-slate-600">
+                          {art.codigo_original || art.codigo_interno}
+                        </span>
+                      </button>
+                    ))}
+                  </div>
                 )}
               </div>
 
-              {/* Autocomplete Dropdown */}
-              {showMasterDropdown && masterSearchResults.length > 0 && (
-                <div className="absolute left-0 right-0 top-full mt-1 bg-white border border-slate-200 rounded-xl shadow-xl z-30 max-h-48 overflow-y-auto">
-                  <div className="p-1.5 text-[10px] font-bold text-slate-400 uppercase bg-slate-50 border-b border-slate-100">
-                    Artículos existentes encontrados
-                  </div>
-                  {masterSearchResults.map(art => (
-                    <button
-                      key={art.id}
-                      type="button"
-                      onClick={() => handleSelectMaster(art)}
-                      className="w-full text-left p-2 hover:bg-orange-50 border-b border-slate-100 last:border-0 flex items-center justify-between text-xs"
-                    >
-                      <div>
-                        <div className="font-bold text-slate-800">{art.articulo_nombre}</div>
-                        <div className="text-[10px] text-slate-500">
-                          {art.categoria} • {art.marca || 'S/M'} {art.modelo_caracteristicas ? `(${art.modelo_caracteristicas})` : ''}
-                        </div>
-                      </div>
-                      <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-slate-100 text-slate-600">
-                        {art.codigo_interno}
-                      </span>
-                    </button>
-                  ))}
+              {/* Duplicate warning notification */}
+              {duplicateWarning && (
+                <div className="mb-4 p-3 bg-amber-50 border border-amber-300 rounded-xl flex items-start space-x-2 text-xs text-amber-800">
+                  <AlertTriangle className="w-4 h-4 text-amber-600 flex-shrink-0 mt-0.5" />
+                  <span>{duplicateWarning.mensaje}</span>
                 </div>
               )}
+
+              {/* Form Fields */}
+              <form onSubmit={(e) => handleSaveItem(e, true)} onKeyDown={handleKeyDown} className="space-y-3 flex-1 flex flex-col justify-between">
+                <div className="space-y-3">
+                  {/* Area & Código Original */}
+                  <div className="grid grid-cols-2 gap-2.5">
+                    <div>
+                      <label className="block text-[11px] font-bold text-slate-700 mb-1">
+                        Área <span className="text-rose-500">*</span>
+                      </label>
+                      <select
+                        value={formData.area}
+                        onChange={(e) => setFormData({ ...formData, area: e.target.value })}
+                        className="w-full px-2.5 py-1.5 text-xs bg-slate-50 border border-slate-200 rounded-xl font-semibold text-slate-800 focus:outline-none focus:ring-2 focus:ring-[#F28524]"
+                      >
+                        {AREAS.map(a => (
+                          <option key={a} value={a}>{a}</option>
+                        ))}
+                      </select>
+                    </div>
+                    <div>
+                      <label className="block text-[11px] font-bold text-slate-700 mb-1">
+                        Código / Placa Física
+                      </label>
+                      <input
+                        type="text"
+                        value={formData.codigo_original}
+                        onChange={(e) => setFormData({ ...formData, codigo_original: e.target.value })}
+                        placeholder="Ej: ACT-0042 o Nº placa"
+                        className="w-full px-2.5 py-1.5 text-xs bg-slate-50 border border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-[#F28524]"
+                      />
+                    </div>
+                  </div>
+
+                  {/* Nombre / Descripción (Primary field) */}
+                  <div>
+                    <label className="block text-[11px] font-bold text-slate-700 mb-1">
+                      Descripción del Artículo <span className="text-rose-500">*</span>
+                    </label>
+                    <input
+                      ref={nombreInputRef}
+                      type="text"
+                      required
+                      value={formData.articulo_nombre}
+                      onChange={(e) => setFormData({ ...formData, articulo_nombre: e.target.value })}
+                      placeholder="Ej: Taladro Percutor Inalámbrico 20V"
+                      className="w-full px-3 py-2 text-xs bg-white border border-slate-300 rounded-xl font-medium focus:outline-none focus:ring-2 focus:ring-[#F28524] shadow-sm"
+                    />
+                  </div>
+
+                  {/* Categoría & Marca */}
+                  <div className="grid grid-cols-2 gap-2.5">
+                    <div>
+                      <SearchableSelect
+                        label="Categoría"
+                        placeholder="Ej: Herramientas..."
+                        options={categorias}
+                        value={formData.categoria}
+                        onChange={(val) => setFormData(p => ({ ...p, categoria: val }))}
+                        allowCreate={true}
+                        onCreateNew={async (newCat) => {
+                          const res = await createCategoria({ area: formData.area, nombre: newCat });
+                          if (res.success) {
+                            setCategorias(prev => [...prev, newCat]);
+                            setFormData(p => ({ ...p, categoria: newCat }));
+                          }
+                        }}
+                        loading={loadingCategorias}
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-[11px] font-bold text-slate-700 mb-1">
+                        Marca
+                      </label>
+                      <input
+                        type="text"
+                        value={formData.marca}
+                        onChange={(e) => setFormData({ ...formData, marca: e.target.value })}
+                        placeholder="Ej: DeWalt, Bosch, Dell"
+                        className="w-full px-2.5 py-1.5 text-xs bg-slate-50 border border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-[#F28524]"
+                      />
+                    </div>
+                  </div>
+
+                  {/* Modelo & Serie/IMEI */}
+                  <div className="grid grid-cols-2 gap-2.5">
+                    <div>
+                      <label className="block text-[11px] font-bold text-slate-700 mb-1">
+                        Modelo / Características
+                      </label>
+                      <input
+                        type="text"
+                        value={formData.modelo_caracteristicas}
+                        onChange={(e) => setFormData({ ...formData, modelo_caracteristicas: e.target.value })}
+                        placeholder="Ej: DCD791B / 1/2 pulgada"
+                        className="w-full px-2.5 py-1.5 text-xs bg-slate-50 border border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-[#F28524]"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-[11px] font-bold text-slate-700 mb-1">
+                        Serie / IMEI
+                      </label>
+                      <input
+                        type="text"
+                        value={formData.serie_imei}
+                        onChange={(e) => {
+                          setFormData({ ...formData, serie_imei: e.target.value });
+                          checkDuplicateSerial(e.target.value);
+                        }}
+                        placeholder="N/S o IMEI"
+                        className="w-full px-2.5 py-1.5 text-xs bg-slate-50 border border-slate-200 rounded-xl font-mono focus:outline-none focus:ring-2 focus:ring-[#F28524]"
+                      />
+                    </div>
+                  </div>
+
+                  {/* Cantidad, Unidad & Estado Físico */}
+                  <div className="grid grid-cols-3 gap-2">
+                    <div>
+                      <label className="block text-[11px] font-bold text-slate-700 mb-1">
+                        Cantidad
+                      </label>
+                      <input
+                        type="number"
+                        min="0.01"
+                        step="0.01"
+                        value={formData.cantidad}
+                        onChange={(e) => setFormData({ ...formData, cantidad: e.target.value })}
+                        className="w-full px-2.5 py-1.5 text-xs bg-slate-50 border border-slate-200 rounded-xl font-bold focus:outline-none focus:ring-2 focus:ring-[#F28524]"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-[11px] font-bold text-slate-700 mb-1">
+                        Unidad
+                      </label>
+                      <select
+                        value={formData.unidad_medida}
+                        onChange={(e) => setFormData({ ...formData, unidad_medida: e.target.value })}
+                        className="w-full px-2 py-1.5 text-xs bg-slate-50 border border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-[#F28524]"
+                      >
+                        {UNIDADES.map(u => (
+                          <option key={u} value={u}>{u}</option>
+                        ))}
+                      </select>
+                    </div>
+                    <div>
+                      <label className="block text-[11px] font-bold text-slate-700 mb-1">
+                        Estado
+                      </label>
+                      <select
+                        value={formData.estado_fisico}
+                        onChange={(e) => setFormData({ ...formData, estado_fisico: e.target.value })}
+                        className={`w-full px-2 py-1.5 text-xs font-bold rounded-xl border focus:outline-none focus:ring-2 focus:ring-[#F28524] ${
+                          normalizeEstadoBadgeKey(formData.estado_fisico) === 'BUENO' ? 'bg-emerald-50 text-emerald-800 border-emerald-300' :
+                          normalizeEstadoBadgeKey(formData.estado_fisico) === 'REGULAR' ? 'bg-amber-50 text-amber-800 border-amber-300' :
+                          normalizeEstadoBadgeKey(formData.estado_fisico) === 'DAÑADO' ? 'bg-rose-50 text-rose-800 border-rose-300' :
+                          'bg-slate-50 text-slate-800 border-slate-300'
+                        }`}
+                      >
+                        {ESTADOS_FISICOS.map(st => (
+                          <option key={st} value={st}>{st}</option>
+                        ))}
+                      </select>
+                    </div>
+                  </div>
+
+                  {/* Responsable & Ubicación Exacta */}
+                  <div className="grid grid-cols-2 gap-2.5">
+                    <div>
+                      <SearchableSelect
+                        label="Responsable / Custodio"
+                        placeholder="Ej: Juan Pérez..."
+                        options={custodios}
+                        value={formData.responsable_custodio}
+                        onChange={(val) => setFormData(p => ({ ...p, responsable_custodio: val }))}
+                        allowCreate={true}
+                        onCreateNew={async (newCust) => {
+                          const res = await createCustodio({ nombre: newCust, cargo: 'Personal de Campo' });
+                          if (res.success) {
+                            setCustodios(prev => [...prev, { label: newCust, value: newCust, sublabel: 'Personal de Campo' }]);
+                            setFormData(p => ({ ...p, responsable_custodio: newCust }));
+                          }
+                        }}
+                        loading={loadingCustodios}
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-[11px] font-bold text-slate-700 mb-1">
+                        Ubicación Exacta
+                      </label>
+                      <input
+                        type="text"
+                        value={formData.ubicacion_exacta}
+                        onChange={(e) => setFormData({ ...formData, ubicacion_exacta: e.target.value })}
+                        placeholder="Ej: Estante B-3, Contenedor"
+                        className="w-full px-2.5 py-1.5 text-xs bg-slate-50 border border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-[#F28524]"
+                      />
+                    </div>
+                  </div>
+
+                  {/* Observaciones */}
+                  <div>
+                    <label className="block text-[11px] font-bold text-slate-700 mb-1">
+                      Observaciones y Comentarios
+                    </label>
+                    <input
+                      type="text"
+                      value={formData.observaciones}
+                      onChange={(e) => setFormData({ ...formData, observaciones: e.target.value })}
+                      placeholder="Ej: Con estuche y cargador original, sin rayones"
+                      className="w-full px-2.5 py-1.5 text-xs bg-slate-50 border border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-[#F28524]"
+                    />
+                  </div>
+                </div>
+
+                {/* Sticky Settings & Submit Buttons */}
+                <div className="pt-3 border-t border-slate-100 space-y-3">
+                  <label className="flex items-center space-x-2 text-xs text-slate-600 select-none cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={keepStickyFields}
+                      onChange={(e) => setKeepStickyFields(e.target.checked)}
+                      className="rounded text-[#F28524] focus:ring-[#F28524] h-4 w-4"
+                    />
+                    <span>Mantener Área, Custodio y Ubicación para el siguiente artículo</span>
+                  </label>
+
+                  <div className="grid grid-cols-2 gap-2">
+                    <button
+                      type="submit"
+                      disabled={savingItem}
+                      className="w-full py-2.5 px-3 bg-[#F28524] hover:bg-[#d9731b] text-white text-xs font-black rounded-xl shadow-md shadow-[#F28524]/20 flex items-center justify-center space-x-1.5 transition-all"
+                    >
+                      <Save className="w-4 h-4" />
+                      <span>{savingItem ? 'Guardando...' : 'Guardar y Otro (Ctrl+↵)'}</span>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={(e) => handleSaveItem(e, false)}
+                      disabled={savingItem}
+                      className="w-full py-2.5 px-3 bg-slate-800 hover:bg-slate-900 text-white text-xs font-black rounded-xl transition-all flex items-center justify-center space-x-1.5"
+                    >
+                      <Check className="w-4 h-4" />
+                      <span>Guardar y Terminar</span>
+                    </button>
+                  </div>
+                </div>
+              </form>
             </div>
-
-            {/* Duplicate warning notification */}
-            {duplicateWarning && (
-              <div className="mb-4 p-3 bg-amber-50 border border-amber-300 rounded-xl flex items-start space-x-2 text-xs text-amber-800">
-                <AlertTriangle className="w-4 h-4 text-amber-600 flex-shrink-0 mt-0.5" />
-                <span>{duplicateWarning.mensaje}</span>
-              </div>
-            )}
-
-            {/* Form Fields */}
-            <form onSubmit={(e) => handleSaveItem(e, true)} onKeyDown={handleKeyDown} className="space-y-3 flex-1 flex flex-col justify-between">
-              <div className="space-y-3">
-                {/* Area & Código Original */}
-                <div className="grid grid-cols-2 gap-2.5">
-                  <div>
-                    <label className="block text-[11px] font-bold text-slate-700 mb-1">
-                      Área <span className="text-rose-500">*</span>
-                    </label>
-                    <select
-                      value={formData.area}
-                      onChange={(e) => setFormData({ ...formData, area: e.target.value })}
-                      className="w-full px-2.5 py-1.5 text-xs bg-slate-50 border border-slate-200 rounded-xl font-semibold text-slate-800 focus:outline-none focus:ring-2 focus:ring-[#F28524]"
-                    >
-                      {AREAS.map(a => (
-                        <option key={a} value={a}>{a}</option>
-                      ))}
-                    </select>
-                  </div>
-                  <div>
-                    <label className="block text-[11px] font-bold text-slate-700 mb-1">
-                      Código / Placa Física
-                    </label>
-                    <input
-                      type="text"
-                      value={formData.codigo_original}
-                      onChange={(e) => setFormData({ ...formData, codigo_original: e.target.value })}
-                      placeholder="Ej: ACT-0042 o Nº placa"
-                      className="w-full px-2.5 py-1.5 text-xs bg-slate-50 border border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-[#F28524]"
-                    />
-                  </div>
-                </div>
-
-                {/* Nombre / Descripción (Primary field) */}
-                <div>
-                  <label className="block text-[11px] font-bold text-slate-700 mb-1">
-                    Descripción del Artículo <span className="text-rose-500">*</span>
-                  </label>
-                  <input
-                    ref={nombreInputRef}
-                    type="text"
-                    required
-                    value={formData.articulo_nombre}
-                    onChange={(e) => setFormData({ ...formData, articulo_nombre: e.target.value })}
-                    placeholder="Ej: Taladro Percutor Inalámbrico 20V"
-                    className="w-full px-3 py-2 text-xs bg-white border border-slate-300 rounded-xl font-medium focus:outline-none focus:ring-2 focus:ring-[#F28524] shadow-sm"
-                  />
-                </div>
-
-                {/* Categoría & Marca */}
-                <div className="grid grid-cols-2 gap-2.5">
-                  <div>
-                    <SearchableSelect
-                      label="Categoría"
-                      placeholder="Ej: Herramientas..."
-                      options={categorias}
-                      value={formData.categoria}
-                      onChange={(val) => setFormData(p => ({ ...p, categoria: val }))}
-                      allowCreate={true}
-                      onCreateNew={async (newCat) => {
-                        const res = await createCategoria({ area: formData.area, nombre: newCat });
-                        if (res.success) {
-                          setCategorias(prev => [...prev, newCat]);
-                          setFormData(p => ({ ...p, categoria: newCat }));
-                        }
-                      }}
-                      loading={loadingCategorias}
-                    />
-                  </div>
-                  <div>
-                    <label className="block text-[11px] font-bold text-slate-700 mb-1">
-                      Marca
-                    </label>
-                    <input
-                      type="text"
-                      value={formData.marca}
-                      onChange={(e) => setFormData({ ...formData, marca: e.target.value })}
-                      placeholder="Ej: DeWalt, Bosch, Dell"
-                      className="w-full px-2.5 py-1.5 text-xs bg-slate-50 border border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-[#F28524]"
-                    />
-                  </div>
-                </div>
-
-                {/* Modelo & Serie/IMEI */}
-                <div className="grid grid-cols-2 gap-2.5">
-                  <div>
-                    <label className="block text-[11px] font-bold text-slate-700 mb-1">
-                      Modelo / Características
-                    </label>
-                    <input
-                      type="text"
-                      value={formData.modelo_caracteristicas}
-                      onChange={(e) => setFormData({ ...formData, modelo_caracteristicas: e.target.value })}
-                      placeholder="Ej: DCD791B / 1/2 pulgada"
-                      className="w-full px-2.5 py-1.5 text-xs bg-slate-50 border border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-[#F28524]"
-                    />
-                  </div>
-                  <div>
-                    <label className="block text-[11px] font-bold text-slate-700 mb-1">
-                      Serie / IMEI
-                    </label>
-                    <input
-                      type="text"
-                      value={formData.serie_imei}
-                      onChange={(e) => {
-                        setFormData({ ...formData, serie_imei: e.target.value });
-                        checkDuplicateSerial(e.target.value);
-                      }}
-                      placeholder="N/S o IMEI"
-                      className="w-full px-2.5 py-1.5 text-xs bg-slate-50 border border-slate-200 rounded-xl font-mono focus:outline-none focus:ring-2 focus:ring-[#F28524]"
-                    />
-                  </div>
-                </div>
-
-                {/* Cantidad, Unidad & Estado Físico */}
-                <div className="grid grid-cols-3 gap-2">
-                  <div>
-                    <label className="block text-[11px] font-bold text-slate-700 mb-1">
-                      Cantidad
-                    </label>
-                    <input
-                      type="number"
-                      min="1"
-                      value={formData.cantidad}
-                      onChange={(e) => setFormData({ ...formData, cantidad: Math.max(1, parseInt(e.target.value) || 1) })}
-                      className="w-full px-2.5 py-1.5 text-xs bg-slate-50 border border-slate-200 rounded-xl font-bold focus:outline-none focus:ring-2 focus:ring-[#F28524]"
-                    />
-                  </div>
-                  <div>
-                    <label className="block text-[11px] font-bold text-slate-700 mb-1">
-                      Unidad
-                    </label>
-                    <select
-                      value={formData.unidad_medida}
-                      onChange={(e) => setFormData({ ...formData, unidad_medida: e.target.value })}
-                      className="w-full px-2 py-1.5 text-xs bg-slate-50 border border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-[#F28524]"
-                    >
-                      {UNIDADES.map(u => (
-                        <option key={u} value={u}>{u}</option>
-                      ))}
-                    </select>
-                  </div>
-                  <div>
-                    <label className="block text-[11px] font-bold text-slate-700 mb-1">
-                      Estado
-                    </label>
-                    <select
-                      value={formData.estado_fisico}
-                      onChange={(e) => setFormData({ ...formData, estado_fisico: e.target.value })}
-                      className={`w-full px-2 py-1.5 text-xs font-bold rounded-xl border focus:outline-none focus:ring-2 focus:ring-[#F28524] ${
-                        formData.estado_fisico === 'BUENO' ? 'bg-emerald-50 text-emerald-800 border-emerald-300' :
-                        formData.estado_fisico === 'REGULAR' ? 'bg-amber-50 text-amber-800 border-amber-300' :
-                        formData.estado_fisico === 'DAÑADO' ? 'bg-rose-50 text-rose-800 border-rose-300' :
-                        'bg-slate-50 text-slate-800 border-slate-300'
-                      }`}
-                    >
-                      {ESTADOS_FISICOS.map(st => (
-                        <option key={st} value={st}>{st}</option>
-                      ))}
-                    </select>
-                  </div>
-                </div>
-
-                {/* Responsable & Ubicación Exacta */}
-                <div className="grid grid-cols-2 gap-2.5">
-                  <div>
-                    <SearchableSelect
-                      label="Responsable / Custodio"
-                      placeholder="Ej: Juan Pérez..."
-                      options={custodios}
-                      value={formData.responsable_custodio}
-                      onChange={(val) => setFormData(p => ({ ...p, responsable_custodio: val }))}
-                      allowCreate={true}
-                      onCreateNew={async (newCust) => {
-                        const res = await createCustodio({ nombre: newCust, cargo: 'Personal de Campo' });
-                        if (res.success) {
-                          setCustodios(prev => [...prev, { label: newCust, value: newCust, sublabel: 'Personal de Campo' }]);
-                          setFormData(p => ({ ...p, responsable_custodio: newCust }));
-                        }
-                      }}
-                      loading={loadingCustodios}
-                    />
-                  </div>
-                  <div>
-                    <label className="block text-[11px] font-bold text-slate-700 mb-1">
-                      Ubicación Exacta
-                    </label>
-                    <input
-                      type="text"
-                      value={formData.ubicacion_exacta}
-                      onChange={(e) => setFormData({ ...formData, ubicacion_exacta: e.target.value })}
-                      placeholder="Ej: Estante B-3, Contenedor"
-                      className="w-full px-2.5 py-1.5 text-xs bg-slate-50 border border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-[#F28524]"
-                    />
-                  </div>
-                </div>
-
-                {/* Observaciones */}
-                <div>
-                  <label className="block text-[11px] font-bold text-slate-700 mb-1">
-                    Observaciones y Comentarios
-                  </label>
-                  <input
-                    type="text"
-                    value={formData.observaciones}
-                    onChange={(e) => setFormData({ ...formData, observaciones: e.target.value })}
-                    placeholder="Ej: Con estuche y cargador original, sin rayones"
-                    className="w-full px-2.5 py-1.5 text-xs bg-slate-50 border border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-[#F28524]"
-                  />
-                </div>
-              </div>
-
-              {/* Sticky Settings & Submit Buttons */}
-              <div className="pt-3 border-t border-slate-100 space-y-3">
-                <label className="flex items-center space-x-2 text-xs text-slate-600 select-none cursor-pointer">
-                  <input
-                    type="checkbox"
-                    checked={keepStickyFields}
-                    onChange={(e) => setKeepStickyFields(e.target.checked)}
-                    className="rounded text-[#F28524] focus:ring-[#F28524] h-4 w-4"
-                  />
-                  <span>Mantener Área, Custodio y Ubicación para el siguiente artículo</span>
-                </label>
-
-                <div className="grid grid-cols-2 gap-2">
-                  <button
-                    type="submit"
-                    disabled={savingItem}
-                    className="w-full py-2.5 px-3 bg-[#F28524] hover:bg-[#d9731b] text-white text-xs font-black rounded-xl shadow-md shadow-[#F28524]/20 flex items-center justify-center space-x-1.5 transition-all"
-                  >
-                    <Save className="w-4 h-4" />
-                    <span>{savingItem ? 'Guardando...' : 'Guardar y Otro (Ctrl+↵)'}</span>
-                  </button>
-
-                  <button
-                    type="button"
-                    onClick={(e) => handleSaveItem(e, false)}
-                    disabled={savingItem}
-                    className="w-full py-2.5 px-3 bg-slate-800 hover:bg-slate-900 text-white text-xs font-black rounded-xl transition-all flex items-center justify-center space-x-1.5"
-                  >
-                    <Check className="w-4 h-4" />
-                    <span>Guardar y Terminar</span>
-                  </button>
-                </div>
-              </div>
-            </form>
-          </div>
+          ) : null
         ) : (
           <div className="lg:col-span-5 bg-white rounded-2xl p-6 border border-emerald-200 shadow-sm flex flex-col justify-center items-center text-center space-y-3">
             <div className="w-16 h-16 rounded-full bg-emerald-100 text-emerald-600 flex items-center justify-center">
@@ -988,7 +1188,7 @@ export default function LevantamientoWorkspace({ levantamientoId, onBack, onCons
         )}
 
         {/* Right Column (7 cols): Live Table of Captured Items */}
-        <div className={`${isFinalizado ? 'lg:col-span-12' : 'lg:col-span-7'} bg-white rounded-2xl p-5 border border-slate-200 shadow-sm flex flex-col`}>
+        <div className={`${(isFinalizado || !canCapture) ? 'lg:col-span-12' : 'lg:col-span-7'} bg-white rounded-2xl p-5 border border-slate-200 shadow-sm flex flex-col`}>
           {/* Header of Table */}
           <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 pb-3 mb-3 border-b border-slate-100">
             <div>
@@ -1049,7 +1249,9 @@ export default function LevantamientoWorkspace({ levantamientoId, onBack, onCons
               <div className="text-center py-16 text-slate-400">
                 <FileSpreadsheet className="w-10 h-10 mx-auto mb-2 opacity-40" />
                 <p className="text-xs font-semibold">No hay artículos registrados para esta selección.</p>
-                <p className="text-[10px] mt-1">Utilice el formulario de la izquierda o importe un archivo Excel.</p>
+                {!isFinalizado && canCapture && (
+                  <p className="text-[10px] mt-1">Utilice el formulario de la izquierda o importe un archivo Excel.</p>
+                )}
               </div>
             ) : (
               <table className="w-full text-left text-xs">
@@ -1061,7 +1263,7 @@ export default function LevantamientoWorkspace({ levantamientoId, onBack, onCons
                     <th className="py-2.5 px-2 text-center">Cant</th>
                     <th className="py-2.5 px-2">Estado</th>
                     <th className="py-2.5 px-2">Responsable / Ubicación</th>
-                    {!isFinalizado && <th className="py-2.5 px-2 text-right">Acciones</th>}
+                    {!isFinalizado && canEditItems && <th className="py-2.5 px-2 text-right">Acciones</th>}
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100">
@@ -1088,9 +1290,9 @@ export default function LevantamientoWorkspace({ levantamientoId, onBack, onCons
                       </td>
                       <td className="py-2.5 px-2">
                         <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${
-                          item.estado_fisico === 'BUENO' ? 'bg-emerald-100 text-emerald-800' :
-                          item.estado_fisico === 'REGULAR' ? 'bg-amber-100 text-amber-800' :
-                          item.estado_fisico === 'DAÑADO' ? 'bg-rose-100 text-rose-800' :
+                          normalizeEstadoBadgeKey(item.estado_fisico) === 'BUENO' ? 'bg-emerald-100 text-emerald-800' :
+                          normalizeEstadoBadgeKey(item.estado_fisico) === 'REGULAR' ? 'bg-amber-100 text-amber-800' :
+                          normalizeEstadoBadgeKey(item.estado_fisico) === 'DAÑADO' ? 'bg-rose-100 text-rose-800' :
                           'bg-slate-100 text-slate-800'
                         }`}>
                           {item.estado_fisico}
@@ -1100,7 +1302,7 @@ export default function LevantamientoWorkspace({ levantamientoId, onBack, onCons
                         <div className="font-medium truncate max-w-[140px]">{item.responsable_custodio || 'N/A'}</div>
                         <div className="text-[10px] text-slate-400 truncate max-w-[140px]">{item.ubicacion_exacta || 'Sin especificar'}</div>
                       </td>
-                      {!isFinalizado && (
+                      {!isFinalizado && canEditItems && (
                         <td className="py-2.5 px-2 text-right">
                           <div className="flex items-center justify-end space-x-1">
                             <button
@@ -1130,7 +1332,7 @@ export default function LevantamientoWorkspace({ levantamientoId, onBack, onCons
       </div>
 
       {/* MODAL: EDIT ITEM */}
-      {editingItem && (
+      {editingItem && !isFinalizado && canEditItems && (
         <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm z-50 flex items-center justify-center p-4">
           <div className="bg-white rounded-2xl max-w-lg w-full p-6 shadow-2xl space-y-4">
             <div className="flex items-center justify-between border-b border-slate-100 pb-3">
@@ -1165,7 +1367,7 @@ export default function LevantamientoWorkspace({ levantamientoId, onBack, onCons
                 <div>
                   <label className="block font-bold text-slate-700 mb-1">Estado Físico</label>
                   <select
-                    value={editFormData.estado_fisico || 'BUENO'}
+                    value={editFormData.estado_fisico || 'Bueno'}
                     onChange={(e) => setEditFormData({ ...editFormData, estado_fisico: e.target.value })}
                     className="w-full p-2 border border-slate-300 rounded-xl"
                   >
@@ -1200,9 +1402,10 @@ export default function LevantamientoWorkspace({ levantamientoId, onBack, onCons
                   <label className="block font-bold text-slate-700 mb-1">Cantidad</label>
                   <input
                     type="number"
-                    min="1"
-                    value={editFormData.cantidad || 1}
-                    onChange={(e) => setEditFormData({ ...editFormData, cantidad: parseInt(e.target.value) || 1 })}
+                    min="0.01"
+                    step="0.01"
+                    value={editFormData.cantidad ?? 1}
+                    onChange={(e) => setEditFormData({ ...editFormData, cantidad: parseFloat(e.target.value) || 1 })}
                     className="w-full p-2 border border-slate-300 rounded-xl"
                   />
                 </div>
@@ -1247,7 +1450,7 @@ export default function LevantamientoWorkspace({ levantamientoId, onBack, onCons
       )}
 
       {/* MODAL: DELETE CONFIRMATION */}
-      {deletingItem && (
+      {deletingItem && !isFinalizado && canEditItems && (
         <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm z-50 flex items-center justify-center p-4">
           <div className="bg-white rounded-2xl max-w-sm w-full p-5 shadow-2xl space-y-4 text-center">
             <div className="w-12 h-12 rounded-full bg-rose-100 text-rose-600 flex items-center justify-center mx-auto">
@@ -1278,7 +1481,7 @@ export default function LevantamientoWorkspace({ levantamientoId, onBack, onCons
       )}
 
       {/* MODAL: EXCEL IMPORT */}
-      {showExcelModal && (
+      {showExcelModal && !isFinalizado && canImportExcel && (
         <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm z-50 flex items-center justify-center p-4">
           <div className="bg-white rounded-2xl max-w-2xl w-full p-6 shadow-2xl space-y-4 flex flex-col max-h-[90vh]">
             <div className="flex items-center justify-between border-b border-slate-100 pb-3">
@@ -1292,16 +1495,17 @@ export default function LevantamientoWorkspace({ levantamientoId, onBack, onCons
             </div>
 
             <div className="space-y-4 text-xs">
-              <p className="text-slate-500">
-                Seleccione un libro Excel (.xlsx, .xls) o CSV con el formato del levantamiento físico (soporta hojas de Informática, Oficinas, Almacén, Cocina).
+              <p className="text-slate-600">
+                Seleccione un libro Excel (<code className="font-mono">.xlsx</code>) o archivo <code className="font-mono">.csv</code> con el formato del levantamiento físico (soporta hojas de Informática, Oficinas, Almacén, Cocina).
               </p>
 
               {/* File Input */}
               <div className="border-2 border-dashed border-slate-300 rounded-xl p-4 text-center hover:bg-slate-50 cursor-pointer">
                 <input
                   type="file"
-                  accept=".xlsx, .xls, .csv"
+                  accept=".xlsx, .csv"
                   onChange={handleExcelFileUpload}
+                  aria-label="Seleccionar archivo Excel o CSV para importar"
                   className="w-full text-xs text-slate-500 file:mr-4 file:py-2 file:px-4 file:rounded-xl file:border-0 file:text-xs file:font-semibold file:bg-[#F28524] file:text-white hover:file:bg-[#d9731b]"
                 />
               </div>
@@ -1320,7 +1524,31 @@ export default function LevantamientoWorkspace({ levantamientoId, onBack, onCons
                   >
                     {excelSheets.map(s => <option key={s} value={s}>{s}</option>)}
                   </select>
-                  <span className="text-slate-400">({previewItems.length} filas detectadas)</span>
+                  <span className="text-slate-400">({previewItems.length} filas válidas)</span>
+                </div>
+              )}
+
+              {excelParseError && (
+                <div className="p-2.5 bg-rose-50 border border-rose-200 rounded-xl text-rose-800 font-medium">
+                  {excelParseError}
+                </div>
+              )}
+
+              {excelRowErrors.length > 0 && (
+                <div className="p-3 bg-amber-50 border border-amber-300 rounded-xl text-amber-900 space-y-1">
+                  <div className="font-bold">Filas omitidas por formato inválido ({excelRowErrors.length}):</div>
+                  <ul className="list-disc pl-4 max-h-24 overflow-y-auto space-y-0.5 text-[11px]">
+                    {excelRowErrors.map((errMsg, idx) => <li key={idx}>{errMsg}</li>)}
+                  </ul>
+                </div>
+              )}
+
+              {excelServerErrors.length > 0 && (
+                <div className="p-3 bg-rose-50 border border-rose-300 rounded-xl text-rose-900 space-y-1">
+                  <div className="font-bold">Errores rechazados por servidor ({excelServerErrors.length}):</div>
+                  <ul className="list-disc pl-4 max-h-24 overflow-y-auto space-y-0.5 text-[11px]">
+                    {excelServerErrors.map((errMsg, idx) => <li key={idx}>{errMsg}</li>)}
+                  </ul>
                 </div>
               )}
 
@@ -1384,7 +1612,7 @@ export default function LevantamientoWorkspace({ levantamientoId, onBack, onCons
       )}
 
       {/* MODAL: CONSOLIDATION CONFIRMATION */}
-      {showConsolidarModal && (
+      {showConsolidarModal && !isFinalizado && canConsolidar && (
         <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm z-50 flex items-center justify-center p-4">
           <div className="bg-white rounded-2xl max-w-md w-full p-6 shadow-2xl space-y-4">
             <div className="w-12 h-12 rounded-full bg-emerald-100 text-emerald-600 flex items-center justify-center mx-auto">
@@ -1422,7 +1650,10 @@ export default function LevantamientoWorkspace({ levantamientoId, onBack, onCons
                 <div className="max-h-24 overflow-y-auto space-y-1 pr-1 font-mono text-[10px]">
                   {duplicadosDetectados.map((d, idx) => (
                     <div key={idx} className="bg-white/80 p-1.5 rounded border border-amber-200">
-                      <strong>{d.serie_imei}</strong> — {d.articulo_nombre} ({d.ubicacion_actual || d.ubicacion_nombre})
+                      <span className="font-semibold uppercase mr-1 px-1 rounded bg-amber-100 text-amber-900">
+                        {d.origen === 'LOTE_SESION' ? 'Lote' : 'Maestro'}
+                      </span>
+                      <strong>{d.serie_imei}</strong> — {d.articulo_nombre} ({d.ubicacion_actual || d.ubicacion_nombre || 'Sin ubicación'})
                     </div>
                   ))}
                 </div>
@@ -1537,6 +1768,161 @@ export default function LevantamientoWorkspace({ levantamientoId, onBack, onCons
                   </button>
                 </div>
               )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* MODAL: CONCILIACIÓN FÍSICO VS TEÓRICO (SOLO LECTURA) */}
+      {showConciliacionModal && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="modal-conciliacion-title"
+          className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm z-50 flex items-center justify-center p-4"
+        >
+          <div className="bg-white rounded-2xl max-w-4xl w-full p-6 shadow-2xl border border-slate-200 flex flex-col max-h-[90vh] space-y-4">
+            <div className="flex items-center justify-between border-b border-slate-100 pb-3">
+              <div>
+                <h3 id="modal-conciliacion-title" className="text-base font-bold text-slate-900">
+                  Conciliación Físico vs Teórico — {levantamiento.campamento_nombre}
+                </h3>
+                <p className="text-xs text-slate-500">
+                  Comparación en tiempo real (solo lectura) entre la captura física actual y el inventario maestro del campamento.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowConciliacionModal(false)}
+                className="p-1.5 text-slate-400 hover:text-slate-700 hover:bg-slate-100 rounded-lg"
+                aria-label="Cerrar conciliación"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            {loadingConciliacion ? (
+              <div className="py-12 flex flex-col items-center justify-center space-y-2 text-xs text-slate-500">
+                <RefreshCw className="w-6 h-6 text-[#F28524] animate-spin" />
+                <span>Calculando conciliación físico vs teórico...</span>
+              </div>
+            ) : conciliacionError ? (
+              <div className="p-4 rounded-xl bg-rose-50 border border-rose-200 text-xs text-rose-800 font-medium">
+                {conciliacionError}
+              </div>
+            ) : conciliacionData ? (
+              <>
+                <div className="grid grid-cols-2 sm:grid-cols-6 gap-2 text-center">
+                  <div className="p-2.5 rounded-xl bg-slate-50 border border-slate-200">
+                    <div className="text-[10px] font-bold text-slate-500 uppercase">Teórico Reg.</div>
+                    <div className="text-lg font-black text-slate-900">{conciliacionData.resumen?.total_teorico_registros ?? 0}</div>
+                  </div>
+                  <div className="p-2.5 rounded-xl bg-slate-50 border border-slate-200">
+                    <div className="text-[10px] font-bold text-slate-500 uppercase">Físico Reg.</div>
+                    <div className="text-lg font-black text-slate-900">{conciliacionData.resumen?.total_fisico_registros ?? 0}</div>
+                  </div>
+                  <div className="p-2.5 rounded-xl bg-emerald-50 border border-emerald-200">
+                    <div className="text-[10px] font-bold text-emerald-700 uppercase">Coincidencias</div>
+                    <div className="text-lg font-black text-emerald-700">{conciliacionData.resumen?.coincidencias_exactas ?? 0}</div>
+                  </div>
+                  <div className="p-2.5 rounded-xl bg-amber-50 border border-amber-200">
+                    <div className="text-[10px] font-bold text-amber-700 uppercase">Diferencias</div>
+                    <div className="text-lg font-black text-amber-700">{conciliacionData.resumen?.diferencias_cantidad_count ?? 0}</div>
+                  </div>
+                  <div className="p-2.5 rounded-xl bg-rose-50 border border-rose-200">
+                    <div className="text-[10px] font-bold text-rose-700 uppercase">Faltantes</div>
+                    <div className="text-lg font-black text-rose-700">{conciliacionData.resumen?.faltantes_count ?? 0}</div>
+                  </div>
+                  <div className="p-2.5 rounded-xl bg-blue-50 border border-blue-200">
+                    <div className="text-[10px] font-bold text-blue-700 uppercase">Sobrantes</div>
+                    <div className="text-lg font-black text-blue-700">{conciliacionData.resumen?.sobrantes_count ?? 0}</div>
+                  </div>
+                </div>
+
+                <div className="flex space-x-2 border-b border-slate-200 text-xs font-bold">
+                  {[
+                    { id: 'diferencias', label: `Diferencias (${conciliacionData.diferencias_cantidad?.length || 0})` },
+                    { id: 'faltantes', label: `Faltantes (${conciliacionData.faltantes_no_localizados?.length || 0})` },
+                    { id: 'sobrantes', label: `Sobrantes (${conciliacionData.sobrantes_en_campo?.length || 0})` },
+                    { id: 'coincidencias', label: `Coincidencias (${conciliacionData.coincidencias?.length || 0})` }
+                  ].map(tab => (
+                    <button
+                      key={tab.id}
+                      type="button"
+                      onClick={() => setConciliacionTab(tab.id)}
+                      className={`pb-2 px-2 border-b-2 transition-colors ${
+                        conciliacionTab === tab.id
+                          ? 'border-[#F28524] text-[#F28524]'
+                          : 'border-transparent text-slate-500 hover:text-slate-800'
+                      }`}
+                    >
+                      {tab.label}
+                    </button>
+                  ))}
+                </div>
+
+                <div className="flex-1 overflow-y-auto border border-slate-200 rounded-xl">
+                  <table className="w-full text-left text-xs">
+                    <thead className="bg-slate-50 sticky top-0 border-b border-slate-200 text-[11px] font-bold text-slate-600 uppercase">
+                      <tr>
+                        <th className="p-2.5">Código / Serie</th>
+                        <th className="p-2.5">Artículo</th>
+                        <th className="p-2.5 text-right">Teórico</th>
+                        <th className="p-2.5 text-right">Físico</th>
+                        <th className="p-2.5 text-right">Dif. / Estado</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-100">
+                      {conciliacionTab === 'diferencias' && (conciliacionData.diferencias_cantidad || []).map((row, idx) => (
+                        <tr key={idx} className="hover:bg-amber-50/40">
+                          <td className="p-2.5 font-mono text-[11px]">{row.codigo_original || row.serie_imei || '—'}</td>
+                          <td className="p-2.5 font-medium">{row.articulo_nombre}</td>
+                          <td className="p-2.5 text-right font-mono">{row.cantidad_teorica ?? 'N/D'}</td>
+                          <td className="p-2.5 text-right font-mono">{row.cantidad_fisica}</td>
+                          <td className="p-2.5 text-right font-bold text-amber-700">{row.diferencia ?? row.observacion}</td>
+                        </tr>
+                      ))}
+                      {conciliacionTab === 'faltantes' && (conciliacionData.faltantes_no_localizados || []).map((row, idx) => (
+                        <tr key={idx} className="hover:bg-rose-50/40">
+                          <td className="p-2.5 font-mono text-[11px]">{row.codigo_original || row.serie_imei || '—'}</td>
+                          <td className="p-2.5 font-medium">{row.articulo_nombre}</td>
+                          <td className="p-2.5 text-right font-mono">{row.cantidad_teorica ?? 'N/D'}</td>
+                          <td className="p-2.5 text-right font-mono">0</td>
+                          <td className="p-2.5 text-right text-rose-700 font-semibold">{row.motivo || 'No localizado'}</td>
+                        </tr>
+                      ))}
+                      {conciliacionTab === 'sobrantes' && (conciliacionData.sobrantes_en_campo || []).map((row, idx) => (
+                        <tr key={idx} className="hover:bg-blue-50/40">
+                          <td className="p-2.5 font-mono text-[11px]">{row.codigo_original || row.serie_imei || '—'}</td>
+                          <td className="p-2.5 font-medium">{row.articulo_nombre}</td>
+                          <td className="p-2.5 text-right font-mono">0</td>
+                          <td className="p-2.5 text-right font-mono">{row.cantidad_fisica}</td>
+                          <td className="p-2.5 text-right text-blue-700 font-semibold">{row.motivo || 'Sobrante en campo'}</td>
+                        </tr>
+                      ))}
+                      {conciliacionTab === 'coincidencias' && (conciliacionData.coincidencias || []).map((row, idx) => (
+                        <tr key={idx} className="hover:bg-emerald-50/40">
+                          <td className="p-2.5 font-mono text-[11px]">{row.codigo_original || row.serie_imei || '—'}</td>
+                          <td className="p-2.5 font-medium">{row.articulo_nombre}</td>
+                          <td className="p-2.5 text-right font-mono">{row.cantidad_teorica}</td>
+                          <td className="p-2.5 text-right font-mono">{row.cantidad_fisica}</td>
+                          <td className="p-2.5 text-right text-emerald-700 font-bold">0 (Exacta)</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </>
+            ) : null}
+
+            <div className="flex justify-end pt-2 border-t border-slate-100">
+              <button
+                type="button"
+                onClick={() => setShowConciliacionModal(false)}
+                className="px-4 py-2 bg-slate-900 hover:bg-slate-800 text-white text-xs font-bold rounded-xl"
+              >
+                Cerrar
+              </button>
             </div>
           </div>
         </div>

@@ -5,9 +5,10 @@ import {
   Search, Calendar, User, MapPin
 } from 'lucide-react';
 import { useApp } from '../context/AppContext';
+import { userHasPermission } from '../utils/permissions';
 
 export default function MovimientosPage() {
-  const { fetchMovimientos, registrarMovimiento, fetchArticulos, currentRole } = useApp();
+  const { fetchMovimientos, registrarMovimiento, fetchArticulos, activeCampamento, currentUser } = useApp();
   const [movimientos, setMovimientos] = useState([]);
   const [loading, setLoading] = useState(true);
   const [showModal, setShowModal] = useState(false);
@@ -18,7 +19,7 @@ export default function MovimientosPage() {
     articulo_id: '',
     tipo_movimiento: 'TRASLADO',
     cantidad: 1,
-    ubicacion_destino: 'KM 19 AUT DUARTE',
+    ubicacion_destino: activeCampamento?.nombre || 'KM 19 AUT DUARTE',
     custodio_destino: '',
     estado_nuevo: 'Bueno',
     motivo: '',
@@ -26,17 +27,28 @@ export default function MovimientosPage() {
   });
   const [submitting, setSubmitting] = useState(false);
 
+  const activeCampamentoId = activeCampamento ? activeCampamento.id : null;
+  const canViewMovimientos = userHasPermission(currentUser, 'inv:movimientos_ver');
+  const canMove = userHasPermission(currentUser, 'inv:movimientos_registrar');
+
   const loadMovimientos = useCallback(async () => {
+    if (!canViewMovimientos) {
+      setMovimientos([]);
+      setLoading(false);
+      return;
+    }
     setLoading(true);
     try {
-      const res = await fetchMovimientos(150);
+      const res = await fetchMovimientos(
+        activeCampamentoId ? { limit: 150, campamento_id: activeCampamentoId } : 150
+      );
       if (res.success) {
         setMovimientos(res.movimientos);
       }
     } finally {
       setLoading(false);
     }
-  }, [fetchMovimientos]);
+  }, [fetchMovimientos, activeCampamentoId, canViewMovimientos]);
 
   useEffect(() => {
     loadMovimientos();
@@ -44,8 +56,10 @@ export default function MovimientosPage() {
 
   const openModal = async () => {
     setShowModal(true);
-    // Fetch active items for selector
-    const res = await fetchArticulos({ limit: 500 });
+    const res = await fetchArticulos({
+      limit: 500,
+      ...(activeCampamentoId ? { campamento_id: activeCampamentoId } : {})
+    });
     if (res.success) {
       setArticulosList(res.articulos);
       if (res.articulos.length > 0 && !formData.articulo_id) {
@@ -99,8 +113,6 @@ export default function MovimientosPage() {
     }
   };
 
-  const canMove = currentRole === 'admin' || currentRole === 'almacen' || currentRole === 'supervisor' || currentRole === 'developer';
-
   return (
     <div className="space-y-6">
       {/* Header */}
@@ -109,6 +121,11 @@ export default function MovimientosPage() {
           <h1 className="text-xl font-black text-slate-900 tracking-tight flex items-center space-x-2">
             <ArrowRightLeft className="w-5 h-5 text-[#F28524]" />
             <span>Control Transaccional de Movimientos</span>
+            {activeCampamento?.nombre && (
+              <span className="px-2.5 py-0.5 rounded-full text-[11px] font-bold bg-orange-50 text-[#F28524] border border-orange-200">
+                Sede: {activeCampamento.nombre}
+              </span>
+            )}
           </h1>
           <p className="text-xs text-slate-500 mt-1">
             Registro inmutable de entradas, salidas, traslados entre sedes, asignaciones a personal técnico y ajustes de inventario.
@@ -150,7 +167,17 @@ export default function MovimientosPage() {
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100">
-              {loading ? (
+              {!canViewMovimientos ? (
+                <tr>
+                  <td colSpan="8" className="py-16 text-center text-slate-500 px-4">
+                    <History className="w-8 h-8 mx-auto mb-2 text-amber-500 opacity-75" />
+                    <p className="font-semibold text-slate-700">Historial de movimientos restringido</p>
+                    <p className="text-xs text-slate-500 mt-1">
+                      Su cuenta tiene permiso para registrar movimientos, pero no cuenta con el permiso de lectura de historial (<code className="font-mono">inv:movimientos_ver</code>).
+                    </p>
+                  </td>
+                </tr>
+              ) : loading ? (
                 <tr>
                   <td colSpan="8" className="py-16 text-center text-slate-400">
                     Cargando historial de movimientos desde MySQL...
@@ -211,14 +238,26 @@ export default function MovimientosPage() {
 
       {/* Movement Modal */}
       {showModal && (
-        <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-sm flex items-center justify-center p-4">
-          <div className="bg-white rounded-2xl shadow-2xl w-full max-w-xl overflow-hidden border border-slate-200">
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="modal-movimiento-title"
+          className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-sm flex items-center justify-center p-4 overflow-y-auto"
+        >
+          <div className="bg-white rounded-2xl shadow-2xl w-full max-w-xl max-h-[92vh] overflow-y-auto border border-slate-200">
             <div className="bg-slate-900 text-white p-5 flex items-center justify-between">
-              <h3 className="font-bold text-base flex items-center space-x-2">
+              <h3 id="modal-movimiento-title" className="font-bold text-base flex items-center space-x-2">
                 <ArrowRightLeft className="w-5 h-5 text-[#F28524]" />
                 <span>Registrar Transacción de Almacén</span>
               </h3>
-              <button onClick={() => setShowModal(false)} className="text-slate-400 hover:text-white">✕</button>
+              <button
+                type="button"
+                onClick={() => setShowModal(false)}
+                aria-label="Cerrar modal de movimiento"
+                className="text-slate-300 hover:text-white p-1 rounded-lg"
+              >
+                ✕
+              </button>
             </div>
 
             <form onSubmit={handleSubmit} className="p-6 space-y-4 text-xs">

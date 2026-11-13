@@ -2,17 +2,21 @@ import React, { useState, useEffect } from 'react';
 import {
   X, Edit3, Save, CheckCircle2, AlertTriangle, Clock,
   MapPin, User, Tag, Hash, FileSpreadsheet, History,
-  ShieldCheck, ArrowRightLeft, Camera
+  ShieldCheck, ArrowRightLeft, Camera, Trash2
 } from 'lucide-react';
 import { useApp } from '../../context/AppContext';
+import { userHasPermission } from '../../utils/permissions';
 
 export default function ItemDetailModal({ itemId, onClose, onUpdated }) {
-  const { getArticuloById, updateArticulo, currentRole } = useApp();
+  const { getArticuloById, updateArticulo, deleteArticulo, currentUser } = useApp();
   const [loading, setLoading] = useState(true);
   const [item, setItem] = useState(null);
   const [history, setHistory] = useState([]);
   const [isEditing, setIsEditing] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [pendingDeleteConfirm, setPendingDeleteConfirm] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+  const [deleteError, setDeleteError] = useState('');
   const [activeTab, setActiveTab] = useState('detalle'); // 'detalle' | 'origen' | 'movimientos'
 
   // Edit form state
@@ -52,7 +56,28 @@ export default function ItemDetailModal({ itemId, onClose, onUpdated }) {
     return () => { isMounted = false; };
   }, [itemId, getArticuloById]);
 
-  const canEdit = currentRole === 'admin' || currentRole === 'almacen' || currentRole === 'supervisor' || currentRole === 'developer';
+  const canEdit = userHasPermission(currentUser, 'inv:editar');
+  const canDelete = userHasPermission(currentUser, 'inv:eliminar');
+
+  const handleConfirmDelete = async () => {
+    if (!item?.id || !canDelete) return;
+    setDeleting(true);
+    setDeleteError('');
+    try {
+      const res = await deleteArticulo(item.id);
+      if (res?.success) {
+        setPendingDeleteConfirm(false);
+        if (onUpdated) onUpdated();
+        onClose();
+      } else {
+        setDeleteError(res?.message || 'No fue posible retirar el bien del inventario.');
+      }
+    } catch {
+      setDeleteError('Error de conexión al intentar retirar el bien.');
+    } finally {
+      setDeleting(false);
+    }
+  };
 
   const handleSave = async (e) => {
     e.preventDefault();
@@ -96,7 +121,12 @@ export default function ItemDetailModal({ itemId, onClose, onUpdated }) {
   if (!itemId) return null;
 
   return (
-    <div className="fixed inset-0 z-50 overflow-y-auto bg-slate-900/60 backdrop-blur-sm flex items-center justify-center p-4">
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="modal-detalle-bien-title"
+      className="fixed inset-0 z-50 overflow-y-auto bg-slate-900/60 backdrop-blur-sm flex items-center justify-center p-4"
+    >
       <div className="bg-white rounded-2xl shadow-2xl w-full max-w-4xl max-h-[92vh] flex flex-col overflow-hidden border border-slate-200 animate-in fade-in zoom-in duration-200">
 
         {/* Header */}
@@ -111,7 +141,7 @@ export default function ItemDetailModal({ itemId, onClose, onUpdated }) {
               </span>
               {item && getStatusBadge(item.estado_fisico)}
             </div>
-            <h2 className="text-xl font-bold text-white tracking-tight">
+            <h2 id="modal-detalle-bien-title" className="text-xl font-bold text-white tracking-tight">
               {item?.articulo_nombre || 'Cargando detalle...'}
             </h2>
             <p className="text-xs text-slate-400 mt-1 flex items-center space-x-4">
@@ -129,6 +159,19 @@ export default function ItemDetailModal({ itemId, onClose, onUpdated }) {
               >
                 <Edit3 className="w-3.5 h-3.5" />
                 <span>Editar Bien</span>
+              </button>
+            )}
+            {canDelete && !isEditing && item && (
+              <button
+                type="button"
+                onClick={() => {
+                  setDeleteError('');
+                  setPendingDeleteConfirm(true);
+                }}
+                className="px-3 py-1.5 rounded-lg bg-rose-950/70 hover:bg-rose-600 text-rose-100 hover:text-white text-xs font-medium flex items-center space-x-1.5 transition-colors border border-rose-800 hover:border-rose-500"
+              >
+                <Trash2 className="w-3.5 h-3.5" />
+                <span>Retirar Bien</span>
               </button>
             )}
             <button
@@ -521,6 +564,56 @@ export default function ItemDetailModal({ itemId, onClose, onUpdated }) {
             Cerrar Ficha
           </button>
         </div>
+
+        {pendingDeleteConfirm && (
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="modal-retirar-bien-title"
+            className="fixed inset-0 z-[60] bg-slate-900/70 backdrop-blur-sm flex items-center justify-center p-4"
+          >
+            <div className="bg-white rounded-2xl max-w-md w-full p-6 shadow-2xl border border-slate-200 space-y-4">
+              <div className="flex items-start space-x-3">
+                <div className="w-10 h-10 rounded-full bg-rose-100 text-rose-600 flex items-center justify-center flex-shrink-0">
+                  <Trash2 className="w-5 h-5" />
+                </div>
+                <div className="flex-1">
+                  <h3 id="modal-retirar-bien-title" className="text-base font-bold text-slate-900">
+                    Confirmar retiro lógico del bien
+                  </h3>
+                  <p className="text-xs text-slate-600 mt-1">
+                    Se desactivará <strong>{item?.articulo_nombre}</strong> ({item?.codigo_original || `#${item?.id}`}) del inventario activo. Sus movimientos y auditorías históricas se conservarán íntegros.
+                  </p>
+                </div>
+              </div>
+
+              {deleteError && (
+                <div className="p-2.5 rounded-lg bg-rose-50 border border-rose-200 text-xs text-rose-800 font-medium">
+                  {deleteError}
+                </div>
+              )}
+
+              <div className="flex justify-end space-x-2 pt-2">
+                <button
+                  type="button"
+                  onClick={() => setPendingDeleteConfirm(false)}
+                  disabled={deleting}
+                  className="px-4 py-2 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-bold transition-colors"
+                >
+                  Cancelar
+                </button>
+                <button
+                  type="button"
+                  onClick={handleConfirmDelete}
+                  disabled={deleting}
+                  className="px-4 py-2 rounded-lg bg-rose-600 hover:bg-rose-700 disabled:opacity-50 text-white text-xs font-bold transition-colors"
+                >
+                  {deleting ? 'Retirando...' : 'Confirmar Retiro'}
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
 
       </div>
     </div>

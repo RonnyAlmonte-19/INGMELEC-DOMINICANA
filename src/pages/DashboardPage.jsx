@@ -11,20 +11,39 @@ import {
   PieChart, Pie, Cell, Legend
 } from 'recharts';
 import { useApp } from '../context/AppContext';
+import { toSafeDisplayString } from '../utils/jsonFormat';
 
 export default function DashboardPage({ setActivePage, navigateTo }) {
-  const { kpis, kpisLoading, refreshKpis, currentUser, currentRole, activeCampamento, entornoInfo } = useApp();
+  const {
+    kpis,
+    kpisLoading,
+    refreshKpis,
+    currentUser,
+    currentRole,
+    activeCampamento,
+    setActiveCampamento,
+    campamentosCatalog = [],
+    entornoInfo
+  } = useApp();
 
   const isDev = currentRole === 'developer' || currentUser?.es_developer === 1;
   const isGlobalRole = isDev || currentRole === 'gerencia';
 
-  // Filter state for Developer / Gerencia
-  const [selectedCampamento, setSelectedCampamento] = useState('TODOS');
+  // Filter state for Developer / Gerencia (propagado con selector global activeCampamento C08)
+  const activeCampamentoIdStr = activeCampamento?.id ? String(activeCampamento.id) : 'TODOS';
+  const [selectedCampamento, setSelectedCampamento] = useState(activeCampamentoIdStr);
   const [selectedAlmacen, setSelectedAlmacen] = useState('TODOS');
 
-  const bannerTitle = isDev
-    ? 'INGMELEC | ALMACÉN GENERAL'
-    : (activeCampamento?.nombre ? `INGMELEC | ALMACÉN ${activeCampamento.nombre.toUpperCase()}` : (currentUser?.campamento_nombre ? `INGMELEC | ALMACÉN ${currentUser.campamento_nombre.toUpperCase()}` : 'INGMELEC | ALMACÉN GENERAL'));
+  useEffect(() => {
+    setSelectedCampamento(activeCampamentoIdStr);
+    setSelectedAlmacen('TODOS');
+  }, [activeCampamentoIdStr]);
+
+  const bannerTitle = activeCampamento?.nombre
+    ? `INGMELEC | ALMACÉN ${String(activeCampamento.nombre).toUpperCase()}`
+    : (isDev
+      ? 'INGMELEC | ALMACÉN GENERAL'
+      : (currentUser?.campamento_nombre ? `INGMELEC | ALMACÉN ${String(currentUser.campamento_nombre).toUpperCase()}` : 'INGMELEC | ALMACÉN GENERAL'));
 
   useEffect(() => {
     refreshKpis({
@@ -70,6 +89,14 @@ export default function DashboardPage({ setActivePage, navigateTo }) {
     recientesMovimientos = [],
     levantamientosResumen = []
   } = kpis || {};
+
+  const sumaConfirmados = Number(
+    consistenciaMatematica?.sumaArticulosCampamentosConfirmados ??
+    porCampamento.reduce((acc, c) => acc + Number(c.total_articulos || 0), 0)
+  );
+  const sinSedeCount = Number(sinSedeVerificada?.total_articulos ?? 0);
+  const totalUnidadesTexto = Number(cantidadFisicaTotal || 0).toLocaleString('es-DO');
+  const sinSedeLabelUbic = toSafeDisplayString(sinSedeVerificada?.ubicacion_historica, 'sede pendiente');
 
   // Navigation handler
   const handleSelectArea = (areaId, params = {}) => {
@@ -201,13 +228,13 @@ export default function DashboardPage({ setActivePage, navigateTo }) {
         <CheckCircle2 className="w-5 h-5 text-emerald-600 flex-shrink-0 mt-0.5" />
         <div className="space-y-1 text-xs">
           <div className="font-bold flex flex-wrap items-center gap-2">
-            <span>Inventario Empresarial Conciliado con Levantamiento Documental (16 de Octubre de 2026)</span>
+            <span>Inventario Empresarial Conciliado en Tiempo Real</span>
             <span className="px-2 py-0.5 rounded-full text-[10px] bg-emerald-600 text-white font-mono uppercase">
               es_sintetico = 0 · Datos Reales
             </span>
           </div>
           <p className="text-emerald-900 leading-relaxed">
-            Visualizando los <strong className="font-bold">433 artículos empresariales históricos</strong> (<strong className="font-bold">329</strong> vinculados inequívocamente a las <strong className="font-bold">3 sedes confirmadas</strong> + <strong className="font-bold">104</strong> en <strong className="font-bold">SIN SEDE VERIFICADA · KM 19 AUT DUARTE</strong>) con <strong className="font-bold">1,971 unidades físicas conocidas</strong> y <strong className="font-bold">23 artículos con cantidad pendiente de verificación</strong>.
+            Visualizando <strong className="font-bold">{totalArticulos} artículos empresariales activos</strong> (<strong className="font-bold">{sumaConfirmados}</strong> vinculados en <strong className="font-bold">{porCampamento.length} sedes confirmadas</strong> + <strong className="font-bold">{sinSedeCount}</strong> sin sede verificada) con <strong className="font-bold">{totalUnidadesTexto} unidades físicas conocidas</strong> y <strong className="font-bold">{articulosSinCantidad} artículos con cantidad pendiente de verificación</strong>.
             {resumenSinteticos && resumenSinteticos.articulos > 0 && (
               <span> Los <strong>{resumenSinteticos.articulos} artículos sintéticos de prueba</strong> (Playwright / QA) y <strong>{resumenSinteticos.campamentos} campamentos sintéticos</strong> se mantienen aislados fuera de las estadísticas empresariales.</span>
             )}
@@ -224,23 +251,35 @@ export default function DashboardPage({ setActivePage, navigateTo }) {
             </div>
             <div>
               <div className="text-xs font-bold text-slate-800">Filtro Territorial Consolidado por Sede</div>
-              <div className="text-[11px] text-slate-500">Alternar entre visión corporativa global (433), sedes confirmadas (329) o sin sede verificada (104)</div>
+              <div className="text-[11px] text-slate-600">Alternar entre visión corporativa global ({totalArticulos}), sedes confirmadas ({sumaConfirmados}) o sin sede verificada ({sinSedeCount})</div>
             </div>
           </div>
 
           <div className="flex flex-wrap items-center gap-3">
             {/* Campamento selector */}
             <div className="flex items-center space-x-2">
-              <label className="text-xs font-semibold text-slate-600">Sede / Campamento:</label>
+              <label htmlFor="dash-campamento-select" className="text-xs font-semibold text-slate-700">Sede / Campamento:</label>
               <select
+                id="dash-campamento-select"
                 value={selectedCampamento}
                 onChange={(e) => {
-                  setSelectedCampamento(e.target.value);
+                  const val = e.target.value;
+                  setSelectedCampamento(val);
                   setSelectedAlmacen('TODOS');
+                  if (typeof setActiveCampamento === 'function') {
+                    if (val === 'TODOS' || val === 'SIN_SEDE') {
+                      setActiveCampamento(null);
+                    } else {
+                      const selectedObj =
+                        campamentosCatalog.find((c) => String(c.id) === String(val)) ||
+                        porCampamento.find((c) => String(c.id) === String(val));
+                      setActiveCampamento(selectedObj || { id: Number(val), nombre: '' });
+                    }
+                  }
                 }}
                 className="text-xs bg-slate-50 border border-slate-200 rounded-xl px-3 py-1.5 font-medium text-slate-800 focus:outline-none focus:ring-2 focus:ring-[#F28524]"
               >
-                <option value="TODOS">GLOBAL EMPRESARIAL (433 bienes · 3 sedes + sin sede)</option>
+                <option value="TODOS">GLOBAL EMPRESARIAL ({totalArticulos} bienes · {porCampamento.length} sedes{sinSedeVerificada ? ' + sin sede' : ''})</option>
                 {porCampamento.map(c => (
                   <option key={c.id} value={c.id}>{c.nombre} ({c.total_articulos} bienes · {Math.round(c.total_fisico)} u.)</option>
                 ))}
@@ -274,6 +313,9 @@ export default function DashboardPage({ setActivePage, navigateTo }) {
                 onClick={() => {
                   setSelectedCampamento('TODOS');
                   setSelectedAlmacen('TODOS');
+                  if (typeof setActiveCampamento === 'function') {
+                    setActiveCampamento(null);
+                  }
                 }}
                 className="text-xs text-red-600 hover:text-red-800 font-semibold px-2 py-1 bg-red-50 rounded-lg border border-red-100"
               >
@@ -546,7 +588,6 @@ export default function DashboardPage({ setActivePage, navigateTo }) {
           <button
             type="button"
             onClick={() => handleSelectEstado('BUENO')}
-            onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') handleSelectEstado('BUENO'); }}
             className="w-full bg-emerald-50/70 border border-emerald-200/80 p-4 rounded-xl text-center cursor-pointer transition-all duration-200 hover:shadow-md hover:scale-[1.02] active:scale-[0.99] hover:border-emerald-400 focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:ring-offset-1 group"
             title="Ver los artículos en estado Bueno en el Inventario General"
           >
@@ -568,7 +609,6 @@ export default function DashboardPage({ setActivePage, navigateTo }) {
           <button
             type="button"
             onClick={() => handleSelectEstado('REGULAR')}
-            onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') handleSelectEstado('REGULAR'); }}
             className="w-full bg-amber-50/70 border border-amber-200/80 p-4 rounded-xl text-center cursor-pointer transition-all duration-200 hover:shadow-md hover:scale-[1.02] active:scale-[0.99] hover:border-amber-400 focus:outline-none focus:ring-2 focus:ring-amber-500 focus:ring-offset-1 group"
             title="Ver los artículos en estado Regular en el Inventario General"
           >
@@ -590,7 +630,6 @@ export default function DashboardPage({ setActivePage, navigateTo }) {
           <button
             type="button"
             onClick={() => handleSelectEstado('DANADO')}
-            onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') handleSelectEstado('DANADO'); }}
             className="w-full bg-rose-50/70 border border-rose-200/80 p-4 rounded-xl text-center cursor-pointer transition-all duration-200 hover:shadow-md hover:scale-[1.02] active:scale-[0.99] hover:border-rose-400 focus:outline-none focus:ring-2 focus:ring-rose-500 focus:ring-offset-1 group"
             title="Ver los artículos en estado Dañado en el Inventario General"
           >
@@ -612,7 +651,6 @@ export default function DashboardPage({ setActivePage, navigateTo }) {
           <button
             type="button"
             onClick={() => handleSelectEstado('FUERA_SERVICIO')}
-            onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') handleSelectEstado('FUERA_SERVICIO'); }}
             className="w-full bg-red-50/70 border border-red-200/80 p-4 rounded-xl text-center cursor-pointer transition-all duration-200 hover:shadow-md hover:scale-[1.02] active:scale-[0.99] hover:border-red-400 focus:outline-none focus:ring-2 focus:ring-red-500 focus:ring-offset-1 group"
             title="Ver los artículos fuera de servicio o perdidos en el Inventario General"
           >
@@ -634,7 +672,6 @@ export default function DashboardPage({ setActivePage, navigateTo }) {
           <button
             type="button"
             onClick={() => handleSelectEstado('PENDIENTE')}
-            onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') handleSelectEstado('PENDIENTE'); }}
             className="w-full bg-slate-100/70 border border-slate-300/80 p-4 rounded-xl text-center col-span-2 sm:col-span-1 cursor-pointer transition-all duration-200 hover:shadow-md hover:scale-[1.02] active:scale-[0.99] hover:border-slate-400 focus:outline-none focus:ring-2 focus:ring-slate-500 focus:ring-offset-1 group"
             title="Ver los artículos pendientes de verificación en el Inventario General"
           >
@@ -754,7 +791,7 @@ export default function DashboardPage({ setActivePage, navigateTo }) {
           </div>
           <div className="flex flex-wrap items-center gap-2">
             <span className="text-xs font-bold text-emerald-700 bg-emerald-50 border border-emerald-200 px-3 py-1 rounded-full">
-              {porCampamento.length} Sedes Confirmadas ({consistenciaMatematica?.sumaArticulosCampamentosConfirmados ?? 329} bienes)
+              {porCampamento.length} Sedes Confirmadas ({sumaConfirmados} bienes)
             </span>
             {sinSedeVerificada && (
               <span className="text-xs font-bold text-amber-800 bg-amber-50 border border-amber-200 px-3 py-1 rounded-full">
@@ -886,7 +923,7 @@ export default function DashboardPage({ setActivePage, navigateTo }) {
                 <tr
                   onClick={() => handleOpenCampamentoInventario('SIN_SEDE')}
                   className="bg-amber-50/40 hover:bg-amber-100/50 transition-colors cursor-pointer group border-t-2 border-amber-200"
-                  title="Haz clic para auditar los 104 artículos de KM 19 AUT DUARTE pendientes de clasificación de sede"
+                  title={`Haz clic para auditar los ${sinSedeCount} artículos de ${sinSedeLabelUbic} pendientes de clasificación de sede`}
                 >
                   <td className="py-3.5 px-3">
                     <div className="font-bold text-amber-950 flex items-center space-x-2 group-hover:text-[#F28524] transition-colors">
@@ -1044,17 +1081,27 @@ export default function DashboardPage({ setActivePage, navigateTo }) {
           </p>
 
           <div className="divide-y divide-slate-100 text-xs">
-            {unidades.map((u, i) => (
-              <div key={i} className="py-2.5 flex items-center justify-between">
-                <div>
-                  <span className="font-bold text-slate-800">{u.unidad_medida}</span>
-                  <span className="text-slate-400 ml-2">({u.registros} registros en base de datos)</span>
+            {(Array.isArray(unidades) ? unidades : []).map((u, i) => {
+              const unidadRaw = toSafeDisplayString(u?.unidad_medida, '');
+              const unidadLabel = unidadRaw || 'Sin unidad';
+              const unidadSuffix = unidadRaw ? `${unidadRaw.toLowerCase()}s` : 'u.';
+              const totalCantidad = Number(u?.total_cantidad ?? 0);
+              const totalRegistros = Number(u?.registros ?? 0);
+
+              return (
+                <div key={i} className="py-2.5 flex items-center justify-between">
+                  <div>
+                    <span className="font-bold text-slate-800">{unidadLabel}</span>
+                    <span className="text-slate-400 ml-2">
+                      ({Number.isFinite(totalRegistros) ? totalRegistros : 0} registros en base de datos)
+                    </span>
+                  </div>
+                  <div className="font-mono font-bold text-slate-900 bg-slate-100 px-2.5 py-1 rounded-md">
+                    {(Number.isFinite(totalCantidad) ? totalCantidad : 0).toLocaleString('es-DO')} {unidadSuffix}
+                  </div>
                 </div>
-                <div className="font-mono font-bold text-slate-900 bg-slate-100 px-2.5 py-1 rounded-md">
-                  {Number(u.total_cantidad).toLocaleString('es-DO')} {u.unidad_medida.toLowerCase()}s
-                </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
         </div>
 
@@ -1074,17 +1121,19 @@ export default function DashboardPage({ setActivePage, navigateTo }) {
           </div>
 
           <div className="space-y-2 text-xs">
-            {recientesMovimientos.length > 0 ? (
+            {Array.isArray(recientesMovimientos) && recientesMovimientos.length > 0 ? (
               recientesMovimientos.slice(0, 5).map((m, idx) => (
                 <div key={idx} className="p-3 bg-slate-50 rounded-xl flex items-center justify-between border border-slate-100">
                   <div className="space-y-0.5 max-w-[70%]">
-                    <div className="font-bold text-slate-800 truncate">{m.articulo_nombre || m.descripcion}</div>
+                    <div className="font-bold text-slate-800 truncate">
+                      {toSafeDisplayString(m?.articulo_nombre || m?.descripcion, 'Artículo sin descripción')}
+                    </div>
                     <div className="text-[11px] text-slate-500 font-mono">
-                      {m.codigo_original || 'S/C'} · {m.tipo_movimiento} ({m.cantidad} u.)
+                      {toSafeDisplayString(m?.codigo_original, 'S/C')} · {toSafeDisplayString(m?.tipo_movimiento, 'MOV')} ({toSafeDisplayString(m?.cantidad, '0')} u.)
                     </div>
                   </div>
                   <span className="px-2 py-0.5 bg-white font-bold text-[10px] text-slate-700 rounded border border-slate-200">
-                    {new Date(m.fecha_movimiento).toLocaleDateString('es-DO')}
+                    {m?.fecha_movimiento ? new Date(m.fecha_movimiento).toLocaleDateString('es-DO') : '—'}
                   </span>
                 </div>
               ))

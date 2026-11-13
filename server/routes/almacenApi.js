@@ -33,7 +33,7 @@ async function verifyPassword(password, stored) {
     try {
       const valid = await argon2.verify(stored, password);
       return { valid, needsUpgrade: false };
-    } catch (e) {
+    } catch {
       return { valid: false, needsUpgrade: false };
     }
   }
@@ -47,12 +47,32 @@ async function verifyPassword(password, stored) {
       const checkBuf = Buffer.from(checkHash, 'hex');
       const valid = hashBuf.length === checkBuf.length && crypto.timingSafeEqual(hashBuf, checkBuf);
       return { valid, needsUpgrade: valid }; // Si es válida, requiere auto-upgrade a Argon2id
-    } catch (e) {
+    } catch {
       return { valid: false, needsUpgrade: false };
     }
   }
 
-  // 3. Formato Legado Plano (prototipos iniciales no hasheados)
+  // 3. Formato Legado Modular: bcrypt ($2a$, $2b$, $2y$)
+  if (stored.startsWith('$2a$') || stored.startsWith('$2b$') || stored.startsWith('$2y$')) {
+    try {
+      const bcryptModule = await import('bcryptjs').catch(() => import('bcrypt')).catch(() => null);
+      if (bcryptModule && typeof bcryptModule.compare === 'function') {
+        const valid = await bcryptModule.compare(password, stored);
+        return { valid, needsUpgrade: valid };
+      }
+      console.warn('[AUTH] Hash bcrypt detectado pero motor bcrypt no disponible en el entorno.');
+      return { valid: false, needsUpgrade: false };
+    } catch {
+      return { valid: false, needsUpgrade: false };
+    }
+  }
+
+  // 4. Fallback Texto Plano: ESTRICTAMENTE DESHABILITADO EN PRODUCCIÓN (Defensa en Profundidad)
+  if (process.env.NODE_ENV === 'production' || process.env.ALLOW_PLAIN_FALLBACK !== 'true') {
+    return { valid: false, needsUpgrade: false };
+  }
+
+  // Solo permitido en pruebas sintéticas locales aisladas si se autoriza explícitamente
   const passBuf = Buffer.from(password);
   const storedBuf = Buffer.from(stored);
   const valid = passBuf.length === storedBuf.length && crypto.timingSafeEqual(passBuf, storedBuf);
@@ -81,12 +101,286 @@ function normalizeEstadoParam(param) {
   return normalizeEstadoFisico(param);
 }
 
-// Token generation & verification
+// Helpers de sanitización de parámetros y trazabilidad
+function getJwtTtlMs() {
+  const raw = process.env.JWT_TTL_HOURS;
+  const parsed = raw !== undefined && raw !== '' ? Number(raw) : 12;
+  const hours = Number.isFinite(parsed) && parsed > 0 ? parsed : 12;
+  return hours * 60 * 60 * 1000;
+}
+
+export const VALID_OPERATIONAL_ROLES = ['admin', 'almacen', 'supervisor', 'auditor', 'gerencia'];
+
+export const KNOWN_PERMISSION_KEYS = [
+  'dash:ver',
+  'inv:ver',
+  'inv:crear',
+  'inv:editar',
+  'inv:movimientos_registrar',
+  'inv:movimientos_ver',
+  'inv:eliminar',
+  'lev:ver',
+  'lev:crear',
+  'lev:capturar',
+  'lev:editar',
+  'lev:importar',
+  'lev:consolidar',
+  'rep:ver',
+  'rep:exportar',
+  'rep:imprimir',
+  'camp:ver',
+  'camp:stock',
+  'camp:operar',
+  'aud:ver'
+];
+
+const KNOWN_PERMISSION_SET = new Set(KNOWN_PERMISSION_KEYS);
+const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+function isTruthyFlag(val) {
+  if (val === undefined || val === null || val === false || val === 0) return false;
+  if (typeof val === 'string') {
+    const norm = val.trim().toLowerCase();
+    return norm !== '' && norm !== 'false' && norm !== '0' && norm !== 'no';
+  }
+  return Boolean(val);
+}
+
+function isValidEmailFormat(email) {
+  return typeof email === 'string' && EMAIL_REGEX.test(email.trim());
+}
+
+function validateStrongPassword(password) {
+  if (typeof password !== 'string') {
+    return {
+      valid: false,
+      message: 'La contraseña debe tener al menos 8 caracteres combinando letras y números.'
+    };
+  }
+  const trimmed = password.trim();
+  if (trimmed.length < 8 || !/[A-Za-z]/.test(password) || !/\d/.test(password)) {
+    return {
+      valid: false,
+      message: 'La contraseña debe tener al menos 8 caracteres combinando letras y números.'
+    };
+  }
+  return { valid: true };
+}
+
+export function parsePermisosJson(raw, rol, esDeveloper = 0) {
+  const isDeveloper = rol === 'developer' && Number(esDeveloper) === 1;
+  const defaultPerms = isDeveloper ? ['*'] : [];
+
+  if (raw === null || raw === undefined || raw === '') {
+    return defaultPerms;
+  }
+
+  let current = Buffer.isBuffer(raw) ? raw.toString('utf8') : raw;
+  if (typeof current === 'string') {
+    const trimmed = current.trim();
+    if (!trimmed) return defaultPerms;
+    try {
+      current = JSON.parse(trimmed);
+      if (typeof current === 'string') {
+        current = JSON.parse(current);
+      }
+    } catch {
+      return defaultPerms;
+    }
+  }
+
+  if (!Array.isArray(current)) {
+    return defaultPerms;
+  }
+
+  const seen = new Set();
+  const sanitized = [];
+  for (const item of current) {
+    if (typeof item !== 'string') continue;
+    const key = item.trim();
+    if (!key) continue;
+    if (key === '*' && !isDeveloper) continue;
+    if (!seen.has(key)) {
+      seen.add(key);
+      sanitized.push(key);
+    }
+  }
+
+  if (isDeveloper && sanitized.length === 0) {
+    return ['*'];
+  }
+  return sanitized;
+}
+
+export function validateAndSanitizePermissions(rawPermisos, targetIsDeveloper = false) {
+  if (!Array.isArray(rawPermisos)) {
+    return {
+      errorStatus: 400,
+      errorMessage: 'El campo permisos debe ser un arreglo de cadenas.'
+    };
+  }
+
+  for (const rawItem of rawPermisos) {
+    if (typeof rawItem === 'string' && rawItem.trim() === '*' && !targetIsDeveloper) {
+      return {
+        errorStatus: 403,
+        errorMessage: 'Política de seguridad: No se permite otorgar acceso comodín (*) ni privilegios developer a cuentas operativas.'
+      };
+    }
+  }
+
+  const seen = new Set();
+  const sanitized = [];
+  for (const rawItem of rawPermisos) {
+    if (typeof rawItem !== 'string') {
+      return {
+        errorStatus: 400,
+        errorMessage: 'Cada permiso debe ser una cadena de texto válida.'
+      };
+    }
+    const key = rawItem.trim();
+    if (!key) {
+      return {
+        errorStatus: 400,
+        errorMessage: 'No se permiten claves de permiso vacías.'
+      };
+    }
+    if (key !== '*' && !KNOWN_PERMISSION_SET.has(key)) {
+      return {
+        errorStatus: 400,
+        errorMessage: `Clave de permiso desconocida o no autorizada: "${key}".`
+      };
+    }
+    if (!seen.has(key)) {
+      seen.add(key);
+      sanitized.push(key);
+    }
+  }
+
+  return { permisos: sanitized };
+}
+
+export async function parseUserCampamentoSelection(db, body = {}) {
+  const { campamento_id, campamentos_adicionales, campamentos } = body || {};
+  const hasSelection =
+    campamento_id !== undefined ||
+    campamentos_adicionales !== undefined ||
+    campamentos !== undefined;
+
+  let explicitMainId = null;
+  if (campamento_id !== undefined && campamento_id !== null && String(campamento_id).trim() !== '') {
+    explicitMainId = parsePositiveInt(campamento_id);
+    if (!explicitMainId) {
+      return {
+        errorStatus: 400,
+        errorMessage: 'El campo campamento_id debe ser un ID de campamento válido.'
+      };
+    }
+  }
+
+  const seen = new Set();
+  const campamentoIds = [];
+  if (explicitMainId) {
+    seen.add(explicitMainId);
+    campamentoIds.push(explicitMainId);
+  }
+
+  for (const [fieldName, rawList] of [
+    ['campamentos_adicionales', campamentos_adicionales],
+    ['campamentos', campamentos]
+  ]) {
+    if (rawList === undefined || rawList === null) continue;
+    if (!Array.isArray(rawList)) {
+      return {
+        errorStatus: 400,
+        errorMessage: `El campo ${fieldName} debe ser un arreglo de IDs de campamento.`
+      };
+    }
+    for (const rawItem of rawList) {
+      const candidate = rawItem && typeof rawItem === 'object' && !Array.isArray(rawItem)
+        ? (rawItem.campamento_id ?? rawItem.id)
+        : rawItem;
+      const cid = parsePositiveInt(candidate);
+      if (!cid) {
+        return {
+          errorStatus: 400,
+          errorMessage: `Todos los elementos de ${fieldName} deben ser IDs de campamento válidos.`
+        };
+      }
+      if (!seen.has(cid)) {
+        seen.add(cid);
+        campamentoIds.push(cid);
+      }
+    }
+  }
+
+  if (campamentoIds.length > 0) {
+    const [validRows] = await db.query(
+      'SELECT id FROM inv_campamentos WHERE id IN (?) AND activo = 1',
+      [campamentoIds]
+    );
+    const validSet = new Set(validRows.map((r) => Number(r.id)));
+    const invalidIds = campamentoIds.filter((id) => !validSet.has(id));
+    if (invalidIds.length > 0) {
+      return {
+        errorStatus: 400,
+        errorMessage: `Uno o más campamentos seleccionados no existen o están inactivos (IDs: ${invalidIds.join(', ')}).`
+      };
+    }
+  }
+
+  const principalCampId = explicitMainId ?? (campamento_id === undefined && campamentoIds.length > 0 ? campamentoIds[0] : null);
+  return {
+    hasSelection,
+    principalCampId,
+    campamentoIds
+  };
+}
+
+function parsePositiveInt(rawVal) {
+  if (typeof rawVal !== 'string' && typeof rawVal !== 'number') return null;
+  const str = String(rawVal).trim();
+  if (!/^\d+$/.test(str)) return null;
+  const parsed = Number.parseInt(str, 10);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null;
+}
+
+function sanitizeLimit(rawLimit, defaultVal = 50, maxVal = 1000) {
+  if (typeof rawLimit !== 'string' && typeof rawLimit !== 'number') return defaultVal;
+  const parsed = Number.parseInt(String(rawLimit).trim(), 10);
+  if (!Number.isFinite(parsed) || Number.isNaN(parsed)) return defaultVal;
+  return Math.min(Math.max(parsed, 1), maxVal);
+}
+
+function sanitizePage(rawPage) {
+  if (typeof rawPage !== 'string' && typeof rawPage !== 'number') return 1;
+  const parsed = Number.parseInt(String(rawPage).trim(), 10);
+  if (!Number.isFinite(parsed) || Number.isNaN(parsed) || parsed < 1) return 1;
+  return parsed;
+}
+
+function asNonEmptyString(val) {
+  return typeof val === 'string' && val.trim() !== '' ? val.trim() : null;
+}
+
+function getClientIp(req) {
+  if (!req) return '127.0.0.1';
+  const rawIp = req.ip || req.socket?.remoteAddress || '127.0.0.1';
+  return String(rawIp).replace(/^::ffff:/i, '').slice(0, 45);
+}
+
+// Token generation & verification (HS256 + timingSafeEqual + exp/alg/typ/tv)
 function generateToken(payload) {
   const header = Buffer.from(JSON.stringify({ alg: 'HS256', typ: 'JWT' })).toString('base64url');
+  const now = Date.now();
+  const tokenVersion = Number.isInteger(Number(payload?.tv)) && Number(payload.tv) > 0
+    ? Number(payload.tv)
+    : 1;
   const stringifiedPayload = Buffer.from(JSON.stringify({
     ...payload,
-    exp: Date.now() + 48 * 60 * 60 * 1000 // 48h
+    tv: tokenVersion,
+    iat: now,
+    exp: now + getJwtTtlMs()
   })).toString('base64url');
   const signature = crypto.createHmac('sha256', SECRET_KEY)
     .update(`${header}.${stringifiedPayload}`)
@@ -96,24 +390,59 @@ function generateToken(payload) {
 
 function verifyToken(token) {
   try {
-    const [header, payload, signature] = token.split('.');
+    if (typeof token !== 'string' || !token) return null;
+    const parts = token.split('.');
+    if (parts.length !== 3) return null;
+    const [header, payload, signature] = parts;
+    if (!header || !payload || !signature) return null;
+
+    const parsedHeader = JSON.parse(Buffer.from(header, 'base64url').toString('utf8'));
+    if (!parsedHeader || typeof parsedHeader !== 'object' || parsedHeader.alg !== 'HS256' || parsedHeader.typ !== 'JWT') {
+      return null;
+    }
+
     const expectedSignature = crypto.createHmac('sha256', SECRET_KEY)
       .update(`${header}.${payload}`)
       .digest('base64url');
-    if (signature !== expectedSignature) return null;
+    const sigBuf = Buffer.from(signature, 'utf8');
+    const expectedBuf = Buffer.from(expectedSignature, 'utf8');
+    if (sigBuf.length !== expectedBuf.length || !crypto.timingSafeEqual(sigBuf, expectedBuf)) {
+      return null;
+    }
+
     const decoded = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
-    if (decoded.exp < Date.now()) return null;
+    if (!decoded || typeof decoded !== 'object' || Array.isArray(decoded)) return null;
+    if (typeof decoded.exp !== 'number' || !Number.isFinite(decoded.exp) || decoded.exp <= Date.now()) {
+      return null;
+    }
+    const uid = Number(decoded.id);
+    if (!Number.isInteger(uid) || uid <= 0) return null;
     return decoded;
-  } catch (e) {
+  } catch {
     return null;
   }
 }
 
-// Middleware: Authenticate JWT with Live Status & Permissions Check
+async function bumpUserTokenVersion(dbOrConn, userId) {
+  try {
+    await dbOrConn.query(
+      'UPDATE inv_usuarios SET token_version = COALESCE(token_version, 1) + 1 WHERE id = ?',
+      [userId]
+    );
+    return true;
+  } catch (err) {
+    if (err?.code === 'ER_BAD_FIELD_ERROR' || String(err?.message || '').includes('token_version')) {
+      return false;
+    }
+    throw err;
+  }
+}
+
+// Middleware: Authenticate JWT with Live Status, Token Version & Fail-Closed DB Check
 async function requireAuth(req, res, next) {
   const authHeader = req.headers['authorization'];
   if (authHeader && authHeader.startsWith('Bearer ')) {
-    const token = authHeader.substring(7);
+    const token = authHeader.substring(7).trim();
     const decoded = verifyToken(token);
     if (decoded) {
       try {
@@ -129,23 +458,49 @@ async function requireAuth(req, res, next) {
           });
         }
 
-        // Live refresh of role & permissions so changes take effect immediately
-        decoded.rol = uRows[0].rol;
-        decoded.es_developer = uRows[0].es_developer;
-        decoded.campamento_id = uRows[0].campamento_id;
-        try {
-          decoded.permisos = uRows[0].permisos_json
-            ? (typeof uRows[0].permisos_json === 'string' ? JSON.parse(uRows[0].permisos_json) : uRows[0].permisos_json)
-            : (decoded.rol === 'developer' ? ['*'] : []);
-        } catch (e) {
-          decoded.permisos = decoded.rol === 'developer' ? ['*'] : [];
+        const userRow = uRows[0];
+        const hasTokenVersionCol = Object.prototype.hasOwnProperty.call(userRow, 'token_version')
+          && userRow.token_version !== null
+          && userRow.token_version !== undefined;
+
+        if (hasTokenVersionCol) {
+          const dbTokenVersion = Number(userRow.token_version);
+          if (decoded.tv !== undefined) {
+            if (!Number.isInteger(decoded.tv) || decoded.tv !== dbTokenVersion) {
+              return res.status(401).json({
+                success: false,
+                message: 'Sesión revocada o expirada. Por favor inicie sesión nuevamente.'
+              });
+            }
+          } else if (dbTokenVersion !== 1) {
+            return res.status(401).json({
+              success: false,
+              message: 'Sesión revocada o expirada. Por favor inicie sesión nuevamente.'
+            });
+          }
+        } else if (decoded.tv !== undefined && (!Number.isInteger(decoded.tv) || decoded.tv !== 1)) {
+          return res.status(401).json({
+            success: false,
+            message: 'Sesión revocada o expirada. Por favor inicie sesión nuevamente.'
+          });
         }
+
+        // Live refresh of identity, role & permissions so changes take effect immediately
+        decoded.nombre = userRow.nombre;
+        decoded.email = userRow.email;
+        decoded.rol = userRow.rol;
+        decoded.es_developer = userRow.es_developer;
+        decoded.campamento_id = userRow.campamento_id;
+        decoded.permisos = parsePermisosJson(userRow.permisos_json, userRow.rol, userRow.es_developer);
 
         req.user = decoded;
         return next();
       } catch (err) {
-        req.user = decoded;
-        return next();
+        console.error('[AUTH] Error verificando sesión en BD (fail-closed):', err?.message || err);
+        return res.status(503).json({
+          success: false,
+          message: 'Servicio de verificación de autenticación temporalmente no disponible.'
+        });
       }
     }
   }
@@ -170,7 +525,7 @@ function requireDeveloper(req, res, next) {
 }
 
 // Middleware: Role Check
-function requireRole(allowedRoles = []) {
+export function requireRole(allowedRoles = []) {
   return (req, res, next) => {
     if (!req.user) {
       return res.status(401).json({ success: false, message: 'No autenticado.' });
@@ -209,15 +564,134 @@ function requirePermission(permKey) {
   };
 }
 
-// Condición SQL unificada para artículos sin serie (Tarea 6: cero divergencias entre módulos)
-const SQL_SIN_SERIAL_CONDITION = "(serie_imei IS NULL OR TRIM(serie_imei) = '' OR UPPER(TRIM(serie_imei)) IN ('N/A', 'S/N', 'SIN SERIAL', 'NO APLICA', 'NONE', '-'))";
+function requireAnyPermission(permKeys = []) {
+  return (req, res, next) => {
+    if (!req.user) {
+      return res.status(401).json({ success: false, message: 'No autenticado.' });
+    }
+    if (req.user.rol === 'developer' || req.user.es_developer === 1) {
+      return next();
+    }
+    const perms = req.user.permisos || [];
+    if (perms.includes('*') || permKeys.some((k) => perms.includes(k))) {
+      return next();
+    }
+    return res.status(403).json({
+      success: false,
+      message: 'Acceso denegado: No dispone de los permisos necesarios para consultar este recurso.'
+    });
+  };
+}
+
+// Condición SQL unificada para artículos sin serie (M01: cero divergencias entre Dashboard, Inventario y Reportes)
+const PLACEHOLDER_SERIAL_VALUES = new Set([
+  'N/A', 'S/N', 'S/S', 'SIN SERIAL', 'SIN SERIE', 'NO APLICA', 'NO TIENE', 'NONE', 'NULL', '--', '-'
+]);
+const SQL_SIN_SERIAL_VALUES_SQL = "('N/A', 'S/N', 'S/S', 'SIN SERIAL', 'SIN SERIE', 'NO APLICA', 'NO TIENE', 'NONE', 'NULL', '--', '-')";
+const buildSqlSinSerialCondition = (col = 'serie_imei') =>
+  `(${col} IS NULL OR TRIM(${col}) = '' OR UPPER(TRIM(${col})) IN ${SQL_SIN_SERIAL_VALUES_SQL})`;
+const SQL_SIN_SERIAL_CONDITION = buildSqlSinSerialCondition('serie_imei');
+const VALID_INVENTARIO_AREAS = ['INFORMATICA', 'OFICINAS', 'COCINA', 'ALMACEN', 'OTRA'];
+
+function sanitizeListArticleRow(row) {
+  if (!row || typeof row !== 'object') return row;
+  const rawFoto = row.evidencia_foto;
+  const hasFoto = Boolean(typeof rawFoto === 'string' && rawFoto.trim() !== '');
+  const isHeavyFoto = typeof rawFoto === 'string' && (rawFoto.trim().startsWith('data:') || rawFoto.length > 255);
+  const cleaned = {
+    ...row,
+    tiene_foto: hasFoto ? 1 : 0
+  };
+  if (isHeavyFoto) {
+    cleaned.evidencia_foto = null;
+  }
+  if (Object.hasOwn(cleaned, 'foto_base64')) {
+    delete cleaned.foto_base64;
+  }
+  if (Object.hasOwn(cleaned, 'imagen_base64')) {
+    delete cleaned.imagen_base64;
+  }
+  return cleaned;
+}
+
+export function normalizeSerialKey(rawSerial) {
+  if (typeof rawSerial !== 'string' && typeof rawSerial !== 'number') return null;
+  const cleaned = String(rawSerial).trim();
+  if (!cleaned) return null;
+  const upper = cleaned.toUpperCase();
+  if (PLACEHOLDER_SERIAL_VALUES.has(upper)) return null;
+  return upper;
+}
+
+function normalizeExactLocation(value) {
+  return String(value || '').trim().toUpperCase();
+}
+
+function hasExactLocationMatch(scope, ubicacionNombre) {
+  const target = normalizeExactLocation(ubicacionNombre);
+  if (!target) return false;
+  return (scope.campamentoNombres || []).some((cn) => normalizeExactLocation(cn) === target);
+}
+
+function canAccessArticle(scope, article) {
+  if (!article) return false;
+  if (scope.isGlobal) return true;
+  if (article.campamento_id !== null && article.campamento_id !== undefined) {
+    return scope.campamentoIds.includes(Number(article.campamento_id));
+  }
+  return hasExactLocationMatch(scope, article.ubicacion_nombre);
+}
+
+function canTargetCampamento(scope, campamentoId, ubicacionNombre) {
+  if (scope.isGlobal) return true;
+  const hasCampId = campamentoId !== undefined && campamentoId !== null && String(campamentoId).trim() !== '';
+  if (hasCampId) {
+    const parsedId = parsePositiveInt(campamentoId);
+    if (!parsedId || !scope.campamentoIds.includes(parsedId)) {
+      return false;
+    }
+    if (ubicacionNombre !== undefined && ubicacionNombre !== null && String(ubicacionNombre).trim() !== '') {
+      return hasExactLocationMatch(scope, ubicacionNombre);
+    }
+    return true;
+  }
+  return hasExactLocationMatch(scope, ubicacionNombre);
+}
+
+function buildArticleScopeFilter(scope, alias = 'a') {
+  const colCamp = alias ? `${alias}.campamento_id` : 'campamento_id';
+  const colUbic = alias ? `${alias}.ubicacion_nombre` : 'ubicacion_nombre';
+  const upperNames = (scope.campamentoNombres || [])
+    .map((n) => normalizeExactLocation(n))
+    .filter(Boolean);
+
+  if (scope.campamentoIds.length > 0 && upperNames.length > 0) {
+    return {
+      sql: `(${colCamp} IN (?) OR (${colCamp} IS NULL AND UPPER(TRIM(${colUbic})) IN (?)))`,
+      params: [scope.campamentoIds, upperNames]
+    };
+  }
+  if (scope.campamentoIds.length > 0) {
+    return {
+      sql: `${colCamp} IN (?)`,
+      params: [scope.campamentoIds]
+    };
+  }
+  if (upperNames.length > 0) {
+    return {
+      sql: `(${colCamp} IS NULL AND UPPER(TRIM(${colUbic})) IN (?))`,
+      params: [upperNames]
+    };
+  }
+  return { sql: '1 = 0', params: [] };
+}
 
 // Helper: Resolve User Allowed Campamentos Scope
-// Regla de Arquitectura: El perfil developer tiene acceso global automático a todos los campamentos.
-// Los usuarios operativos únicamente tienen acceso a las sedes asignadas explícitamente por el desarrollador.
-// El perfil gerencia puede consultar estadísticas globales según sus permisos si no está restringido a una sede.
+// Regla de Seguridad: Solo developer (rol === 'developer' / es_developer === 1) o usuarios con permiso '*' tienen acceso global.
+// Todo usuario operativo/gerencial sin sedes explícitas inicia con ámbito vacío (fail-closed).
 async function getUserAllowedCampamentos(db, user) {
-  if (user.rol === 'developer' || user.es_developer === 1) {
+  const perms = Array.isArray(user?.permisos) ? user.permisos : [];
+  if (user.rol === 'developer' || user.es_developer === 1 || perms.includes('*')) {
     return { isGlobal: true, campamentoIds: [], campamentoNombres: [] };
   }
 
@@ -237,7 +711,7 @@ async function getUserAllowedCampamentos(db, user) {
 
   if (ids.length === 0 && user.campamento_id) {
     const [cRows] = await db.query(
-      'SELECT id, nombre, ubicacion_historica_equivalente FROM inv_campamentos WHERE id = ?',
+      'SELECT id, nombre, ubicacion_historica_equivalente FROM inv_campamentos WHERE id = ? AND activo = 1',
       [user.campamento_id]
     );
     if (cRows.length > 0) {
@@ -247,10 +721,6 @@ async function getUserAllowedCampamentos(db, user) {
     }
   }
 
-  if (ids.length === 0 && user.rol === 'gerencia') {
-    return { isGlobal: true, campamentoIds: [], campamentoNombres: [] };
-  }
-
   return {
     isGlobal: false,
     campamentoIds: ids,
@@ -258,10 +728,281 @@ async function getUserAllowedCampamentos(db, user) {
   };
 }
 
+// Helpers de resiliencia BD, introspección cacheada de esquema MySQL 8 / MariaDB y normalización JSON
+const DB_UNAVAILABLE_CODES = new Set([
+  'ECONNREFUSED',
+  'ETIMEDOUT',
+  'ENOTFOUND',
+  'EHOSTUNREACH',
+  'ECONNRESET',
+  'PROTOCOL_CONNECTION_LOST',
+  'PROTOCOL_ENQUEUE_AFTER_FATAL_ERROR',
+  'ER_CON_COUNT_ERROR',
+  'POOL_CLOSED'
+]);
+
+function isDbUnavailableError(error, conn = undefined) {
+  if (conn === null) return true;
+  const code = error?.code || '';
+  return DB_UNAVAILABLE_CODES.has(code);
+}
+
+async function safeRollback(conn) {
+  if (!conn || typeof conn.rollback !== 'function') return;
+  try {
+    await conn.rollback();
+  } catch (rbErr) {
+    console.error('Rollback error:', rbErr?.message || rbErr);
+  }
+}
+
+function safeRelease(conn) {
+  if (!conn || typeof conn.release !== 'function') return;
+  try {
+    conn.release();
+  } catch (relErr) {
+    console.error('Connection release error:', relErr?.message || relErr);
+  }
+}
+
+function parseEnumValues(columnType) {
+  const str = String(columnType || '');
+  if (!/^enum\(/i.test(str)) return [];
+  const values = [];
+  const regex = /'((?:[^'\\]|\\.|'')*)'/g;
+  let match;
+  while ((match = regex.exec(str)) !== null) {
+    values.push(match[1].replace(/''/g, "'"));
+  }
+  return values;
+}
+
+const SCHEMA_CACHE_TTL_MS = 30 * 1000;
+const schemaCapabilitiesCache = new WeakMap();
+
+export function resetSchemaCapabilitiesCache(poolRef = null) {
+  if (poolRef && typeof poolRef === 'object') {
+    schemaCapabilitiesCache.delete(poolRef);
+  }
+}
+
+function getDefaultSchemaCapabilities() {
+  return {
+    articulos: {
+      exists: true,
+      createdCol: 'fecha_creacion',
+      brandCol: 'marca_modelo',
+      specCol: 'tipo_caracteristicas',
+      cols: new Set(['fecha_creacion', 'marca_modelo', 'tipo_caracteristicas'])
+    },
+    almacenes: {
+      exists: true,
+      hasEstadoVerificacion: false,
+      hasEsSintetico: true
+    },
+    campamentos: {
+      exists: true,
+      hasClasificacionSede: true,
+      hasEsSintetico: true,
+      clasificacionValues: ['CONFIRMADO', 'PROPUESTO', 'SINTETICO_PRUEBA', 'HISTORICO_NO_HOMOLOGADO', 'DUPLICADO_EQUIVALENTE']
+    },
+    custodios: {
+      exists: true,
+      hasDepartamento: false,
+      hasTelefono: false,
+      hasEsSintetico: true
+    },
+    categorias: {
+      exists: true,
+      hasEsSintetico: true
+    },
+    levantamientos: {
+      exists: true,
+      hasEsSintetico: true,
+      estadoValues: ['En preparación', 'En proceso', 'Pendiente de revisión', 'Finalizado', 'Cancelado']
+    },
+    campamentoAlias: {
+      exists: false,
+      cols: new Set(),
+      tipoAliasValues: [],
+      estadoValidacionValues: []
+    }
+  };
+}
+
+async function getSchemaCapabilities(db) {
+  const cacheKey = typeof db === 'object' && db !== null ? db : null;
+  const now = Date.now();
+  if (cacheKey && schemaCapabilitiesCache.has(cacheKey)) {
+    const cached = schemaCapabilitiesCache.get(cacheKey);
+    if (now - cached.loadedAt < SCHEMA_CACHE_TTL_MS) {
+      return cached.data;
+    }
+  }
+
+  const defaults = getDefaultSchemaCapabilities();
+
+  try {
+    const [rows] = await db.query(
+      `SELECT TABLE_NAME AS table_name, COLUMN_NAME AS column_name, COLUMN_TYPE AS column_type
+       FROM information_schema.COLUMNS
+       WHERE TABLE_SCHEMA = DATABASE()
+         AND TABLE_NAME IN ('inv_articulos', 'inv_almacenes', 'inv_campamentos', 'inv_custodios', 'inv_categorias', 'inv_levantamientos', 'inv_campamento_alias')`
+    );
+
+    if (!Array.isArray(rows) || rows.length === 0) {
+      return defaults;
+    }
+
+    const byTable = new Map();
+    for (const row of rows) {
+      const tName = String(row.table_name || row.TABLE_NAME || '').toLowerCase();
+      const cName = String(row.column_name || row.COLUMN_NAME || '').toLowerCase();
+      const cType = String(row.column_type || row.COLUMN_TYPE || '');
+      if (!tName || !cName) continue;
+      if (!byTable.has(tName)) {
+        byTable.set(tName, new Map());
+      }
+      byTable.get(tName).set(cName, cType);
+    }
+
+    const artCols = byTable.get('inv_articulos');
+    const almCols = byTable.get('inv_almacenes');
+    const campCols = byTable.get('inv_campamentos');
+    const custCols = byTable.get('inv_custodios');
+    const catCols = byTable.get('inv_categorias');
+    const levCols = byTable.get('inv_levantamientos');
+    const aliasCols = byTable.get('inv_campamento_alias');
+
+    const capabilities = {
+      articulos: {
+        exists: Boolean(artCols && artCols.size > 0),
+        createdCol: artCols?.has('fecha_creacion')
+          ? 'fecha_creacion'
+          : (artCols?.has('creado_en') ? 'creado_en' : 'id'),
+        brandCol: artCols?.has('marca_modelo')
+          ? 'marca_modelo'
+          : (artCols?.has('marca') ? 'marca' : 'marca_modelo'),
+        specCol: artCols?.has('tipo_caracteristicas')
+          ? 'tipo_caracteristicas'
+          : (artCols?.has('modelo_caracteristicas') ? 'modelo_caracteristicas' : 'tipo_caracteristicas'),
+        cols: artCols ? new Set(artCols.keys()) : defaults.articulos.cols
+      },
+      almacenes: {
+        exists: Boolean(almCols && almCols.size > 0),
+        hasEstadoVerificacion: Boolean(almCols?.has('estado_verificacion')),
+        hasEsSintetico: Boolean(almCols?.has('es_sintetico'))
+      },
+      campamentos: {
+        exists: Boolean(campCols && campCols.size > 0),
+        hasClasificacionSede: Boolean(campCols?.has('clasificacion_sede')),
+        hasEsSintetico: Boolean(campCols?.has('es_sintetico')),
+        clasificacionValues: campCols?.has('clasificacion_sede')
+          ? parseEnumValues(campCols.get('clasificacion_sede'))
+          : []
+      },
+      custodios: {
+        exists: Boolean(custCols && custCols.size > 0),
+        hasDepartamento: Boolean(custCols?.has('departamento')),
+        hasTelefono: Boolean(custCols?.has('telefono')),
+        hasEsSintetico: Boolean(custCols?.has('es_sintetico'))
+      },
+      categorias: {
+        exists: Boolean(catCols && catCols.size > 0),
+        hasEsSintetico: Boolean(catCols?.has('es_sintetico'))
+      },
+      levantamientos: {
+        exists: Boolean(levCols && levCols.size > 0),
+        hasEsSintetico: Boolean(levCols?.has('es_sintetico')),
+        estadoValues: levCols?.has('estado')
+          ? parseEnumValues(levCols.get('estado'))
+          : []
+      },
+      campamentoAlias: {
+        exists: Boolean(aliasCols && aliasCols.size > 0),
+        cols: aliasCols ? new Set(aliasCols.keys()) : new Set(),
+        tipoAliasValues: aliasCols?.has('tipo_alias')
+          ? parseEnumValues(aliasCols.get('tipo_alias'))
+          : [],
+        estadoValidacionValues: aliasCols?.has('estado_validacion')
+          ? parseEnumValues(aliasCols.get('estado_validacion'))
+          : []
+      }
+    };
+
+    if (cacheKey) {
+      schemaCapabilitiesCache.set(cacheKey, { loadedAt: now, data: capabilities });
+    }
+    return capabilities;
+  } catch (err) {
+    if (isDbUnavailableError(err)) {
+      throw err;
+    }
+    console.warn('[SCHEMA] No se pudo inspeccionar information_schema.COLUMNS; usando perfil por defecto:', err?.message || err);
+    return defaults;
+  }
+}
+
+function normalizeAuditJsonField(val) {
+  if (val === null || val === undefined) return null;
+  const current = Buffer.isBuffer(val) ? val.toString('utf8') : val;
+  if (typeof current === 'string') {
+    const trimmed = current.trim();
+    if (trimmed === '') return null;
+    try {
+      let parsed = JSON.parse(trimmed);
+      if (typeof parsed === 'string') {
+        const inner = parsed.trim();
+        if ((inner.startsWith('{') && inner.endsWith('}')) || (inner.startsWith('[') && inner.endsWith(']'))) {
+          try {
+            parsed = JSON.parse(inner);
+          } catch {
+            return parsed;
+          }
+        }
+      }
+      return parsed;
+    } catch {
+      return current;
+    }
+  }
+  return current;
+}
+
+export function normalizeAuditLogRows(rows) {
+  if (!Array.isArray(rows)) return [];
+  return rows.map((row) => {
+    if (!row || typeof row !== 'object') return row;
+    return {
+      ...row,
+      detalles_previos: normalizeAuditJsonField(row.detalles_previos),
+      detalles_nuevos: normalizeAuditJsonField(row.detalles_nuevos)
+    };
+  });
+}
+
+function serializeAuditPayload(val) {
+  if (val === null || val === undefined) return null;
+  if (typeof val === 'string') {
+    const trimmed = val.trim();
+    if (!trimmed) return null;
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (parsed !== null && typeof parsed === 'object') {
+        return trimmed;
+      }
+    } catch {
+      return JSON.stringify(val);
+    }
+    return JSON.stringify(val);
+  }
+  return JSON.stringify(val);
+}
+
 // Helper: Audit Logging
 async function logAudit(db, { usuario_id, usuario_nombre, accion, entidad, entidad_id, detalles_previos, detalles_nuevos, req }) {
   try {
-    const ip = req ? (req.headers['x-forwarded-for'] || req.socket?.remoteAddress || '127.0.0.1') : '127.0.0.1';
+    const ip = getClientIp(req);
     await db.query(
       `INSERT INTO inv_auditoria (usuario_id, usuario_nombre, accion, entidad, entidad_id, detalles_previos, detalles_nuevos, ip_origen)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -271,8 +1012,8 @@ async function logAudit(db, { usuario_id, usuario_nombre, accion, entidad, entid
         accion,
         entidad || 'inv_articulos',
         entidad_id || null,
-        detalles_previos ? JSON.stringify(detalles_previos) : null,
-        detalles_nuevos ? JSON.stringify(detalles_nuevos) : null,
+        serializeAuditPayload(detalles_previos),
+        serializeAuditPayload(detalles_nuevos),
         ip
       ]
     );
@@ -281,25 +1022,57 @@ async function logAudit(db, { usuario_id, usuario_nombre, accion, entidad, entid
   }
 }
 
-// Rate limiting de autenticación en memoria contra ataques de fuerza bruta
+// Rate limiting de autenticación en memoria acotado contra ataques de fuerza bruta y DoS
 const loginAttempts = new Map();
 const RATE_LIMIT_WINDOW_MS = 60 * 1000; // 1 minuto
 const MAX_LOGIN_ATTEMPTS = 15; // Máximo 15 intentos por IP en 1 minuto
+const MAX_LOGIN_ATTEMPTS_PAIR = 10; // Máximo 10 intentos por par ip|email en 1 minuto
+const MAX_LOGIN_ATTEMPTS_EMAIL = 25; // Máximo 25 intentos por cuenta ante fuerza bruta distribuida
+const MAX_RATE_LIMIT_ENTRIES = 5000;
+let lastRateLimitSweep = 0;
+
+function purgeRateLimitEntries(now) {
+  for (const [key, entry] of loginAttempts.entries()) {
+    if (!entry || now > entry.resetAt) {
+      loginAttempts.delete(key);
+    }
+  }
+  while (loginAttempts.size >= MAX_RATE_LIMIT_ENTRIES) {
+    const oldestKey = loginAttempts.keys().next().value;
+    if (oldestKey === undefined) break;
+    loginAttempts.delete(oldestKey);
+  }
+}
+
+function incrementRateLimitKey(key, now) {
+  if (loginAttempts.size >= MAX_RATE_LIMIT_ENTRIES || now - lastRateLimitSweep > RATE_LIMIT_WINDOW_MS) {
+    lastRateLimitSweep = now;
+    purgeRateLimitEntries(now);
+  }
+  const existing = loginAttempts.get(key);
+  if (!existing || now > existing.resetAt) {
+    const fresh = { count: 1, resetAt: now + RATE_LIMIT_WINDOW_MS };
+    loginAttempts.set(key, fresh);
+    return fresh;
+  }
+  existing.count += 1;
+  return existing;
+}
 
 function rateLimitLogin(req, res, next) {
-  const ip = req.headers['x-forwarded-for'] || req.socket?.remoteAddress || '127.0.0.1';
+  const ip = getClientIp(req);
+  const emailNorm = typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : '';
   const now = Date.now();
-  const record = loginAttempts.get(ip) || { count: 0, resetAt: now + RATE_LIMIT_WINDOW_MS };
 
-  if (now > record.resetAt) {
-    record.count = 1;
-    record.resetAt = now + RATE_LIMIT_WINDOW_MS;
-  } else {
-    record.count++;
-  }
-  loginAttempts.set(ip, record);
+  const ipRecord = incrementRateLimitKey(`ip:${ip}`, now);
+  const pairRecord = emailNorm ? incrementRateLimitKey(`pair:${ip}|${emailNorm}`, now) : null;
+  const emailRecord = emailNorm ? incrementRateLimitKey(`email:${emailNorm}`, now) : null;
 
-  if (record.count > MAX_LOGIN_ATTEMPTS) {
+  if (
+    ipRecord.count > MAX_LOGIN_ATTEMPTS ||
+    (pairRecord && pairRecord.count > MAX_LOGIN_ATTEMPTS_PAIR) ||
+    (emailRecord && emailRecord.count > MAX_LOGIN_ATTEMPTS_EMAIL)
+  ) {
     return res.status(429).json({
       success: false,
       message: 'Demasiados intentos de autenticación. Por favor espere un minuto antes de reintentar.'
@@ -314,8 +1087,8 @@ function rateLimitLogin(req, res, next) {
 
 router.post('/auth/login', rateLimitLogin, async (req, res) => {
   try {
-    const { email, password } = req.body;
-    if (!email || !password) {
+    const { email, password } = req.body || {};
+    if (typeof email !== 'string' || typeof password !== 'string' || !email.trim() || !password) {
       return res.status(400).json({ success: false, message: 'Email y contraseña requeridos.' });
     }
 
@@ -344,7 +1117,7 @@ router.post('/auth/login', rateLimitLogin, async (req, res) => {
       try {
         const upgradedHash = await hashPassword(password);
         await db.query('UPDATE inv_usuarios SET password_hash = ? WHERE id = ?', [upgradedHash, user.id]);
-        console.log(`[AUTH-MIGRATION] Contraseña del usuario ${user.email} (ID: ${user.id}) migrada transparentemente a Argon2id.`);
+        console.log(`[AUTH-MIGRATION] Contraseña del usuario ID ${user.id} migrada transparentemente a Argon2id.`);
       } catch (upgradeErr) {
         console.error('[AUTH-MIGRATION] Advertencia: Error en auto-actualización a Argon2id:', upgradeErr.message);
       }
@@ -363,25 +1136,24 @@ router.post('/auth/login', rateLimitLogin, async (req, res) => {
         ORDER BY uc.es_principal DESC, c.nombre ASC
       `, [user.id]);
       userCamps = cRows;
-    } catch (e) {
+    } catch (campErr) {
+      if (campErr?.code !== 'ER_NO_SUCH_TABLE') {
+        console.warn('[AUTH] Error consultando inv_usuario_campamentos en login:', campErr?.message || campErr);
+      }
       userCamps = [];
     }
 
     if (userCamps.length === 0 && user.campamento_id) {
-      const [singleCamp] = await db.query('SELECT id, nombre, codigo, provincia FROM inv_campamentos WHERE id = ?', [user.campamento_id]);
+      const [singleCamp] = await db.query(
+        'SELECT id, nombre, codigo, provincia FROM inv_campamentos WHERE id = ? AND activo = 1',
+        [user.campamento_id]
+      );
       if (singleCamp.length > 0) {
         userCamps = [{ ...singleCamp[0], es_principal: 1 }];
       }
     }
 
-    let parsedPermisos = [];
-    try {
-      parsedPermisos = user.permisos_json
-        ? (typeof user.permisos_json === 'string' ? JSON.parse(user.permisos_json) : user.permisos_json)
-        : (user.rol === 'developer' ? ['*'] : []);
-    } catch (e) {
-      parsedPermisos = user.rol === 'developer' ? ['*'] : [];
-    }
+    const parsedPermisos = parsePermisosJson(user.permisos_json, user.rol, user.es_developer);
 
     const activeCampamento = user.rol === 'developer'
       ? { id: null, nombre: 'GENERAL' }
@@ -400,7 +1172,11 @@ router.post('/auth/login', rateLimitLogin, async (req, res) => {
       permisos: parsedPermisos
     };
 
-    const token = generateToken(payload);
+    const tokenVersion = Number.isInteger(Number(user.token_version)) && Number(user.token_version) > 0
+      ? Number(user.token_version)
+      : 1;
+    const token = generateToken({ ...payload, tv: tokenVersion });
+
     await logAudit(db, {
       usuario_id: user.id,
       usuario_nombre: user.nombre,
@@ -419,6 +1195,25 @@ router.post('/auth/login', rateLimitLogin, async (req, res) => {
   } catch (error) {
     console.error('Login error:', error);
     res.status(500).json({ success: false, message: 'Error en el servidor al autenticar.' });
+  }
+});
+
+router.post('/auth/logout', requireAuth, async (req, res) => {
+  try {
+    const db = getPool();
+    await bumpUserTokenVersion(db, req.user.id);
+    await logAudit(db, {
+      usuario_id: req.user.id,
+      usuario_nombre: req.user.nombre,
+      accion: 'LOGOUT_USUARIO',
+      entidad: 'inv_usuarios',
+      entidad_id: req.user.id,
+      req
+    });
+    res.json({ success: true, message: 'Sesión cerrada y token revocado correctamente.' });
+  } catch (error) {
+    console.error('Logout error:', error);
+    res.status(500).json({ success: false, message: 'Error cerrando sesión.' });
   }
 });
 
@@ -444,25 +1239,24 @@ router.get('/auth/me', requireAuth, async (req, res) => {
         ORDER BY uc.es_principal DESC, c.nombre ASC
       `, [user.id]);
       userCamps = cRows;
-    } catch (e) {
+    } catch (campErr) {
+      if (campErr?.code !== 'ER_NO_SUCH_TABLE') {
+        console.warn('[AUTH] Error consultando inv_usuario_campamentos en login:', campErr?.message || campErr);
+      }
       userCamps = [];
     }
 
     if (userCamps.length === 0 && user.campamento_id) {
-      const [singleCamp] = await db.query('SELECT id, nombre, codigo, provincia FROM inv_campamentos WHERE id = ?', [user.campamento_id]);
+      const [singleCamp] = await db.query(
+        'SELECT id, nombre, codigo, provincia FROM inv_campamentos WHERE id = ? AND activo = 1',
+        [user.campamento_id]
+      );
       if (singleCamp.length > 0) {
         userCamps = [{ ...singleCamp[0], es_principal: 1 }];
       }
     }
 
-    let parsedPermisos = [];
-    try {
-      parsedPermisos = user.permisos_json
-        ? (typeof user.permisos_json === 'string' ? JSON.parse(user.permisos_json) : user.permisos_json)
-        : (user.rol === 'developer' ? ['*'] : []);
-    } catch (e) {
-      parsedPermisos = user.rol === 'developer' ? ['*'] : [];
-    }
+    const parsedPermisos = parsePermisosJson(user.permisos_json, user.rol, user.es_developer);
 
     const activeCampamento = user.rol === 'developer'
       ? { id: null, nombre: 'GENERAL' }
@@ -484,42 +1278,705 @@ router.get('/auth/me', requireAuth, async (req, res) => {
       }
     });
   } catch (error) {
-    res.status(500).json({ success: false, message: 'Error obteniendo perfil.' });
+    console.error('Auth /me error:', error);
+    const status = isDbUnavailableError(error) ? 503 : 500;
+    res.status(status).json({ success: false, message: 'Error obteniendo perfil.' });
   }
 });
 
 // ==========================================
 // CONFIGURACIÓN DE ENTORNO ACTIVO Y FUENTE DE DATOS (TAREA 1 Y TAREA 9)
 // ==========================================
-router.get('/config/entorno', (req, res) => {
-  const host = process.env.DB_HOST || '';
-  const port = process.env.DB_PORT || '3306';
-  const esPruebas = host.includes('127.0.0.1') || host.includes('localhost') || port === '3308';
-  res.json({
+router.get('/config/entorno', requireAuth, (req, res) => {
+  const host = (process.env.DB_HOST || '').toLowerCase();
+  const port = String(process.env.DB_PORT || '3306');
+  const isProd = process.env.NODE_ENV === 'production';
+  const esPruebas = !isProd && (
+    host.includes('127.0.0.1') ||
+    host.includes('localhost') ||
+    process.env.ENVIRONMENT === 'isolated_test' ||
+    process.env.ISOLATED_LOCAL_ONLY === 'true' ||
+    port !== '3306'
+  );
+
+  const basePayload = {
     success: true,
     entorno: esPruebas ? 'PRUEBAS' : 'PRODUCCION',
-    etiqueta: esPruebas ? 'PRUEBAS — MariaDB Local' : 'PRODUCCIÓN — Clever Cloud',
-    esPruebas,
+    etiqueta: esPruebas ? 'PRUEBAS — Entorno Local' : 'PRODUCCIÓN — Sistema Corporativo',
+    esPruebas
+  };
+
+  const isDeveloper = req.user.rol === 'developer' || req.user.es_developer === 1;
+  if (!isDeveloper) {
+    return res.json(basePayload);
+  }
+
+  return res.json({
+    ...basePayload,
     fuenteActiva: esPruebas
-      ? 'Referencia Documental Histórica (Excel 16-Oct-2026: 433 activos reales) en MariaDB Local (:3308) con Capa Sintética Aislada (es_sintetico = 1)'
-      : 'Clever Cloud MySQL Productivo',
-    estadoCleverCloudReadonly: 'PENDIENTE_USUARIO_READONLY',
+      ? 'Base de Datos Local Aislada (capa sintética controlada por es_sintetico)'
+      : 'Base de Datos Productiva Oficial',
     aviso: esPruebas
-      ? 'Base Local Aislada (MariaDB :3308): Mostrando 433 activos históricos reales del Excel del 16-Oct-2026 (18 sintéticos de prueba excluidos por defecto). La consulta en vivo de los 434 activos de Clever Cloud requiere habilitar el usuario de solo lectura ingmelec_readonly.'
-      : 'Entorno de Producción Oficial conectado a Clever Cloud.'
+      ? 'Entorno local de pruebas activo con aislamiento de registros sintéticos.'
+      : 'Entorno de producción oficial activo.'
   });
 });
+
+// ==========================================
+// HELPERS CANÓNICOS DE CAMPAMENTOS, ALIAS Y REASIGNACIÓN SEGURA (ETAPA 4)
+// ==========================================
+
+const NON_IDENTIFIABLE_SERIALS = new Set([
+  '',
+  'N/A',
+  'S/N',
+  'SIN SERIAL',
+  'SIN SERIE',
+  'NO APLICA',
+  'NONE',
+  'NULL',
+  '--',
+  '-'
+]);
+
+export function normalizeAliasKey(value) {
+  if (value === null || value === undefined) return '';
+  return String(value)
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .trim()
+    .replace(/\s+/g, ' ')
+    .toUpperCase();
+}
+
+function normalizeIdentifiableSerial(val) {
+  const norm = String(val ?? '').trim().toUpperCase();
+  if (!norm || NON_IDENTIFIABLE_SERIALS.has(norm)) return null;
+  return norm;
+}
+
+function normalizeCodeKey(val) {
+  const norm = String(val ?? '').trim().toUpperCase();
+  return norm || null;
+}
+
+async function lookupFirstActiveAlmacenId(db, campamentoId, schemaCaps, options = {}) {
+  if (options.skipAlmacenLookup || !campamentoId) return null;
+  if (schemaCaps?.almacenes && !schemaCaps.almacenes.exists) return null;
+  const [almRows] = await db.query(
+    'SELECT id FROM inv_almacenes WHERE campamento_id = ? AND activo = 1 ORDER BY id ASC LIMIT 1',
+    [campamentoId]
+  );
+  return almRows.length > 0 ? almRows[0].id : null;
+}
+
+// Helper canónico para resolver vinculación inequívoca con campamentos confirmados (sin IDs numéricos fijos)
+export async function resolveCampamentoVinculacion(db, campamentoIdInput, ubicacionNombreInput, options = {}) {
+  const hasExplicitCampId = campamentoIdInput !== undefined
+    && campamentoIdInput !== null
+    && String(campamentoIdInput).trim() !== '';
+
+  if (hasExplicitCampId) {
+    const cid = parsePositiveInt(campamentoIdInput);
+    if (!cid) {
+      return {
+        campamento_id: null,
+        almacen_id: null,
+        estado_vinculacion_sede: 'SIN_SEDE',
+        campamento_invalido: true,
+        fuente_resolucion: 'CAMPAMENTO_INEXISTENTE',
+        requiere_revision_historica: false,
+        alias_match: null
+      };
+    }
+
+    const [campRows] = await db.query(
+      'SELECT id, codigo, nombre, clasificacion_sede, activo FROM inv_campamentos WHERE id = ? AND activo = 1 LIMIT 1',
+      [cid]
+    );
+    if (campRows.length === 0) {
+      return {
+        campamento_id: null,
+        almacen_id: null,
+        estado_vinculacion_sede: 'SIN_SEDE',
+        campamento_invalido: true,
+        fuente_resolucion: 'CAMPAMENTO_INEXISTENTE',
+        requiere_revision_historica: false,
+        alias_match: null
+      };
+    }
+
+    const campRow = campRows[0];
+    const schemaCaps = await getSchemaCapabilities(db);
+    const firstAlmId = await lookupFirstActiveAlmacenId(db, campRow.id, schemaCaps, options);
+    return {
+      campamento_id: campRow.id,
+      codigo_campamento: campRow.codigo || null,
+      nombre_campamento: campRow.nombre,
+      almacen_id: firstAlmId,
+      estado_vinculacion_sede: 'CONFIRMADO',
+      campamento_invalido: false,
+      fuente_resolucion: 'CAMPAMENTO_ID',
+      requiere_revision_historica: false,
+      alias_match: null
+    };
+  }
+
+  const normKey = normalizeAliasKey(ubicacionNombreInput);
+  if (!normKey) {
+    return {
+      campamento_id: null,
+      almacen_id: null,
+      estado_vinculacion_sede: 'SIN_SEDE',
+      fuente_resolucion: 'SIN_COINCIDENCIA',
+      requiere_revision_historica: false,
+      alias_match: null
+    };
+  }
+
+  const schemaCaps = await getSchemaCapabilities(db);
+
+  if (schemaCaps.campamentoAlias?.exists) {
+    try {
+      const [aliasRows] = await db.query(
+        `SELECT ca.*,
+                c.codigo AS camp_codigo,
+                c.nombre AS campamento_nombre
+         FROM inv_campamento_alias ca
+         JOIN inv_campamentos c ON c.id = ca.campamento_id
+         WHERE ca.alias_normalizado = ?
+           AND ca.estado_validacion = 'CONFIRMADO'
+           AND c.activo = 1
+         LIMIT 1`,
+        [normKey]
+      );
+
+      if (aliasRows.length > 0) {
+        const row = aliasRows[0];
+        const reqRevHist = Number(row.requiere_revision_historica || 0) === 1;
+        const campCodigo = row.camp_codigo || row.codigo_campamento || null;
+        const aliasMatch = {
+          id: row.id,
+          campamento_id: row.campamento_id,
+          alias_original: row.alias_original,
+          alias_normalizado: row.alias_normalizado,
+          tipo_alias: row.tipo_alias || null,
+          estado_validacion: row.estado_validacion,
+          requiere_revision_historica: reqRevHist
+        };
+
+        if (!reqRevHist) {
+          const firstAlmId = await lookupFirstActiveAlmacenId(db, row.campamento_id, schemaCaps, options);
+          return {
+            campamento_id: row.campamento_id,
+            codigo_campamento: campCodigo,
+            nombre_campamento: row.campamento_nombre,
+            almacen_id: firstAlmId,
+            estado_vinculacion_sede: 'CONFIRMADO',
+            fuente_resolucion: 'ALIAS_DIRECTO',
+            requiere_revision_historica: false,
+            alias_match: aliasMatch
+          };
+        }
+
+        if (options.permitirAliasRevisionHistorica === true) {
+          const firstAlmId = await lookupFirstActiveAlmacenId(db, row.campamento_id, schemaCaps, options);
+          return {
+            campamento_id: row.campamento_id,
+            codigo_campamento: campCodigo,
+            nombre_campamento: row.campamento_nombre,
+            almacen_id: firstAlmId,
+            estado_vinculacion_sede: 'CONFIRMADO',
+            suggested_campamento_id: row.campamento_id,
+            suggested_codigo_campamento: campCodigo,
+            suggested_nombre_campamento: row.campamento_nombre,
+            requiere_revision_historica: true,
+            fuente_resolucion: 'ALIAS_REVISION_HISTORICA',
+            alias_match: aliasMatch
+          };
+        }
+
+        return {
+          campamento_id: null,
+          almacen_id: null,
+          estado_vinculacion_sede: 'SEDE_AMBIGUA',
+          suggested_campamento_id: row.campamento_id,
+          suggested_codigo_campamento: campCodigo,
+          suggested_nombre_campamento: row.campamento_nombre,
+          requiere_revision_historica: true,
+          fuente_resolucion: 'ALIAS_REVISION_HISTORICA',
+          alias_match: aliasMatch
+        };
+      }
+    } catch (aliasErr) {
+      if (aliasErr?.code !== 'ER_NO_SUCH_TABLE') {
+        throw aliasErr;
+      }
+    }
+  }
+
+  const hasClasif = schemaCaps.campamentos?.hasClasificacionSede;
+  const orderSql = hasClasif
+    ? "ORDER BY CASE WHEN clasificacion_sede = 'CONFIRMADO' THEN 0 ELSE 1 END ASC, id ASC"
+    : 'ORDER BY id ASC';
+  const [campCatalogRows] = await db.query(
+    `SELECT id, codigo, nombre
+     FROM inv_campamentos
+     WHERE activo = 1
+     ${orderSql}`
+  );
+
+  const exactByCode = campCatalogRows.find((c) => normalizeAliasKey(c.codigo) === normKey);
+  const exactMatch = exactByCode || campCatalogRows.find((c) => normalizeAliasKey(c.nombre) === normKey);
+
+  if (exactMatch) {
+    const firstAlmId = await lookupFirstActiveAlmacenId(db, exactMatch.id, schemaCaps, options);
+    return {
+      campamento_id: exactMatch.id,
+      codigo_campamento: exactMatch.codigo || null,
+      nombre_campamento: exactMatch.nombre,
+      almacen_id: firstAlmId,
+      estado_vinculacion_sede: 'CONFIRMADO',
+      fuente_resolucion: 'CAMPAMENTO_CATALOGO',
+      requiere_revision_historica: false,
+      alias_match: null
+    };
+  }
+
+  return {
+    campamento_id: null,
+    almacen_id: null,
+    estado_vinculacion_sede: 'SIN_SEDE',
+    fuente_resolucion: 'SIN_COINCIDENCIA',
+    requiere_revision_historica: false,
+    alias_match: null
+  };
+}
+
+async function resolveRequestedCampamentoFilter(db, scope, query = {}) {
+  const { campamento_id, campamento_codigo, sin_sede, sinSede } = query;
+  const campamentoParam = asNonEmptyString(campamento_id);
+  const codigoParam = asNonEmptyString(campamento_codigo);
+  const isSinSedeByCode = Boolean(
+    codigoParam && codigoParam.toUpperCase() === 'SIN_SEDE' && (!campamentoParam || campamentoParam.toUpperCase() === 'TODOS')
+  );
+  const isSinSedeReq = campamentoParam === 'SIN_SEDE' || sin_sede === 'true' || sinSede === 'true' || isSinSedeByCode;
+
+  if (isSinSedeReq) {
+    if (!scope.isGlobal) {
+      return {
+        errorStatus: 403,
+        errorMessage: 'Acceso denegado a artículos sin sede verificada.'
+      };
+    }
+    return { isSinSedeReq: true, selectedCid: null, campamentoNotFound: false };
+  }
+
+  if (campamento_id !== undefined && campamento_id !== '' && campamentoParam !== 'TODOS') {
+    const reqCid = parsePositiveInt(campamento_id);
+    if (!scope.isGlobal) {
+      if (!reqCid || !scope.campamentoIds.includes(reqCid)) {
+        return { errorStatus: 403, errorMessage: 'Acceso denegado a la sede solicitada.' };
+      }
+    } else if (!reqCid) {
+      return { errorStatus: 400, errorMessage: 'Parámetro campamento_id inválido.' };
+    }
+    return { isSinSedeReq: false, selectedCid: reqCid, campamentoNotFound: false };
+  }
+
+  if (codigoParam && codigoParam.toUpperCase() !== 'TODOS') {
+    const normTarget = normalizeAliasKey(codigoParam);
+    const [campRows] = await db.query('SELECT id, codigo FROM inv_campamentos WHERE activo = 1 ORDER BY id ASC');
+    const matched = campRows.find((c) => normalizeAliasKey(c.codigo) === normTarget);
+    if (!matched) {
+      if (!scope.isGlobal) {
+        return { errorStatus: 403, errorMessage: 'Acceso denegado a la sede solicitada.' };
+      }
+      return { isSinSedeReq: false, selectedCid: -1, campamentoNotFound: true };
+    }
+    if (!scope.isGlobal && !scope.campamentoIds.includes(matched.id)) {
+      return { errorStatus: 403, errorMessage: 'Acceso denegado a la sede solicitada.' };
+    }
+    return { isSinSedeReq: false, selectedCid: matched.id, campamentoNotFound: false };
+  }
+
+  return { isSinSedeReq: false, selectedCid: null, campamentoNotFound: false };
+}
+
+async function buildSinSedeSummary(db, includeSynthetic = false) {
+  const syntFilter = includeSynthetic ? '' : 'AND es_sintetico = 0';
+  const [sinSedeRows] = await db.query(`
+    SELECT
+      COUNT(*) as total_articulos,
+      SUM(COALESCE(cantidad_num, 0)) as total_fisico,
+      SUM(CASE WHEN cantidad_num IS NULL OR cantidad_verificada = 0 THEN 1 ELSE 0 END) as articulos_sin_cantidad,
+      SUM(CASE WHEN area = 'INFORMATICA' THEN 1 ELSE 0 END) as dep_informatica,
+      SUM(CASE WHEN area = 'OFICINAS' THEN 1 ELSE 0 END) as dep_oficinas,
+      SUM(CASE WHEN area = 'COCINA' THEN 1 ELSE 0 END) as dep_cocina,
+      SUM(CASE WHEN area = 'ALMACEN' THEN 1 ELSE 0 END) as dep_almacen,
+      SUM(CASE WHEN estado_fisico = 'Bueno' THEN 1 ELSE 0 END) as buenos,
+      SUM(CASE WHEN estado_fisico = 'Regular' THEN 1 ELSE 0 END) as regulares,
+      SUM(CASE WHEN estado_fisico = 'Dañado' THEN 1 ELSE 0 END) as danados,
+      SUM(CASE WHEN estado_fisico = 'Fuera de servicio' THEN 1 ELSE 0 END) as fuera_servicio,
+      SUM(CASE WHEN estado_fisico = 'Pendiente de verificación' THEN 1 ELSE 0 END) as estado_pendiente,
+      SUM(CASE WHEN estado_fisico = 'Pendiente de verificación' OR cantidad_num IS NULL OR cantidad_verificada = 0 THEN 1 ELSE 0 END) as pendientes_verificacion,
+      SUM(CASE WHEN ${SQL_SIN_SERIAL_CONDITION} THEN 1 ELSE 0 END) as sin_serie
+    FROM inv_articulos
+    WHERE activo = 1 AND campamento_id IS NULL ${syntFilter}
+  `);
+
+  const [ubicRows] = await db.query(`
+    SELECT COALESCE(NULLIF(TRIM(ubicacion_nombre), ''), 'Sin especificar') AS ubicacion_label,
+           COUNT(*) AS total
+    FROM inv_articulos
+    WHERE activo = 1 AND campamento_id IS NULL ${syntFilter}
+    GROUP BY ubicacion_label
+    ORDER BY total DESC, ubicacion_label ASC
+  `);
+
+  const sr = sinSedeRows[0] || {};
+  const totalArticulos = parseInt(sr.total_articulos || 0);
+  const porDepartamento = {
+    INFORMATICA: parseInt(sr.dep_informatica || 0),
+    OFICINAS: parseInt(sr.dep_oficinas || 0),
+    COCINA: parseInt(sr.dep_cocina || 0),
+    ALMACEN: parseInt(sr.dep_almacen || 0)
+  };
+
+  const ubicacionesPendientes = ubicRows.map((u) => ({
+    ubicacion_nombre: u.ubicacion_label,
+    total: parseInt(u.total || 0)
+  }));
+
+  const ubicacionHistorica = ubicacionesPendientes.length > 0
+    ? ubicacionesPendientes.map((u) => `${u.ubicacion_nombre} (${u.total})`).join(', ')
+    : 'Sin registros pendientes';
+
+  const deptParts = Object.entries(porDepartamento)
+    .filter(([, count]) => count > 0)
+    .map(([dept, count]) => `${dept} (${count})`);
+
+  const motivo = totalArticulos === 0 || deptParts.length === 0
+    ? 'No existen artículos pendientes de vinculación a sede.'
+    : `Ubicaciones históricas pendientes de homologación en ${deptParts.join(', ')}. Requiere vista previa y confirmación individual antes de reasignar a una sede.`;
+
+  return {
+    id: 'SIN_SEDE',
+    nombre: 'SIN SEDE VERIFICADA (PENDIENTE DE CLASIFICACIÓN)',
+    codigo: 'PEND-SEDE',
+    ubicacion_historica: ubicacionHistorica,
+    ubicaciones_pendientes: ubicacionesPendientes,
+    motivo,
+    clasificacion_sede: 'SEDE_AMBIGUA',
+    cantidad_almacenes: null,
+    total_articulos: totalArticulos,
+    total_fisico: parseFloat(sr.total_fisico || 0),
+    articulos_sin_cantidad: parseInt(sr.articulos_sin_cantidad || 0),
+    por_departamento: porDepartamento,
+    buenos: parseInt(sr.buenos || 0),
+    regulares: parseInt(sr.regulares || 0),
+    danados: parseInt(sr.danados || 0),
+    fuera_servicio: parseInt(sr.fuera_servicio || 0),
+    estado_pendiente: parseInt(sr.estado_pendiente || 0),
+    pendientes_verificacion: parseInt(sr.pendientes_verificacion || 0),
+    sin_serie: parseInt(sr.sin_serie || 0),
+    levantamientos_abiertos: 0,
+    levantamientos_finalizados: 0
+  };
+}
+
+function isAmbiguousRelatedToDestino(normUbic, destCamp, destAliases = []) {
+  if (!normUbic) return false;
+  const destCode = normalizeAliasKey(destCamp?.codigo);
+  const destName = normalizeAliasKey(destCamp?.nombre);
+  const aliasKeys = destAliases.map((a) => normalizeAliasKey(a.alias_normalizado || a.alias_original));
+  const destContext = [destCode, destName, ...aliasKeys].join(' ');
+
+  if (destContext.includes('OPL') || destContext.includes('KM 19') || destContext.includes('KM19')) {
+    if (normUbic.includes('KM 19') || normUbic.includes('KM19') || normUbic.includes('DUARTE') || normUbic.includes('OPL')) {
+      return true;
+    }
+  }
+  if (destContext.includes('633') || destContext.includes('M633') || destContext.includes('MANTENIMIENTO')) {
+    if (normUbic.includes('MANTENIMIENTO') || normUbic.includes('633')) {
+      return true;
+    }
+  }
+  if (destContext.includes('27 DE FEBRERO') || destContext.includes('27FEB')) {
+    if (normUbic.includes('27 DE FEBRERO') || normUbic.includes('27FEB') || normUbic.includes('DISTRITO NACIONAL')) {
+      return true;
+    }
+  }
+  if (destCode && destCode.length >= 4 && normUbic.includes(destCode)) {
+    return true;
+  }
+  return false;
+}
+
+async function resolveDestinoCampamentoYAlmacen(db, {
+  campamento_destino_id,
+  campamento_destino_codigo,
+  almacen_destino_id
+}) {
+  const hasDestId = campamento_destino_id !== undefined
+    && campamento_destino_id !== null
+    && String(campamento_destino_id).trim() !== '';
+  const destCodeStr = asNonEmptyString(campamento_destino_codigo);
+
+  if (!hasDestId && !destCodeStr) {
+    return {
+      errorStatus: 400,
+      errorMessage: 'Debe especificar campamento_destino_id o campamento_destino_codigo.'
+    };
+  }
+
+  let destCamp;
+  if (hasDestId) {
+    const destId = parsePositiveInt(campamento_destino_id);
+    if (!destId) {
+      return { errorStatus: 400, errorMessage: 'ID de campamento destino inválido.' };
+    }
+    const [cRows] = await db.query(
+      'SELECT * FROM inv_campamentos WHERE id = ? AND activo = 1 LIMIT 1',
+      [destId]
+    );
+    destCamp = cRows[0] || null;
+  } else {
+    const normCode = normalizeAliasKey(destCodeStr);
+    const [cRows] = await db.query('SELECT * FROM inv_campamentos WHERE activo = 1 ORDER BY id ASC');
+    destCamp = cRows.find((c) => normalizeAliasKey(c.codigo) === normCode) || null;
+  }
+
+  if (!destCamp) {
+    return { errorStatus: 404, errorMessage: 'Campamento destino no encontrado o inactivo.' };
+  }
+
+  let destAlm;
+  const hasAlmId = almacen_destino_id !== undefined
+    && almacen_destino_id !== null
+    && String(almacen_destino_id).trim() !== '';
+
+  if (hasAlmId) {
+    const almId = parsePositiveInt(almacen_destino_id);
+    if (!almId) {
+      return { errorStatus: 400, errorMessage: 'ID de almacén destino inválido.' };
+    }
+    const [aRows] = await db.query(
+      'SELECT * FROM inv_almacenes WHERE id = ? AND campamento_id = ? AND activo = 1 LIMIT 1',
+      [almId, destCamp.id]
+    );
+    if (aRows.length === 0) {
+      return {
+        errorStatus: 400,
+        errorMessage: 'El almacén destino no existe, está inactivo o no pertenece al campamento destino.'
+      };
+    }
+    destAlm = aRows[0];
+  } else {
+    const [aRows] = await db.query(
+      'SELECT * FROM inv_almacenes WHERE campamento_id = ? AND activo = 1 ORDER BY id ASC LIMIT 1',
+      [destCamp.id]
+    );
+    destAlm = aRows[0] || null;
+  }
+
+  return { destCamp, destAlm };
+}
+
+async function evaluateReasignacionCandidatos(db, candidateRows, destCamp, destAliases, includeSynthetic = false) {
+  if (!Array.isArray(candidateRows) || candidateRows.length === 0) {
+    return [];
+  }
+
+  const destAliasMap = new Map();
+  for (const al of destAliases) {
+    const k = normalizeAliasKey(al.alias_normalizado || al.alias_original);
+    if (k && !destAliasMap.has(k)) {
+      destAliasMap.set(k, al);
+    }
+  }
+
+  const syntFilter = includeSynthetic ? '' : 'AND es_sintetico = 0';
+  const candidateCodes = Array.from(
+    new Set(candidateRows.map((r) => normalizeCodeKey(r.codigo_original)).filter(Boolean))
+  );
+  const candidateSerials = Array.from(
+    new Set(candidateRows.map((r) => normalizeIdentifiableSerial(r.serie_imei)).filter(Boolean))
+  );
+
+  const codeGroups = new Map();
+  if (candidateCodes.length > 0) {
+    const [codePeers] = await db.query(
+      `SELECT id, codigo_original, articulo_nombre, area, ubicacion_nombre, campamento_id, almacen_id, estado_fisico, cantidad_num
+       FROM inv_articulos
+       WHERE activo = 1 ${syntFilter} AND UPPER(TRIM(codigo_original)) IN (?)`,
+      [candidateCodes]
+    );
+    for (const p of codePeers) {
+      const k = normalizeCodeKey(p.codigo_original);
+      if (!k) continue;
+      if (!codeGroups.has(k)) codeGroups.set(k, []);
+      codeGroups.get(k).push(p);
+    }
+  }
+
+  const serialGroups = new Map();
+  if (candidateSerials.length > 0) {
+    const [serialPeers] = await db.query(
+      `SELECT id, codigo_original, articulo_nombre, area, ubicacion_nombre, serie_imei, campamento_id, almacen_id, estado_fisico, cantidad_num
+       FROM inv_articulos
+       WHERE activo = 1 ${syntFilter} AND UPPER(TRIM(serie_imei)) IN (?)`,
+      [candidateSerials]
+    );
+    for (const p of serialPeers) {
+      const k = normalizeIdentifiableSerial(p.serie_imei);
+      if (!k) continue;
+      if (!serialGroups.has(k)) serialGroups.set(k, []);
+      serialGroups.get(k).push(p);
+    }
+  }
+
+  return candidateRows.map((row) => {
+    const normUbic = normalizeAliasKey(row.ubicacion_nombre);
+    const aliasMatch = normUbic ? (destAliasMap.get(normUbic) || null) : null;
+    const esUbicacionNoHomologada = !aliasMatch;
+
+    const codeKey = normalizeCodeKey(row.codigo_original);
+    const allCodeMatches = codeKey ? (codeGroups.get(codeKey) || []) : [];
+    const duplicadoCodigoDetectado = Boolean(codeKey && allCodeMatches.length > 1);
+    const conflictosCodigo = duplicadoCodigoDetectado
+      ? allCodeMatches
+        .filter((p) => p.id !== row.id)
+        .map((p) => ({
+          id: p.id,
+          codigo_original: p.codigo_original,
+          articulo_nombre: p.articulo_nombre,
+          area: p.area,
+          ubicacion_nombre: p.ubicacion_nombre,
+          campamento_id: p.campamento_id
+        }))
+      : [];
+
+    const serialKey = normalizeIdentifiableSerial(row.serie_imei);
+    const allSerialMatches = serialKey ? (serialGroups.get(serialKey) || []) : [];
+    const duplicadoSerieDetectado = Boolean(serialKey && allSerialMatches.length > 1);
+    const conflictosSerie = duplicadoSerieDetectado
+      ? allSerialMatches
+        .filter((p) => p.id !== row.id)
+        .map((p) => ({
+          id: p.id,
+          codigo_original: p.codigo_original,
+          serie_imei: p.serie_imei,
+          articulo_nombre: p.articulo_nombre,
+          area: p.area,
+          ubicacion_nombre: p.ubicacion_nombre,
+          campamento_id: p.campamento_id
+        }))
+      : [];
+
+    const yaAsignadoSede = row.campamento_id !== null && row.campamento_id !== undefined;
+    const requiereConfirmacionIndividual = Boolean(
+      duplicadoCodigoDetectado || duplicadoSerieDetectado || esUbicacionNoHomologada || yaAsignadoSede
+    );
+
+    const motivosBloqueo = [];
+    if (duplicadoCodigoDetectado) {
+      motivosBloqueo.push(`Código de referencia duplicado en inventario activo (${row.codigo_original}).`);
+    }
+    if (duplicadoSerieDetectado) {
+      motivosBloqueo.push(`Serial/IMEI duplicado en inventario activo (${row.serie_imei}).`);
+    }
+    if (esUbicacionNoHomologada) {
+      motivosBloqueo.push(
+        `Ubicación histórica "${row.ubicacion_nombre || 'Sin especificar'}" no homologada como alias confirmado de ${destCamp.codigo || destCamp.nombre}.`
+      );
+    }
+    if (yaAsignadoSede) {
+      motivosBloqueo.push(
+        Number(row.campamento_id) === Number(destCamp.id)
+          ? `Artículo ya asignado previamente a la sede destino (#${row.campamento_id}).`
+          : `Artículo ya asignado a otra sede (#${row.campamento_id}).`
+      );
+    }
+
+    let clasificacion = 'ELEGIBLE_ALIAS_DIRECTO';
+    if (requiereConfirmacionIndividual) {
+      clasificacion = 'BLOQUEADO_REVISION_INDIVIDUAL';
+    } else if (aliasMatch && Number(aliasMatch.requiere_revision_historica || 0) === 1) {
+      clasificacion = 'ELEGIBLE_EQUIVALENCIA_APROBADA';
+    }
+
+    return {
+      ...row,
+      ubicacion_normalizada: normUbic,
+      alias_match: aliasMatch
+        ? {
+            id: aliasMatch.id,
+            alias_original: aliasMatch.alias_original,
+            alias_normalizado: aliasMatch.alias_normalizado,
+            tipo_alias: aliasMatch.tipo_alias || null,
+            requiere_revision_historica: Number(aliasMatch.requiere_revision_historica || 0) === 1
+          }
+        : null,
+      duplicado_codigo_detectado: duplicadoCodigoDetectado,
+      duplicado_serie_detectado: duplicadoSerieDetectado,
+      es_ubicacion_no_homologada: esUbicacionNoHomologada,
+      ya_asignado_sede: yaAsignadoSede,
+      requiere_confirmacion_individual: requiereConfirmacionIndividual,
+      clasificacion,
+      conflictos_codigo: conflictosCodigo,
+      conflictos_serie: conflictosSerie,
+      motivos_bloqueo: motivosBloqueo
+    };
+  });
+}
 
 // ==========================================
 // 2. DASHBOARD & KPIS (ESTADÍSTICAS CONCILIADAS POR CAMPAMENTO — TAREAS 5, 6, 7)
 // ==========================================
 
-router.get('/dashboard/kpis', requireAuth, async (req, res) => {
+router.get('/dashboard/kpis', requireAuth, requirePermission('dash:ver'), async (req, res) => {
   try {
     const db = getPool();
+    const schemaCaps = await getSchemaCapabilities(db);
+    const pendingClasificaciones = ['PENDIENTE_VALIDACION', 'PROPUESTO'].filter((v) =>
+      schemaCaps.campamentos.clasificacionValues.includes(v)
+    );
+    const levOpenCond = schemaCaps.levantamientos.estadoValues.includes('Cancelado')
+      ? "estado NOT IN ('Finalizado', 'Cancelado')"
+      : "estado <> 'Finalizado'";
     const scope = await getUserAllowedCampamentos(db, req.user);
-    const { campamento_id, almacen_id, incluir_sinteticos, sin_sede } = req.query;
+    const { almacen_id, incluir_sinteticos } = req.query;
     const includeSynthetic = incluir_sinteticos === 'true';
+
+    const campFilter = await resolveRequestedCampamentoFilter(db, scope, req.query);
+    if (campFilter.errorStatus) {
+      return res.status(campFilter.errorStatus).json({ success: false, message: campFilter.errorMessage });
+    }
+    const { isSinSedeReq, selectedCid } = campFilter;
+    const almacenParam = asNonEmptyString(almacen_id);
+
+    let reqAlmId = null;
+    if (almacen_id !== undefined && almacen_id !== '' && almacenParam !== 'TODOS') {
+      reqAlmId = parsePositiveInt(almacen_id);
+      if (!reqAlmId) {
+        return res.status(400).json({ success: false, message: 'Parámetro almacen_id inválido.' });
+      }
+      if (!scope.isGlobal) {
+        const [almRows] = await db.query(
+          'SELECT campamento_id FROM inv_almacenes WHERE id = ? AND activo = 1',
+          [reqAlmId]
+        );
+        if (almRows.length === 0 || !scope.campamentoIds.includes(almRows[0].campamento_id)) {
+          return res.status(403).json({ success: false, message: 'Acceso denegado al almacén solicitado.' });
+        }
+      }
+    }
+
+    const isSinSedeFilter = scope.isGlobal && isSinSedeReq;
+    const effectiveCampIds = !scope.isGlobal
+      ? (selectedCid !== null ? [selectedCid] : scope.campamentoIds)
+      : (selectedCid !== null ? [selectedCid] : null);
 
     let whereArt = 'WHERE activo = 1';
     const paramsArt = [];
@@ -530,43 +1987,26 @@ router.get('/dashboard/kpis', requireAuth, async (req, res) => {
     }
 
     if (!scope.isGlobal) {
-      if (campamento_id && campamento_id !== 'TODOS') {
-        if (campamento_id === 'SIN_SEDE') {
-          return res.status(403).json({ success: false, message: 'Acceso denegado a registros sin sede verificada.' });
-        }
-        const reqCid = parseInt(campamento_id);
-        if (!scope.campamentoIds.includes(reqCid)) {
-          return res.status(403).json({ success: false, message: 'Acceso denegado a la sede solicitada.' });
-        }
+      if (selectedCid) {
         whereArt += ' AND campamento_id = ?';
-        paramsArt.push(reqCid);
-      } else if (scope.campamentoIds.length > 0 && scope.campamentoNombres.length > 0) {
-        whereArt += ' AND (campamento_id IN (?) OR ubicacion_nombre IN (?))';
-        paramsArt.push(scope.campamentoIds, scope.campamentoNombres);
-      } else if (scope.campamentoIds.length > 0) {
-        whereArt += ' AND campamento_id IN (?)';
-        paramsArt.push(scope.campamentoIds);
-      } else if (scope.campamentoNombres.length > 0) {
-        whereArt += ' AND ubicacion_nombre IN (?)';
-        paramsArt.push(scope.campamentoNombres);
+        paramsArt.push(selectedCid);
       } else {
-        whereArt += ' AND 1 = 0';
+        const scopeFilter = buildArticleScopeFilter(scope, '');
+        whereArt += ` AND ${scopeFilter.sql}`;
+        paramsArt.push(...scopeFilter.params);
       }
     } else {
-      // Alcance Global (Developer / Gerencia): Soporte de filtrado por Campamento confirmado o SIN_SEDE
-      if (sin_sede === 'true' || campamento_id === 'SIN_SEDE') {
+      if (isSinSedeFilter) {
         whereArt += ' AND campamento_id IS NULL';
-      } else if (campamento_id && campamento_id !== 'TODOS') {
-        const reqCid = parseInt(campamento_id);
-        if (!isNaN(reqCid)) {
-          whereArt += ' AND campamento_id = ?';
-          paramsArt.push(reqCid);
-        }
+      } else if (selectedCid) {
+        whereArt += ' AND campamento_id = ?';
+        paramsArt.push(selectedCid);
       }
-      if (almacen_id && almacen_id !== 'TODOS') {
-        whereArt += ' AND almacen_id = ?';
-        paramsArt.push(parseInt(almacen_id));
-      }
+    }
+
+    if (reqAlmId) {
+      whereArt += ' AND almacen_id = ?';
+      paramsArt.push(reqAlmId);
     }
 
     // 1. Total count, Known Physical Quantity, and Pending Quantities (Tarea 6)
@@ -635,34 +2075,75 @@ router.get('/dashboard/kpis', requireAuth, async (req, res) => {
     };
     estadoRes.forEach(r => { porEstado[r.estado_fisico] = r.count; });
 
-    // 5. Total Campamentos Confirmados, Pendientes de Validación y Sintéticos (Tareas 2 y 3)
+    // 5. Total Campamentos Confirmados, Pendientes de Validación y Sintéticos (acotado por scope)
     let totalCampamentos = 0;
     let totalCampamentosPendientesValidacion = 0;
     let totalCampamentosSinteticos = 0;
-    try {
-      const [tc] = await db.query(`
-        SELECT
-          SUM(CASE WHEN clasificacion_sede = 'CONFIRMADO' AND es_sintetico = 0 THEN 1 ELSE 0 END) as confirmados,
-          SUM(CASE WHEN clasificacion_sede = 'PENDIENTE_VALIDACION' AND es_sintetico = 0 THEN 1 ELSE 0 END) as pendientes_validacion,
-          SUM(CASE WHEN es_sintetico = 1 THEN 1 ELSE 0 END) as sinteticos
-        FROM inv_campamentos WHERE activo = 1
-      `);
-      totalCampamentos = parseInt(tc[0]?.confirmados || 0);
-      totalCampamentosPendientesValidacion = parseInt(tc[0]?.pendientes_validacion || 0);
-      totalCampamentosSinteticos = parseInt(tc[0]?.sinteticos || 0);
-    } catch (e) {
-      totalCampamentos = 0;
+    if (schemaCaps.campamentos.exists && !isSinSedeFilter && (effectiveCampIds === null || effectiveCampIds.length > 0)) {
+      try {
+        const campCountConds = ['activo = 1'];
+        const campCountParams = [];
+        if (effectiveCampIds !== null) {
+          campCountConds.push('id IN (?)');
+          campCountParams.push(effectiveCampIds);
+        }
+        const selectConfirmados = schemaCaps.campamentos.hasClasificacionSede
+          ? `SUM(CASE WHEN clasificacion_sede = 'CONFIRMADO' ${schemaCaps.campamentos.hasEsSintetico ? 'AND es_sintetico = 0' : ''} THEN 1 ELSE 0 END)`
+          : `SUM(CASE WHEN ${schemaCaps.campamentos.hasEsSintetico ? 'es_sintetico = 0' : '1 = 1'} THEN 1 ELSE 0 END)`;
+        let selectPendientes = '0';
+        const selectPendParams = [];
+        if (schemaCaps.campamentos.hasClasificacionSede && pendingClasificaciones.length > 0) {
+          selectPendientes = `SUM(CASE WHEN clasificacion_sede IN (?) ${schemaCaps.campamentos.hasEsSintetico ? 'AND es_sintetico = 0' : ''} THEN 1 ELSE 0 END)`;
+          selectPendParams.push(pendingClasificaciones);
+        }
+        const selectSinteticos = schemaCaps.campamentos.hasEsSintetico
+          ? 'SUM(CASE WHEN es_sintetico = 1 THEN 1 ELSE 0 END)'
+          : '0';
+
+        const [tc] = await db.query(`
+          SELECT
+            ${selectConfirmados} as confirmados,
+            ${selectPendientes} as pendientes_validacion,
+            ${selectSinteticos} as sinteticos
+          FROM inv_campamentos WHERE ${campCountConds.join(' AND ')}
+        `, [...selectPendParams, ...campCountParams]);
+        totalCampamentos = parseInt(tc[0]?.confirmados || 0);
+        totalCampamentosPendientesValidacion = scope.isGlobal ? parseInt(tc[0]?.pendientes_validacion || 0) : 0;
+        totalCampamentosSinteticos = scope.isGlobal ? parseInt(tc[0]?.sinteticos || 0) : 0;
+      } catch (campErr) {
+        console.error('KPI campamentos error:', campErr?.message || campErr);
+        totalCampamentos = 0;
+      }
     }
 
     let totalAlmacenes = 0;
-    try {
-      const [ta] = await db.query(`
-        SELECT COUNT(*) as total FROM inv_almacenes
-        WHERE activo = 1 AND es_sintetico = 0 AND estado_verificacion = 'CONFIRMADO'
-      `);
-      totalAlmacenes = ta[0].total;
-    } catch (e) {
-      totalAlmacenes = 0;
+    if (schemaCaps.almacenes.exists && !isSinSedeFilter && (effectiveCampIds === null || effectiveCampIds.length > 0)) {
+      try {
+        const almCountConds = ['activo = 1'];
+        const almCountParams = [];
+        if (schemaCaps.almacenes.hasEsSintetico) {
+          almCountConds.push('es_sintetico = 0');
+        }
+        if (schemaCaps.almacenes.hasEstadoVerificacion) {
+          almCountConds.push("estado_verificacion = 'CONFIRMADO'");
+        }
+        if (effectiveCampIds !== null) {
+          almCountConds.push('campamento_id IN (?)');
+          almCountParams.push(effectiveCampIds);
+        }
+        if (reqAlmId) {
+          almCountConds.push('id = ?');
+          almCountParams.push(reqAlmId);
+        }
+        const [ta] = await db.query(
+          `SELECT COUNT(*) as total FROM inv_almacenes WHERE ${almCountConds.join(' AND ')}`,
+          almCountParams
+        );
+        totalAlmacenes = Number(ta[0]?.total || 0);
+      } catch (almErr) {
+        console.error('KPI totalAlmacenes error:', almErr?.message || almErr);
+        totalAlmacenes = 0;
+      }
     }
 
     // 6. Artículos sin serial identificable (Condición SQL unificada)
@@ -672,8 +2153,9 @@ router.get('/dashboard/kpis', requireAuth, async (req, res) => {
         SELECT COUNT(*) as total FROM inv_articulos
         ${whereArt} AND ${SQL_SIN_SERIAL_CONDITION}
       `, paramsArt);
-      articulosSinSerial = sinSerRes[0].total;
-    } catch (e) {
+      articulosSinSerial = Number(sinSerRes[0]?.total || 0);
+    } catch (sinSerErr) {
+      console.error('KPI articulosSinSerial error:', sinSerErr?.message || sinSerErr);
       articulosSinSerial = 0;
     }
 
@@ -684,28 +2166,43 @@ router.get('/dashboard/kpis', requireAuth, async (req, res) => {
         SELECT COUNT(*) as total FROM inv_articulos
         ${whereArt} AND (cantidad_num IS NULL OR cantidad_verificada = 0 OR estado_fisico = 'Pendiente de verificación')
       `, paramsArt);
-      articulosPendientesVerificacion = pendRes[0].total;
-    } catch (e) {
+      articulosPendientesVerificacion = Number(pendRes[0]?.total || 0);
+    } catch (pendErr) {
+      console.error('KPI articulosPendientesVerificacion error:', pendErr?.message || pendErr);
       articulosPendientesVerificacion = 0;
     }
 
-    // 8. Levantamientos: en proceso y finalizados (excluyendo sintéticos por defecto)
+    // 8. Levantamientos: en proceso y finalizados (acotado por scope y filtro territorial)
     let levantamientosEnProceso = 0;
     let levantamientosFinalizados = 0;
-    try {
-      const levSyntFilter = includeSynthetic ? '' : 'WHERE es_sintetico = 0';
-      const [lCounts] = await db.query(`
-        SELECT
-          SUM(CASE WHEN estado NOT IN ('Finalizado', 'Cancelado') THEN 1 ELSE 0 END) as en_proceso,
-          SUM(CASE WHEN estado = 'Finalizado' THEN 1 ELSE 0 END) as finalizados
-        FROM inv_levantamientos
-        ${levSyntFilter}
-      `);
-      levantamientosEnProceso = parseInt(lCounts[0]?.en_proceso || 0);
-      levantamientosFinalizados = parseInt(lCounts[0]?.finalizados || 0);
-    } catch (e) {
-      levantamientosEnProceso = 0;
-      levantamientosFinalizados = 0;
+    if (schemaCaps.levantamientos.exists && !isSinSedeFilter && (effectiveCampIds === null || effectiveCampIds.length > 0)) {
+      try {
+        const levConds = [];
+        const levParams = [];
+        if (!includeSynthetic && schemaCaps.levantamientos.hasEsSintetico) levConds.push('es_sintetico = 0');
+        if (effectiveCampIds !== null) {
+          levConds.push('campamento_id IN (?)');
+          levParams.push(effectiveCampIds);
+        }
+        if (reqAlmId) {
+          levConds.push('almacen_id = ?');
+          levParams.push(reqAlmId);
+        }
+        const levWhere = levConds.length > 0 ? `WHERE ${levConds.join(' AND ')}` : '';
+        const [lCounts] = await db.query(`
+          SELECT
+            SUM(CASE WHEN ${levOpenCond} THEN 1 ELSE 0 END) as en_proceso,
+            SUM(CASE WHEN estado = 'Finalizado' THEN 1 ELSE 0 END) as finalizados
+          FROM inv_levantamientos
+          ${levWhere}
+        `, levParams);
+        levantamientosEnProceso = parseInt(lCounts[0]?.en_proceso || 0);
+        levantamientosFinalizados = parseInt(lCounts[0]?.finalizados || 0);
+      } catch (levErr) {
+        console.error('KPI levantamientos count error:', levErr?.message || levErr);
+        levantamientosEnProceso = 0;
+        levantamientosFinalizados = 0;
+      }
     }
 
     // 9. Quantities grouped by unit of measure
@@ -748,26 +2245,29 @@ router.get('/dashboard/kpis', requireAuth, async (req, res) => {
       FROM inv_movimientos m
       JOIN inv_articulos a ON m.articulo_id = a.id
     `;
-    const movConds = [];
+    const movConds = ['a.activo = 1'];
     const movParams = [];
     if (!includeSynthetic) {
       movConds.push('m.es_sintetico = 0 AND a.es_sintetico = 0');
     }
     if (!scope.isGlobal) {
-      if (scope.campamentoNombres.length > 0 || scope.campamentoIds.length > 0) {
-        const subConds = [];
-        if (scope.campamentoIds.length > 0) {
-          subConds.push('a.campamento_id IN (?)');
-          movParams.push(scope.campamentoIds);
-        }
-        if (scope.campamentoNombres.length > 0) {
-          subConds.push('m.ubicacion_origen IN (?) OR m.ubicacion_destino IN (?) OR a.ubicacion_nombre IN (?)');
-          movParams.push(scope.campamentoNombres, scope.campamentoNombres, scope.campamentoNombres);
-        }
-        movConds.push(`(${subConds.join(' OR ')})`);
+      if (selectedCid) {
+        movConds.push('a.campamento_id = ?');
+        movParams.push(selectedCid);
       } else {
-        movConds.push('1 = 0');
+        const movScope = buildArticleScopeFilter(scope, 'a');
+        movConds.push(movScope.sql);
+        movParams.push(...movScope.params);
       }
+    } else if (isSinSedeFilter) {
+      movConds.push('a.campamento_id IS NULL');
+    } else if (selectedCid) {
+      movConds.push('a.campamento_id = ?');
+      movParams.push(selectedCid);
+    }
+    if (reqAlmId) {
+      movConds.push('a.almacen_id = ?');
+      movParams.push(reqAlmId);
     }
     if (movConds.length > 0) {
       movQuery += ` WHERE ${movConds.join(' AND ')}`;
@@ -783,28 +2283,35 @@ router.get('/dashboard/kpis', requireAuth, async (req, res) => {
     let levantamientosResumen = [];
 
     try {
-      let campWhere = "WHERE c.activo = 1 AND c.clasificacion_sede = 'CONFIRMADO'";
-      if (!includeSynthetic) {
-        campWhere += ' AND c.es_sintetico = 0';
+      const campConds = ['c.activo = 1'];
+      if (schemaCaps.campamentos.hasClasificacionSede) {
+        campConds.push("c.clasificacion_sede = 'CONFIRMADO'");
+      }
+      if (!includeSynthetic && schemaCaps.campamentos.hasEsSintetico) {
+        campConds.push('c.es_sintetico = 0');
       }
       const campParams = [];
-      if (!scope.isGlobal) {
-        if (scope.campamentoIds.length > 0) {
-          campWhere += ' AND c.id IN (?)';
-          campParams.push(scope.campamentoIds);
+      if (isSinSedeFilter) {
+        campConds.push('1 = 0');
+      } else if (effectiveCampIds !== null) {
+        if (effectiveCampIds.length > 0) {
+          campConds.push('c.id IN (?)');
+          campParams.push(effectiveCampIds);
         } else {
-          campWhere += ' AND 1 = 0';
+          campConds.push('1 = 0');
         }
       }
+      const campWhere = `WHERE ${campConds.join(' AND ')}`;
 
       const artSyntJoin = includeSynthetic ? '' : 'AND a.es_sintetico = 0';
-      const levSyntSub = includeSynthetic ? '' : 'AND es_sintetico = 0';
+      const almSyntSub = (!includeSynthetic && schemaCaps.almacenes.hasEsSintetico) ? 'AND es_sintetico = 0' : '';
+      const levSyntSub = (!includeSynthetic && schemaCaps.levantamientos.hasEsSintetico) ? 'AND es_sintetico = 0' : '';
 
       const [cRes] = await db.query(`
         SELECT
           c.id, c.nombre, c.codigo, c.provincia, c.direccion, c.responsable,
           c.clasificacion_sede, c.ubicacion_historica_equivalente, c.origen_registro,
-          (SELECT COUNT(*) FROM inv_almacenes WHERE campamento_id = c.id AND activo = 1 ${includeSynthetic ? '' : 'AND es_sintetico = 0'}) as cantidad_almacenes,
+          (SELECT COUNT(*) FROM inv_almacenes WHERE campamento_id = c.id AND activo = 1 ${almSyntSub}) as cantidad_almacenes,
           COUNT(a.id) as total_articulos,
           SUM(COALESCE(a.cantidad_num, 0)) as total_fisico,
           SUM(CASE WHEN a.id IS NOT NULL AND (a.cantidad_num IS NULL OR a.cantidad_verificada = 0) THEN 1 ELSE 0 END) as articulos_sin_cantidad,
@@ -819,7 +2326,7 @@ router.get('/dashboard/kpis', requireAuth, async (req, res) => {
           SUM(CASE WHEN a.estado_fisico = 'Pendiente de verificación' THEN 1 ELSE 0 END) as estado_pendiente,
           SUM(CASE WHEN a.id IS NOT NULL AND (a.estado_fisico = 'Pendiente de verificación' OR a.cantidad_num IS NULL OR a.cantidad_verificada = 0) THEN 1 ELSE 0 END) as pendientes_verificacion,
           SUM(CASE WHEN a.id IS NOT NULL AND (a.serie_imei IS NULL OR TRIM(a.serie_imei) = '' OR UPPER(TRIM(a.serie_imei)) IN ('N/A', 'S/N', 'SIN SERIAL', 'NO APLICA', 'NONE', '-')) THEN 1 ELSE 0 END) as sin_serie,
-          (SELECT COUNT(*) FROM inv_levantamientos WHERE campamento_id = c.id AND estado NOT IN ('Finalizado', 'Cancelado') ${levSyntSub}) as levantamientos_abiertos,
+          (SELECT COUNT(*) FROM inv_levantamientos WHERE campamento_id = c.id AND ${levOpenCond} ${levSyntSub}) as levantamientos_abiertos,
           (SELECT COUNT(*) FROM inv_levantamientos WHERE campamento_id = c.id AND estado = 'Finalizado' ${levSyntSub}) as levantamientos_finalizados
         FROM inv_campamentos c
         LEFT JOIN inv_articulos a ON a.campamento_id = c.id AND a.activo = 1 ${artSyntJoin}
@@ -851,105 +2358,95 @@ router.get('/dashboard/kpis', requireAuth, async (req, res) => {
         levantamientos_finalizados: parseInt(r.levantamientos_finalizados || 0)
       }));
 
-      // 13.1. SECCIÓN SIN SEDE VERIFICADA (TAREA 5: Artículos con sede ambigua o pendiente de clasificación, ej. KM 19 AUT DUARTE)
+      // 13.1. SECCIÓN SIN SEDE VERIFICADA (solo global, calculado dinámicamente desde inv_articulos)
       if (scope.isGlobal) {
-        const [sinSedeRows] = await db.query(`
-          SELECT
-            COUNT(*) as total_articulos,
-            SUM(COALESCE(cantidad_num, 0)) as total_fisico,
-            SUM(CASE WHEN cantidad_num IS NULL OR cantidad_verificada = 0 THEN 1 ELSE 0 END) as articulos_sin_cantidad,
-            SUM(CASE WHEN area = 'INFORMATICA' THEN 1 ELSE 0 END) as dep_informatica,
-            SUM(CASE WHEN area = 'OFICINAS' THEN 1 ELSE 0 END) as dep_oficinas,
-            SUM(CASE WHEN area = 'COCINA' THEN 1 ELSE 0 END) as dep_cocina,
-            SUM(CASE WHEN area = 'ALMACEN' THEN 1 ELSE 0 END) as dep_almacen,
-            SUM(CASE WHEN estado_fisico = 'Bueno' THEN 1 ELSE 0 END) as buenos,
-            SUM(CASE WHEN estado_fisico = 'Regular' THEN 1 ELSE 0 END) as regulares,
-            SUM(CASE WHEN estado_fisico = 'Dañado' THEN 1 ELSE 0 END) as danados,
-            SUM(CASE WHEN estado_fisico = 'Fuera de servicio' THEN 1 ELSE 0 END) as fuera_servicio,
-            SUM(CASE WHEN estado_fisico = 'Pendiente de verificación' THEN 1 ELSE 0 END) as estado_pendiente,
-            SUM(CASE WHEN estado_fisico = 'Pendiente de verificación' OR cantidad_num IS NULL OR cantidad_verificada = 0 THEN 1 ELSE 0 END) as pendientes_verificacion,
-            SUM(CASE WHEN ${SQL_SIN_SERIAL_CONDITION} THEN 1 ELSE 0 END) as sin_serie
-          FROM inv_articulos
-          WHERE activo = 1 AND campamento_id IS NULL ${includeSynthetic ? '' : 'AND es_sintetico = 0'}
-        `);
-        const sr = sinSedeRows[0] || {};
-        sinSedeVerificada = {
-          id: 'SIN_SEDE',
-          nombre: 'SIN SEDE VERIFICADA (PENDIENTE DE CLASIFICACIÓN)',
-          codigo: 'PEND-SEDE',
-          ubicacion_historica: 'KM 19 AUT DUARTE',
-          motivo: 'Ubicación histórica general en hojas INFORMATICA (61) y OFICINAS (43). Prohibido reasignar automáticamente a OPL o Mantenimiento 633 sin confirmación individual.',
-          cantidad_almacenes: null,
-          total_articulos: parseInt(sr.total_articulos || 0),
-          total_fisico: parseFloat(sr.total_fisico || 0),
-          articulos_sin_cantidad: parseInt(sr.articulos_sin_cantidad || 0),
-          por_departamento: {
-            INFORMATICA: parseInt(sr.dep_informatica || 0),
-            OFICINAS: parseInt(sr.dep_oficinas || 0),
-            COCINA: parseInt(sr.dep_cocina || 0),
-            ALMACEN: parseInt(sr.dep_almacen || 0)
-          },
-          buenos: parseInt(sr.buenos || 0),
-          regulares: parseInt(sr.regulares || 0),
-          danados: parseInt(sr.danados || 0),
-          fuera_servicio: parseInt(sr.fuera_servicio || 0),
-          estado_pendiente: parseInt(sr.estado_pendiente || 0),
-          pendientes_verificacion: parseInt(sr.pendientes_verificacion || 0),
-          sin_serie: parseInt(sr.sin_serie || 0),
-          levantamientos_abiertos: 0,
-          levantamientos_finalizados: 0
-        };
+        sinSedeVerificada = await buildSinSedeSummary(db, includeSynthetic);
 
         // 13.2. Campamentos registrados en BD pero pendientes de validación (San Cristóbal, Azua, Pedernales)
-        const [pendCamps] = await db.query(`
-          SELECT c.id, c.nombre, c.codigo, c.provincia, c.responsable, c.clasificacion_sede, c.origen_registro,
-            (SELECT COUNT(*) FROM inv_almacenes WHERE campamento_id = c.id AND activo = 1 AND es_sintetico = 0) as cantidad_almacenes
-          FROM inv_campamentos c
-          WHERE c.activo = 1 AND c.clasificacion_sede = 'PENDIENTE_VALIDACION' AND c.es_sintetico = 0
-          ORDER BY c.id ASC
-        `);
-        campamentosPendientesValidacion = pendCamps.map(pc => ({
-          ...pc,
-          estado_inventario: 'SIN VINCULAR / PENDIENTE DE VALIDACIÓN FÍSICA (No respaldado en Excel 16-Oct-2026)'
-        }));
+        if (schemaCaps.campamentos.hasClasificacionSede && pendingClasificaciones.length > 0) {
+          const [pendCamps] = await db.query(`
+            SELECT c.id, c.nombre, c.codigo, c.provincia, c.responsable, c.clasificacion_sede, c.origen_registro,
+              (SELECT COUNT(*) FROM inv_almacenes WHERE campamento_id = c.id AND activo = 1 ${schemaCaps.almacenes.hasEsSintetico ? 'AND es_sintetico = 0' : ''}) as cantidad_almacenes
+            FROM inv_campamentos c
+            WHERE c.activo = 1 AND c.clasificacion_sede IN (?) ${schemaCaps.campamentos.hasEsSintetico ? 'AND c.es_sintetico = 0' : ''}
+            ORDER BY c.id ASC
+          `, [pendingClasificaciones]);
+          campamentosPendientesValidacion = pendCamps.map(pc => ({
+            ...pc,
+            estado_inventario: 'SIN VINCULAR / PENDIENTE DE VALIDACIÓN FÍSICA (No respaldado en Excel 16-Oct-2026)'
+          }));
+        }
       }
     } catch (e) {
       console.error('Error calculando inventario por campamento:', e);
       porCampamento = [];
     }
 
-    try {
-      const almSyntFilter = includeSynthetic ? '' : 'AND a.es_sintetico = 0';
-      const artSyntFilter = includeSynthetic ? '' : 'AND art.es_sintetico = 0';
-      const [aRes] = await db.query(`
-        SELECT a.id, a.nombre, a.campamento_id, a.estado_verificacion, c.nombre as campamento_nombre,
-               COUNT(art.id) as total_articulos,
-               SUM(COALESCE(art.cantidad_num, 0)) as total_fisico
-        FROM inv_almacenes a
-        LEFT JOIN inv_campamentos c ON a.campamento_id = c.id
-        LEFT JOIN inv_articulos art ON (art.almacen_id = a.id) AND art.activo = 1 ${artSyntFilter}
-        WHERE a.activo = 1 ${almSyntFilter}
-        GROUP BY a.id, a.nombre, a.campamento_id, a.estado_verificacion, c.nombre
-        ORDER BY total_articulos DESC, a.id ASC
-      `);
-      porAlmacen = aRes;
-    } catch (e) {
-      porAlmacen = [];
+    if (schemaCaps.almacenes.exists && !isSinSedeFilter && (effectiveCampIds === null || effectiveCampIds.length > 0)) {
+      try {
+        const artSyntFilter = includeSynthetic ? '' : 'AND art.es_sintetico = 0';
+        const almWhereConds = ['a.activo = 1'];
+        const almWhereParams = [];
+        if (!includeSynthetic && schemaCaps.almacenes.hasEsSintetico) almWhereConds.push('a.es_sintetico = 0');
+        if (effectiveCampIds !== null) {
+          almWhereConds.push('a.campamento_id IN (?)');
+          almWhereParams.push(effectiveCampIds);
+        }
+        if (reqAlmId) {
+          almWhereConds.push('a.id = ?');
+          almWhereParams.push(reqAlmId);
+        }
+        const almEstadoSelect = schemaCaps.almacenes.hasEstadoVerificacion
+          ? 'a.estado_verificacion'
+          : "'CONFIRMADO' as estado_verificacion";
+        const almEstadoGroup = schemaCaps.almacenes.hasEstadoVerificacion
+          ? ', a.estado_verificacion'
+          : '';
+        const [aRes] = await db.query(`
+          SELECT a.id, a.nombre, a.campamento_id, ${almEstadoSelect}, c.nombre as campamento_nombre,
+                 COUNT(art.id) as total_articulos,
+                 SUM(COALESCE(art.cantidad_num, 0)) as total_fisico
+          FROM inv_almacenes a
+          LEFT JOIN inv_campamentos c ON a.campamento_id = c.id
+          LEFT JOIN inv_articulos art ON (art.almacen_id = a.id) AND art.activo = 1 ${artSyntFilter}
+          WHERE ${almWhereConds.join(' AND ')}
+          GROUP BY a.id, a.nombre, a.campamento_id${almEstadoGroup}, c.nombre
+          ORDER BY total_articulos DESC, a.id ASC
+        `, almWhereParams);
+        porAlmacen = aRes;
+      } catch (almListErr) {
+        console.error('KPI porAlmacen error:', almListErr?.message || almListErr);
+        porAlmacen = [];
+      }
     }
 
-    try {
-      const levSyntFilter = includeSynthetic ? '' : 'WHERE l.es_sintetico = 0';
-      const [lRes] = await db.query(`
-        SELECT l.id, l.codigo_levantamiento, l.titulo, l.estado, c.nombre as campamento_nombre,
-               (SELECT COUNT(*) FROM inv_levantamiento_items WHERE levantamiento_id = l.id) as items_capturados
-        FROM inv_levantamientos l
-        JOIN inv_campamentos c ON l.campamento_id = c.id
-        ${levSyntFilter}
-        ORDER BY l.id DESC LIMIT 5
-      `);
-      levantamientosResumen = lRes;
-    } catch (e) {
-      levantamientosResumen = [];
+    if (schemaCaps.levantamientos.exists && !isSinSedeFilter && (effectiveCampIds === null || effectiveCampIds.length > 0)) {
+      try {
+        const levSumConds = [];
+        const levSumParams = [];
+        if (!includeSynthetic && schemaCaps.levantamientos.hasEsSintetico) levSumConds.push('l.es_sintetico = 0');
+        if (effectiveCampIds !== null) {
+          levSumConds.push('l.campamento_id IN (?)');
+          levSumParams.push(effectiveCampIds);
+        }
+        if (reqAlmId) {
+          levSumConds.push('l.almacen_id = ?');
+          levSumParams.push(reqAlmId);
+        }
+        const levSumWhere = levSumConds.length > 0 ? `WHERE ${levSumConds.join(' AND ')}` : '';
+        const [lRes] = await db.query(`
+          SELECT l.id, l.codigo_levantamiento, l.titulo, l.estado, c.nombre as campamento_nombre,
+                 (SELECT COUNT(*) FROM inv_levantamiento_items WHERE levantamiento_id = l.id) as items_capturados
+          FROM inv_levantamientos l
+          JOIN inv_campamentos c ON l.campamento_id = c.id
+          ${levSumWhere}
+          ORDER BY l.id DESC LIMIT 5
+        `, levSumParams);
+        levantamientosResumen = lRes;
+      } catch (levListErr) {
+        console.error('KPI levantamientosResumen error:', levListErr?.message || levListErr);
+        levantamientosResumen = [];
+      }
     }
 
     // 14. Consistencia Matemática Global (Tarea 6)
@@ -962,32 +2459,60 @@ router.get('/dashboard/kpis', requireAuth, async (req, res) => {
       totalGeneralArticulos: sumaArticulosCampamentosConfirmados + articulosSinSedeCount,
       sumaArticulosCampamentosConfirmados,
       articulosSinSedeVerificada: articulosSinSedeCount,
-      cuadraArticulos: (!campamento_id || campamento_id === 'TODOS')
+      cuadraArticulos: (selectedCid === null && !isSinSedeFilter)
         ? (totalArticulos === sumaArticulosCampamentosConfirmados + articulosSinSedeCount)
         : true,
       totalUnidadesFisicasConocidas: sumaUnidadesCampamentosConfirmados + unidadesSinSedeCount,
       sumaUnidadesCampamentosConfirmados,
       unidadesSinSedeVerificada: unidadesSinSedeCount,
-      cuadraUnidades: (!campamento_id || campamento_id === 'TODOS')
+      cuadraUnidades: (selectedCid === null && !isSinSedeFilter)
         ? (Math.abs(cantidadFisicaTotal - (sumaUnidadesCampamentosConfirmados + unidadesSinSedeCount)) < 0.01)
         : true,
       totalArticulosCantidadPendiente: articulosSinCantidad,
       totalArticulosEstadoPendiente: articulosEstadoPendiente
     };
 
-    // 15. Resumen de Capa Sintética Aislada (Tarea 7)
+    // 15. Resumen de Capa Sintética Aislada (acotado por scope)
     let resumenSinteticos = { articulos: 0, campamentos: totalCampamentosSinteticos, almacenes: 0, levantamientos: 0 };
-    try {
-      const [[sArt]] = await db.query('SELECT COUNT(*) as c FROM inv_articulos WHERE activo = 1 AND es_sintetico = 1');
-      const [[sAlm]] = await db.query('SELECT COUNT(*) as c FROM inv_almacenes WHERE activo = 1 AND es_sintetico = 1');
-      const [[sLev]] = await db.query('SELECT COUNT(*) as c FROM inv_levantamientos WHERE es_sintetico = 1');
-      resumenSinteticos = {
-        articulos: sArt?.c || 0,
-        campamentos: totalCampamentosSinteticos,
-        almacenes: sAlm?.c || 0,
-        levantamientos: sLev?.c || 0
-      };
-    } catch (e) {}
+    if (!isSinSedeFilter && (effectiveCampIds === null || effectiveCampIds.length > 0)) {
+      try {
+        if (scope.isGlobal && effectiveCampIds === null) {
+          const [[sArt]] = await db.query('SELECT COUNT(*) as c FROM inv_articulos WHERE activo = 1 AND es_sintetico = 1');
+          const sAlm = (schemaCaps.almacenes.exists && schemaCaps.almacenes.hasEsSintetico)
+            ? (await db.query('SELECT COUNT(*) as c FROM inv_almacenes WHERE activo = 1 AND es_sintetico = 1'))[0][0]
+            : { c: 0 };
+          const sLev = (schemaCaps.levantamientos.exists && schemaCaps.levantamientos.hasEsSintetico)
+            ? (await db.query('SELECT COUNT(*) as c FROM inv_levantamientos WHERE es_sintetico = 1'))[0][0]
+            : { c: 0 };
+          resumenSinteticos = {
+            articulos: sArt?.c || 0,
+            campamentos: totalCampamentosSinteticos,
+            almacenes: sAlm?.c || 0,
+            levantamientos: sLev?.c || 0
+          };
+        } else if (effectiveCampIds && effectiveCampIds.length > 0) {
+          const [[sArt]] = await db.query(
+            'SELECT COUNT(*) as c FROM inv_articulos WHERE activo = 1 AND es_sintetico = 1 AND campamento_id IN (?)',
+            [effectiveCampIds]
+          );
+          const sAlm = (schemaCaps.almacenes.exists && schemaCaps.almacenes.hasEsSintetico)
+            ? (await db.query('SELECT COUNT(*) as c FROM inv_almacenes WHERE activo = 1 AND es_sintetico = 1 AND campamento_id IN (?)', [effectiveCampIds]))[0][0]
+            : { c: 0 };
+          const sLev = (schemaCaps.levantamientos.exists && schemaCaps.levantamientos.hasEsSintetico)
+            ? (await db.query('SELECT COUNT(*) as c FROM inv_levantamientos WHERE es_sintetico = 1 AND campamento_id IN (?)', [effectiveCampIds]))[0][0]
+            : { c: 0 };
+          resumenSinteticos = {
+            articulos: sArt?.c || 0,
+            campamentos: totalCampamentosSinteticos,
+            almacenes: sAlm?.c || 0,
+            levantamientos: sLev?.c || 0
+          };
+        }
+      } catch (synthErr) {
+        console.error('KPI resumenSinteticos error:', synthErr?.message || synthErr);
+        resumenSinteticos = { articulos: 0, campamentos: totalCampamentosSinteticos, almacenes: 0, levantamientos: 0 };
+      }
+    }
 
     res.json({
       success: true,
@@ -1039,20 +2564,22 @@ const AREA_PREFIX_MAP = {
   'COCINA': 'COC'
 };
 
-async function generateNextCodeForArea(db, area) {
+async function generateNextCodeForArea(dbOrConn, area, options = {}) {
+  const { forUpdate = false } = options;
+  const lockSuffix = forUpdate ? ' FOR UPDATE' : '';
   const normArea = (area || 'ALMACEN').toUpperCase().trim();
   const prefix = AREA_PREFIX_MAP[normArea] || 'ACT';
 
   // Buscar códigos existentes en inv_articulos que comiencen con el prefijo
-  const [rows] = await db.query(
-    'SELECT codigo_original FROM inv_articulos WHERE codigo_original LIKE ?',
+  const [rows] = await dbOrConn.query(
+    `SELECT codigo_original FROM inv_articulos WHERE codigo_original LIKE ?${lockSuffix}`,
     [`${prefix}%`]
   );
 
   let maxNum = 0;
   for (const r of rows) {
     if (!r.codigo_original) continue;
-    const matches = r.codigo_original.match(/\d+/g);
+    const matches = String(r.codigo_original).match(/\d+/g);
     if (matches) {
       for (const m of matches) {
         const num = parseInt(m, 10);
@@ -1065,13 +2592,13 @@ async function generateNextCodeForArea(db, area) {
 
   // Comprobar también en levantamientos activos para evitar colisiones
   try {
-    const [auditRows] = await db.query(
-      'SELECT codigo_original FROM inv_levantamiento_items WHERE codigo_original LIKE ?',
+    const [auditRows] = await dbOrConn.query(
+      `SELECT codigo_original FROM inv_levantamiento_items WHERE codigo_original LIKE ?${lockSuffix}`,
       [`${prefix}%`]
     );
     for (const r of auditRows) {
       if (!r.codigo_original) continue;
-      const matches = r.codigo_original.match(/\d+/g);
+      const matches = String(r.codigo_original).match(/\d+/g);
       if (matches) {
         for (const m of matches) {
           const num = parseInt(m, 10);
@@ -1081,20 +2608,26 @@ async function generateNextCodeForArea(db, area) {
         }
       }
     }
-  } catch (e) {
-    // Si no está disponible la tabla, continuar
+  } catch (err) {
+    if (err?.code !== 'ER_NO_SUCH_TABLE') {
+      console.warn('[CODES] Error consultando inv_levantamiento_items:', err?.message || err);
+    }
   }
 
   let nextNum = maxNum + 1;
   let candidate = `${prefix}-${String(nextNum).padStart(3, '0')}`;
 
-  // Verificar que el candidato no exista previamente
+  // Verificar que el candidato no exista previamente ni en maestro ni en levantamientos
   while (true) {
-    const [check] = await db.query(
-      'SELECT id FROM inv_articulos WHERE codigo_original = ? LIMIT 1',
-      [candidate]
+    const [checkMaster] = await dbOrConn.query(
+      `SELECT id FROM inv_articulos WHERE UPPER(TRIM(codigo_original)) = ? LIMIT 1${lockSuffix}`,
+      [candidate.toUpperCase()]
     );
-    if (check.length === 0) break;
+    const [checkLev] = await dbOrConn.query(
+      `SELECT id FROM inv_levantamiento_items WHERE UPPER(TRIM(codigo_original)) = ? LIMIT 1${lockSuffix}`,
+      [candidate.toUpperCase()]
+    );
+    if (checkMaster.length === 0 && checkLev.length === 0) break;
     nextNum++;
     candidate = `${prefix}-${String(nextNum).padStart(3, '0')}`;
   }
@@ -1107,10 +2640,10 @@ async function generateNextCodeForArea(db, area) {
   };
 }
 
-router.get('/articulos/next-code', requireAuth, async (req, res) => {
+router.get('/articulos/next-code', requireAuth, requirePermission('inv:crear'), async (req, res) => {
   try {
     const db = getPool();
-    const { area } = req.query;
+    const area = asNonEmptyString(req.query.area);
     if (!area) {
       return res.status(400).json({ success: false, message: 'El parámetro área es obligatorio.' });
     }
@@ -1128,6 +2661,7 @@ router.get('/articulos/next-code', requireAuth, async (req, res) => {
 router.get('/articulos', requireAuth, requirePermission('inv:ver'), async (req, res) => {
   try {
     const db = getPool();
+    const schemaCaps = await getSchemaCapabilities(db);
     const scope = await getUserAllowedCampamentos(db, req.user);
     const {
       area,
@@ -1137,8 +2671,6 @@ router.get('/articulos', requireAuth, requirePermission('inv:ver'), async (req, 
       search,
       sinSerial,
       sinCantidad,
-      sinSede,
-      campamento_id,
       incluir_sinteticos,
       page = 1,
       limit = 50,
@@ -1153,81 +2685,71 @@ router.get('/articulos', requireAuth, requirePermission('inv:ver'), async (req, 
     }
     const params = [];
 
+    const campFilter = await resolveRequestedCampamentoFilter(db, scope, req.query);
+    if (campFilter.errorStatus) {
+      return res.status(campFilter.errorStatus).json({ success: false, message: campFilter.errorMessage });
+    }
+    const { isSinSedeReq, selectedCid } = campFilter;
+
     // Ámbito de campamentos / sedes permitidas
     if (!scope.isGlobal) {
-      if (campamento_id === 'SIN_SEDE' || sinSede === 'true') {
-        return res.status(403).json({
-          success: false,
-          message: 'Acceso denegado: Solo el Desarrollador Principal o perfiles globales pueden consultar artículos sin sede verificada.'
-        });
-      }
-      if (campamento_id && campamento_id !== 'TODOS') {
-        const reqCid = parseInt(campamento_id);
-        if (!scope.campamentoIds.includes(reqCid)) {
-          return res.status(403).json({ success: false, message: 'Acceso denegado a la sede solicitada.' });
-        }
+      if (selectedCid !== null) {
         conditions.push('(a.campamento_id = ?)');
-        params.push(reqCid);
+        params.push(selectedCid);
       } else {
-        if (scope.campamentoIds.length > 0 && scope.campamentoNombres.length > 0) {
-          conditions.push('(a.campamento_id IN (?) OR a.ubicacion_nombre IN (?))');
-          params.push(scope.campamentoIds, scope.campamentoNombres);
-        } else if (scope.campamentoIds.length > 0) {
-          conditions.push('a.campamento_id IN (?)');
-          params.push(scope.campamentoIds);
-        } else if (scope.campamentoNombres.length > 0) {
-          conditions.push('a.ubicacion_nombre IN (?)');
-          params.push(scope.campamentoNombres);
-        } else {
-          conditions.push('1 = 0');
-        }
+        const scopeFilter = buildArticleScopeFilter(scope, 'a');
+        conditions.push(scopeFilter.sql);
+        params.push(...scopeFilter.params);
       }
-    } else {
-      if (campamento_id === 'SIN_SEDE' || sinSede === 'true') {
-        conditions.push('a.campamento_id IS NULL');
-      } else if (campamento_id && campamento_id !== 'TODOS') {
-        conditions.push('a.campamento_id = ?');
-        params.push(parseInt(campamento_id));
-      }
+    } else if (isSinSedeReq) {
+      conditions.push('a.campamento_id IS NULL');
+    } else if (selectedCid !== null) {
+      conditions.push('a.campamento_id = ?');
+      params.push(selectedCid);
     }
 
-    if (area && area !== 'TODOS') {
+    const areaParam = asNonEmptyString(area);
+    if (areaParam && areaParam.toUpperCase() !== 'TODOS') {
       conditions.push('a.area = ?');
-      params.push(area.toUpperCase());
+      params.push(areaParam.toUpperCase());
     }
 
-    if (categoria && categoria !== 'TODAS') {
+    const categoriaParam = asNonEmptyString(categoria);
+    if (categoriaParam && categoriaParam.toUpperCase() !== 'TODAS') {
       conditions.push('a.categoria = ?');
-      params.push(categoria);
+      params.push(categoriaParam);
     }
 
-    if (estado && estado !== 'TODOS') {
-      const normEstado = normalizeEstadoParam(estado);
+    const estadoParam = asNonEmptyString(estado);
+    if (estadoParam && estadoParam.toUpperCase() !== 'TODOS') {
+      const normEstado = normalizeEstadoParam(estadoParam);
       if (normEstado) {
         conditions.push('a.estado_fisico = ?');
         params.push(normEstado);
       }
     }
 
-    if (ubicacion && ubicacion !== 'TODAS') {
+    const ubicacionParam = asNonEmptyString(ubicacion);
+    if (ubicacionParam && ubicacionParam.toUpperCase() !== 'TODAS') {
       conditions.push('a.ubicacion_nombre = ?');
-      params.push(ubicacion);
+      params.push(ubicacionParam);
     }
 
     if (sinSerial === 'true') {
-      conditions.push(`(a.serie_imei IS NULL OR TRIM(a.serie_imei) = '' OR UPPER(TRIM(a.serie_imei)) IN ('N/A', 'S/N', 'SIN SERIE', 'NONE', 'NULL', '--', '-'))`);
+      conditions.push(buildSqlSinSerialCondition('a.serie_imei'));
     }
 
     if (sinCantidad === 'true') {
       conditions.push('(a.cantidad_num IS NULL OR a.cantidad_verificada = 0)');
     }
 
-    if (search && search.trim() !== '') {
-      const q = `%${search.trim()}%`;
+    const searchParam = asNonEmptyString(search);
+    if (searchParam) {
+      const q = `%${searchParam}%`;
       conditions.push(`(
         a.codigo_original LIKE ? OR
         a.articulo_nombre LIKE ? OR
-        a.marca_modelo LIKE ? OR
+        a.${schemaCaps.articulos.brandCol} LIKE ? OR
         a.serie_imei LIKE ? OR
         a.asignado_a LIKE ? OR
         a.ubicacion_nombre LIKE ? OR
@@ -1252,17 +2774,49 @@ router.get('/articulos', requireAuth, requirePermission('inv:ver'), async (req, 
     const totalUnidadesFisicas = parseFloat(countRows[0]?.total_unidades_fisicas || 0);
     const articulosSinCantidad = parseInt(countRows[0]?.articulos_sin_cantidad || 0);
 
-    // Sorting safe fields
-    const safeSortFields = ['id', 'codigo_original', 'articulo_nombre', 'categoria', 'area', 'estado_fisico', 'ubicacion_nombre', 'cantidad_num', 'asignado_a', 'creado_en', 'campamento_id'];
-    const safeSort = safeSortFields.includes(sortBy) ? `a.${sortBy}` : 'a.id';
-    const safeOrder = sortOrder.toUpperCase() === 'DESC' ? 'DESC' : 'ASC';
+    // Sorting safe fields (mapeo compatible MySQL 8 / respaldos históricos: fecha_creacion vs creado_en)
+    const sortColumnMap = {
+      id: 'a.id',
+      codigo_original: 'a.codigo_original',
+      articulo_nombre: 'a.articulo_nombre',
+      categoria: 'a.categoria',
+      area: 'a.area',
+      estado_fisico: 'a.estado_fisico',
+      ubicacion_nombre: 'a.ubicacion_nombre',
+      cantidad_num: 'a.cantidad_num',
+      asignado_a: 'a.asignado_a',
+      campamento_id: 'a.campamento_id',
+      fecha_creacion: `a.${schemaCaps.articulos.createdCol}`,
+      creado_en: `a.${schemaCaps.articulos.createdCol}`,
+      marca_modelo: `a.${schemaCaps.articulos.brandCol}`,
+      marca: `a.${schemaCaps.articulos.brandCol}`,
+      tipo_caracteristicas: `a.${schemaCaps.articulos.specCol}`,
+      modelo_caracteristicas: `a.${schemaCaps.articulos.specCol}`
+    };
+    const safeSort = (typeof sortBy === 'string' && Object.hasOwn(sortColumnMap, sortBy))
+      ? sortColumnMap[sortBy]
+      : 'a.id';
+    const safeOrder = typeof sortOrder === 'string' && sortOrder.toUpperCase() === 'DESC' ? 'DESC' : 'ASC';
+
+    const extraAliases = [];
+    if (schemaCaps.articulos.brandCol !== 'marca_modelo') {
+      extraAliases.push(`a.${schemaCaps.articulos.brandCol} as marca_modelo`);
+    }
+    if (schemaCaps.articulos.specCol !== 'tipo_caracteristicas') {
+      extraAliases.push(`a.${schemaCaps.articulos.specCol} as tipo_caracteristicas`);
+    }
+    if (schemaCaps.articulos.createdCol !== 'fecha_creacion' && schemaCaps.articulos.createdCol !== 'id') {
+      extraAliases.push(`a.${schemaCaps.articulos.createdCol} as fecha_creacion`);
+    }
+    const extraAliasSql = extraAliases.length > 0 ? `,\n             ${extraAliases.join(',\n             ')}` : '';
 
     // Pagination
-    const numLimit = Math.min(Math.max(parseInt(limit) || 50, 1), 500);
-    const offset = (Math.max(parseInt(page) || 1, 1) - 1) * numLimit;
+    const numLimit = sanitizeLimit(limit, 50, 500);
+    const numPage = sanitizePage(page);
+    const offset = (numPage - 1) * numLimit;
 
     const query = `
-      SELECT a.*,
+      SELECT a.*${extraAliasSql},
              COALESCE(c.nombre, 'SIN SEDE VERIFICADA (PENDIENTE DE CLASIFICACIÓN)') as campamento_nombre,
              c.codigo as campamento_codigo,
              c.clasificacion_sede as campamento_clasificacion,
@@ -1276,10 +2830,11 @@ router.get('/articulos', requireAuth, requirePermission('inv:ver'), async (req, 
     `;
 
     const [rows] = await db.query(query, [...params, numLimit, offset]);
+    const sanitizedRows = rows.map(sanitizeListArticleRow);
 
     res.json({
       success: true,
-      articulos: rows,
+      articulos: sanitizedRows,
       resumen: {
         totalRegistros: total,
         totalUnidadesFisicas,
@@ -1287,7 +2842,7 @@ router.get('/articulos', requireAuth, requirePermission('inv:ver'), async (req, 
       },
       pagination: {
         total,
-        page: parseInt(page) || 1,
+        page: numPage,
         limit: numLimit,
         totalPages: Math.ceil(total / numLimit)
       }
@@ -1301,23 +2856,35 @@ router.get('/articulos', requireAuth, requirePermission('inv:ver'), async (req, 
 router.get('/articulos/:id', requireAuth, requirePermission('inv:ver'), async (req, res) => {
   try {
     const db = getPool();
-    const [rows] = await db.query('SELECT * FROM inv_articulos WHERE id = ?', [req.params.id]);
+    const artId = parsePositiveInt(req.params.id);
+    if (!artId) {
+      return res.status(400).json({ success: false, message: 'ID de artículo inválido.' });
+    }
+
+    const [rows] = await db.query('SELECT * FROM inv_articulos WHERE id = ?', [artId]);
     if (rows.length === 0) {
       return res.status(404).json({ success: false, message: 'Artículo no encontrado.' });
     }
     const articulo = rows[0];
 
-    // Verificar ámbito de campamento
+    const perms = Array.isArray(req.user?.permisos) ? req.user.permisos : [];
+    const canSeeInactive = (
+      req.user.rol === 'developer' ||
+      req.user.es_developer === 1 ||
+      perms.includes('*') ||
+      perms.includes('aud:ver')
+    ) && req.query.incluir_inactivos === 'true';
+    if (articulo.activo !== 1 && !canSeeInactive) {
+      return res.status(404).json({ success: false, message: 'Artículo no encontrado.' });
+    }
+
+    // Verificar ámbito de campamento sin coincidencia parcial (.includes)
     const scope = await getUserAllowedCampamentos(db, req.user);
-    if (!scope.isGlobal) {
-      const campMatch = articulo.campamento_id && scope.campamentoIds.includes(articulo.campamento_id);
-      const nameMatch = articulo.ubicacion_nombre && scope.campamentoNombres.some(cn => articulo.ubicacion_nombre.toLowerCase().includes(cn.toLowerCase()));
-      if (!campMatch && !nameMatch) {
-        return res.status(403).json({
-          success: false,
-          message: 'Acceso denegado: El activo pertenece a otra sede o campamento no autorizado.'
-        });
-      }
+    if (!canAccessArticle(scope, articulo)) {
+      return res.status(403).json({
+        success: false,
+        message: 'Acceso denegado: El activo pertenece a otra sede o campamento no autorizado.'
+      });
     }
 
     // Get movement history
@@ -1327,7 +2894,7 @@ router.get('/articulos/:id', requireAuth, requirePermission('inv:ver'), async (r
        LEFT JOIN inv_usuarios u ON m.usuario_id = u.id
        WHERE m.articulo_id = ?
        ORDER BY m.fecha_movimiento DESC`,
-      [req.params.id]
+      [artId]
     );
 
     res.json({
@@ -1336,43 +2903,18 @@ router.get('/articulos/:id', requireAuth, requirePermission('inv:ver'), async (r
       historial_movimientos: movimientos
     });
   } catch (error) {
-    res.status(500).json({ success: false, message: 'Error obteniendo detalle del artículo.' });
+    console.error('Get articulo detail error:', error);
+    const status = isDbUnavailableError(error) ? 503 : 500;
+    res.status(status).json({ success: false, message: 'Error obteniendo detalle del artículo.' });
   }
 });
 
-// Helper para resolver vinculación inequívoca con campamentos confirmados (Tarea 4)
-function resolveCampamentoVinculacion(campamentoIdInput, ubicacionNombreInput) {
-  let cid = campamentoIdInput ? parseInt(campamentoIdInput) : null;
-  let aid = null;
-  let estadoVinc = 'SIN_VINCULAR';
-  const uUpper = String(ubicacionNombreInput || '').trim().toUpperCase();
-
-  if (cid === 3 || uUpper === 'ALMACÉN 27 DE FEBRERO' || uUpper === 'ALMACEN 27 DE FEBRERO' || uUpper === 'DISTRITO NACIONAL 27 DE FEBRERO' || uUpper.includes('27 DE FEBRERO')) {
-    cid = 3;
-    aid = 3;
-    estadoVinc = 'CONFIRMADO';
-  } else if (cid === 12 || uUpper === 'OPL' || uUpper === 'KM 19 AUTOPISTA DUARTE OPL' || uUpper.includes('DUARTE OPL')) {
-    cid = 12;
-    aid = 10;
-    estadoVinc = 'CONFIRMADO';
-  } else if (cid === 13 || uUpper === 'MANTENIMIENTO 633' || uUpper.includes('633')) {
-    cid = 13;
-    aid = 11;
-    estadoVinc = 'CONFIRMADO';
-  } else if (uUpper === 'KM 19 AUT DUARTE' || uUpper === 'KM 19 AUTOPISTA DUARTE') {
-    cid = null;
-    aid = null;
-    estadoVinc = 'SEDE_AMBIGUA';
-  } else if (cid) {
-    estadoVinc = 'CONFIRMADO';
-  }
-  return { campamento_id: cid, almacen_id: aid, estado_vinculacion_sede: estadoVinc };
-}
-
 // CREATE ITEM
 router.post('/articulos', requireAuth, requirePermission('inv:crear'), async (req, res) => {
+  const pool = getPool();
+  let conn = null;
+  let inTransaction = false;
   try {
-    const db = getPool();
     const {
       codigo_original,
       area,
@@ -1392,107 +2934,175 @@ router.post('/articulos', requireAuth, requirePermission('inv:crear'), async (re
       observaciones,
       campamento_id,
       es_sintetico
-    } = req.body;
+    } = req.body || {};
 
-    if (!area || !articulo_nombre || !ubicacion_nombre) {
+    if (
+      typeof area !== 'string' || !area.trim() ||
+      typeof articulo_nombre !== 'string' || !articulo_nombre.trim() ||
+      typeof ubicacion_nombre !== 'string' || !ubicacion_nombre.trim()
+    ) {
       return res.status(400).json({
         success: false,
         message: 'Área, descripción del artículo y ubicación son obligatorios.'
       });
     }
 
-    const vinc = resolveCampamentoVinculacion(campamento_id, ubicacion_nombre);
-
-    // Validación de ámbito de campamento
-    const scope = await getUserAllowedCampamentos(db, req.user);
-    if (!scope.isGlobal) {
-      const match = scope.campamentoNombres.some(cn => ubicacion_nombre.toLowerCase().includes(cn.toLowerCase())) ||
-                    (vinc.campamento_id && scope.campamentoIds.includes(vinc.campamento_id));
-      if (!match) {
-        return res.status(403).json({
-          success: false,
-          message: 'Acceso denegado: No tiene autorización para registrar artículos en esta sede.'
-        });
-      }
+    const normArea = area.trim().toUpperCase();
+    if (!VALID_INVENTARIO_AREAS.includes(normArea)) {
+      return res.status(400).json({
+        success: false,
+        message: `Área inválida. Valores permitidos: ${VALID_INVENTARIO_AREAS.join(', ')}.`
+      });
     }
 
-    let finalCodigo = (codigo_original || '').trim();
+    if (campamento_id !== undefined && campamento_id !== null && String(campamento_id).trim() !== '' && !parsePositiveInt(campamento_id)) {
+      return res.status(400).json({ success: false, message: 'ID de campamento inválido.' });
+    }
 
-    // 1. Validación o generación segura de Código de Referencia
+    let parsedCant = null;
+    if (cantidad_num !== undefined && cantidad_num !== null && String(cantidad_num).trim() !== '') {
+      const candidateCant = Number(cantidad_num);
+      if (!Number.isFinite(candidateCant) || candidateCant < 0) {
+        return res.status(400).json({ success: false, message: 'La cantidad debe ser un número válido mayor o igual a cero.' });
+      }
+      if (Number(candidateCant.toFixed(2)) !== candidateCant) {
+        return res.status(400).json({ success: false, message: 'La cantidad no puede tener más de 2 cifras decimales.' });
+      }
+      parsedCant = candidateCant;
+    }
+
+    conn = await pool.getConnection();
+    if (!conn) {
+      return res.status(503).json({ success: false, message: 'Servicio de base de datos no disponible temporalmente.' });
+    }
+    await conn.beginTransaction();
+    inTransaction = true;
+
+    // Validación estricta de ámbito de campamento destino (sin coincidencia parcial .includes)
+    const scope = await getUserAllowedCampamentos(conn, req.user);
+    if (!canTargetCampamento(scope, campamento_id, ubicacion_nombre)) {
+      inTransaction = false;
+      await safeRollback(conn);
+      return res.status(403).json({
+        success: false,
+        message: 'Acceso denegado: No tiene autorización para registrar artículos en esta sede.'
+      });
+    }
+
+    const vinc = await resolveCampamentoVinculacion(conn, campamento_id, ubicacion_nombre);
+    if (vinc.campamento_invalido) {
+      inTransaction = false;
+      await safeRollback(conn);
+      return res.status(400).json({
+        success: false,
+        message: 'El campamento seleccionado no existe o está inactivo.'
+      });
+    }
+
+    let finalCodigo = (typeof codigo_original === 'string' ? codigo_original : '').trim();
+
+    // 1. Validación o generación atómica FOR UPDATE de Código de Referencia (M07)
     if (finalCodigo !== '') {
-      const [existingCode] = await db.query(
-        'SELECT id, articulo_nombre FROM inv_articulos WHERE codigo_original = ? AND activo = 1 LIMIT 1',
-        [finalCodigo]
+      const [existingCode] = await conn.query(
+        'SELECT id, articulo_nombre FROM inv_articulos WHERE UPPER(TRIM(codigo_original)) = ? AND activo = 1 LIMIT 1 FOR UPDATE',
+        [finalCodigo.toUpperCase()]
       );
       if (existingCode.length > 0) {
+        inTransaction = false;
+        await safeRollback(conn);
         return res.status(409).json({
           success: false,
           message: `El código de referencia "${finalCodigo}" ya está asignado al activo "${existingCode[0].articulo_nombre}".`
         });
       }
     } else {
-      // Generación automática inteligente según el área
-      const autoGen = await generateNextCodeForArea(db, area);
+      const autoGen = await generateNextCodeForArea(conn, normArea, { forUpdate: true });
       finalCodigo = autoGen.nextCode;
     }
 
-    // 2. Registro dinámico de Categoría en inv_categorias si es nueva
-    if (categoria && categoria.trim() !== '' && categoria.trim() !== 'General') {
-      try {
-        await db.query(
-          'INSERT IGNORE INTO inv_categorias (area, nombre, activo) VALUES (?, ?, 1)',
-          [area.toUpperCase(), categoria.trim()]
-        );
-      } catch (e) {
-        // Ignorar si ya existe
+    // 2. Validación estricta de unicidad de Serie / IMEI real (excluye placeholders S/N, N/A, -, etc.)
+    const cleanSerie = typeof serie_imei === 'string' && serie_imei.trim() !== '' ? serie_imei.trim() : null;
+    const serialKey = normalizeSerialKey(cleanSerie);
+    if (serialKey) {
+      const [existingSerial] = await conn.query(
+        'SELECT id, codigo_original, articulo_nombre FROM inv_articulos WHERE activo = 1 AND UPPER(TRIM(serie_imei)) = ? LIMIT 1 FOR UPDATE',
+        [serialKey]
+      );
+      if (existingSerial.length > 0) {
+        inTransaction = false;
+        await safeRollback(conn);
+        return res.status(409).json({
+          success: false,
+          message: `El serial/IMEI "${cleanSerie}" ya se encuentra asignado al activo activo "${existingSerial[0].articulo_nombre}" (${existingSerial[0].codigo_original || `#${existingSerial[0].id}`}).`
+        });
       }
     }
 
-    // 3. Registro dinámico de Custodio en inv_custodios si es nuevo
-    if (asignado_a && asignado_a.trim() !== '' && asignado_a.trim() !== 'Sin asignar') {
+    // 3. Registro dinámico de Categoría en inv_categorias si es nueva
+    if (typeof categoria === 'string' && categoria.trim() !== '' && categoria.trim() !== 'General') {
       try {
-        await db.query(
+        await conn.query(
+          'INSERT IGNORE INTO inv_categorias (area, nombre, activo) VALUES (?, ?, 1)',
+          [normArea, categoria.trim()]
+        );
+      } catch (catErr) {
+        if (catErr?.code !== 'ER_NO_SUCH_TABLE') {
+          console.warn('[CATALOGOS] Error registrando categoría dinámica:', catErr?.message || catErr);
+        }
+      }
+    }
+
+    // 4. Registro dinámico de Custodio en inv_custodios si es nuevo
+    if (typeof asignado_a === 'string' && asignado_a.trim() !== '' && asignado_a.trim() !== 'Sin asignar') {
+      try {
+        await conn.query(
           'INSERT IGNORE INTO inv_custodios (nombre, activo) VALUES (?, 1)',
           [asignado_a.trim()]
         );
-      } catch (e) {
-        // Ignorar si ya existe
+      } catch (custErr) {
+        if (custErr?.code !== 'ER_NO_SUCH_TABLE') {
+          console.warn('[CATALOGOS] Error registrando custodio dinámico:', custErr?.message || custErr);
+        }
       }
     }
 
+    const schemaCaps = await getSchemaCapabilities(conn);
     const isSynt = (es_sintetico === true || es_sintetico === 1 || String(observaciones || '').includes('[REGISTRO SINTÉTICO')) ? 1 : 0;
-    const parsedCant = (cantidad_num === null || cantidad_num === '' || isNaN(Number(cantidad_num))) ? null : Number(cantidad_num);
     const cantVerif = parsedCant !== null ? 1 : 0;
+    const estadoCantidad = parsedCant !== null ? 'VERIFICADO' : 'PENDIENTE_VERIFICACION';
+    const estadoNormalizado = normalizeEstadoFisico(estado_fisico);
+    const cleanUbic = ubicacion_nombre.trim();
 
-    const [result] = await db.query(
+    const [result] = await conn.query(
       `INSERT INTO inv_articulos (
-        codigo_original, area, categoria, articulo_nombre, marca_modelo,
-        tipo_caracteristicas, serie_imei, propietario, asignado_a,
-        cantidad_num, cantidad_texto, cantidad_verificada, unidad_medida,
+        codigo_original, area, categoria, articulo_nombre, ${schemaCaps.articulos.brandCol},
+        ${schemaCaps.articulos.specCol}, serie_imei, propietario, asignado_a,
+        cantidad_num, cantidad_texto, cantidad_verificada, estado_cantidad, unidad_medida,
         estado_fisico, ubicacion_nombre, zona_estante, fecha_revision,
         observaciones, activo, hoja_origen, fila_origen, creado_por,
         campamento_id, almacen_id, es_sintetico, origen_datos, estado_vinculacion_sede
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, 0, ?, ?, ?, ?, ?, ?)`,
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, 0, ?, ?, ?, ?, ?, ?)`,
       [
         finalCodigo,
-        area.toUpperCase(),
-        categoria || 'General',
-        articulo_nombre,
+        normArea,
+        typeof categoria === 'string' && categoria.trim() ? categoria.trim() : 'General',
+        articulo_nombre.trim(),
         marca_modelo || null,
         tipo_caracteristicas || null,
-        serie_imei || null,
-        propietario,
-        asignado_a || null,
+        cleanSerie,
+        propietario || 'INGMELEC',
+        typeof asignado_a === 'string' && asignado_a.trim() ? asignado_a.trim() : null,
         parsedCant,
         parsedCant !== null ? String(parsedCant) : null,
         cantVerif,
-        unidad_medida,
-        normalizeEstadoFisico(estado_fisico),
-        ubicacion_nombre,
+        estadoCantidad,
+        unidad_medida || 'Unidad',
+        estadoNormalizado,
+        cleanUbic,
         zona_estante || null,
         fecha_revision || null,
         observaciones || null,
-        `CREADO_MANUAL_${area.toUpperCase()}`,
+        `CREADO_MANUAL_${normArea}`,
         req.user.id,
         vinc.campamento_id,
         vinc.almacen_id,
@@ -1504,64 +3114,83 @@ router.post('/articulos', requireAuth, requirePermission('inv:crear'), async (re
 
     const newId = result.insertId;
 
-    // Log movement ENTRADA
-    await db.query(
+    // Registrar movimiento ENTRADA respetando 0/NULL (A06: no fabricar 1 unidad cuando no existe)
+    await conn.query(
       `INSERT INTO inv_movimientos (
         articulo_id, tipo_movimiento, cantidad, unidad_medida,
         ubicacion_destino, custodio_destino, estado_nuevo, motivo, usuario_id, es_sintetico
       ) VALUES (?, 'ENTRADA', ?, ?, ?, ?, ?, 'Alta manual de inventario', ?, ?)`,
-      [newId, parsedCant || 1, unidad_medida, ubicacion_nombre, asignado_a || null, normalizeEstadoFisico(estado_fisico), req.user.id, isSynt]
+      [
+        newId,
+        parsedCant !== null ? parsedCant : 0,
+        unidad_medida || 'Unidad',
+        cleanUbic,
+        typeof asignado_a === 'string' && asignado_a.trim() ? asignado_a.trim() : null,
+        estadoNormalizado,
+        req.user.id,
+        isSynt
+      ]
     );
 
-    // Audit
-    await logAudit(db, {
+    // Audit inside transaction
+    await logAudit(conn, {
       usuario_id: req.user.id,
       usuario_nombre: req.user.nombre,
       accion: 'ALTA_ARTICULO',
       entidad: 'inv_articulos',
       entidad_id: newId,
-      detalles_nuevos: req.body,
+      detalles_nuevos: {
+        ...(req.body || {}),
+        codigo_original: finalCodigo,
+        area: normArea,
+        campamento_id: vinc.campamento_id,
+        almacen_id: vinc.almacen_id
+      },
       req
     });
+
+    await conn.commit();
+    inTransaction = false;
 
     res.status(201).json({
       success: true,
       message: 'Artículo registrado correctamente.',
       id: newId,
-      codigo_original: finalCodigo
+      codigo_original: finalCodigo,
+      campamento_id: vinc.campamento_id,
+      almacen_id: vinc.almacen_id,
+      estado_vinculacion_sede: vinc.estado_vinculacion_sede
     });
   } catch (error) {
+    if (conn && inTransaction) {
+      await safeRollback(conn);
+    }
     console.error('Create articulo error:', error);
-    res.status(500).json({ success: false, message: 'Error registrando artículo.' });
+    const status = isDbUnavailableError(error, conn) ? 503 : 500;
+    res.status(status).json({
+      success: false,
+      message: status === 503
+        ? 'Base de datos temporalmente no disponible. Intente nuevamente.'
+        : 'Error registrando artículo.'
+    });
+  } finally {
+    safeRelease(conn);
   }
 });
 
 // UPDATE ITEM
 router.put('/articulos/:id', requireAuth, requirePermission('inv:editar'), async (req, res) => {
+  const pool = getPool();
+  let conn = null;
+  let inTransaction = false;
   try {
-    const db = getPool();
-    const id = req.params.id;
-
-    const [prevRows] = await db.query('SELECT * FROM inv_articulos WHERE id = ?', [id]);
-    if (prevRows.length === 0) {
-      return res.status(404).json({ success: false, message: 'Artículo no encontrado.' });
-    }
-    const prev = prevRows[0];
-
-    // Validación de ámbito de campamento
-    const scope = await getUserAllowedCampamentos(db, req.user);
-    if (!scope.isGlobal) {
-      const campMatch = prev.campamento_id && scope.campamentoIds.includes(prev.campamento_id);
-      const nameMatch = prev.ubicacion_nombre && scope.campamentoNombres.some(cn => prev.ubicacion_nombre.toLowerCase().includes(cn.toLowerCase()));
-      if (!campMatch && !nameMatch) {
-        return res.status(403).json({
-          success: false,
-          message: 'Acceso denegado: No puede modificar artículos de otra sede o campamento.'
-        });
-      }
+    const id = parsePositiveInt(req.params.id);
+    if (!id) {
+      return res.status(400).json({ success: false, message: 'ID de artículo inválido.' });
     }
 
     const {
+      codigo_original,
       articulo_nombre,
       categoria,
       marca_modelo,
@@ -1577,66 +3206,257 @@ router.put('/articulos/:id', requireAuth, requirePermission('inv:editar'), async
       fecha_revision,
       observaciones,
       campamento_id
-    } = req.body;
+    } = req.body || {};
 
-    const newCant = (cantidad_num !== undefined && cantidad_num !== null && cantidad_num !== '' && !isNaN(Number(cantidad_num)))
-      ? Number(cantidad_num)
-      : (cantidad_num === null ? null : prev.cantidad_num);
+    if (articulo_nombre !== undefined && (typeof articulo_nombre !== 'string' || !articulo_nombre.trim())) {
+      return res.status(400).json({ success: false, message: 'La descripción del artículo no puede estar vacía.' });
+    }
+
+    if (cantidad_num !== undefined && cantidad_num !== null && String(cantidad_num).trim() !== '') {
+      const checkCant = Number(cantidad_num);
+      if (!Number.isFinite(checkCant) || checkCant < 0) {
+        return res.status(400).json({ success: false, message: 'La cantidad debe ser un número válido mayor o igual a cero.' });
+      }
+      if (Number(checkCant.toFixed(2)) !== checkCant) {
+        return res.status(400).json({ success: false, message: 'La cantidad no puede tener más de 2 cifras decimales.' });
+      }
+    }
+
+    conn = await pool.getConnection();
+    if (!conn) {
+      return res.status(503).json({ success: false, message: 'Servicio de base de datos no disponible temporalmente.' });
+    }
+    await conn.beginTransaction();
+    inTransaction = true;
+
+    const [prevRows] = await conn.query('SELECT * FROM inv_articulos WHERE id = ? AND activo = 1 FOR UPDATE', [id]);
+    if (prevRows.length === 0) {
+      inTransaction = false;
+      await safeRollback(conn);
+      return res.status(404).json({ success: false, message: 'Artículo no encontrado.' });
+    }
+    const prev = prevRows[0];
+
+    // Validación estricta de ámbito de campamento origen (sin coincidencia parcial .includes)
+    const scope = await getUserAllowedCampamentos(conn, req.user);
+    if (!canAccessArticle(scope, prev)) {
+      inTransaction = false;
+      await safeRollback(conn);
+      return res.status(403).json({
+        success: false,
+        message: 'Acceso denegado: No puede modificar artículos de otra sede o campamento.'
+      });
+    }
+
+    // Validar unicidad de codigo_original y serie_imei si fueron modificados (M07)
+    let nextCodigoOriginal = prev.codigo_original;
+    if (codigo_original !== undefined && typeof codigo_original === 'string' && codigo_original.trim() !== '') {
+      const candidateCode = codigo_original.trim();
+      if (candidateCode.toUpperCase() !== String(prev.codigo_original || '').trim().toUpperCase()) {
+        const [dupCodeRows] = await conn.query(
+          'SELECT id, articulo_nombre FROM inv_articulos WHERE activo = 1 AND UPPER(TRIM(codigo_original)) = ? AND id <> ? LIMIT 1 FOR UPDATE',
+          [candidateCode.toUpperCase(), id]
+        );
+        if (dupCodeRows.length > 0) {
+          inTransaction = false;
+          await safeRollback(conn);
+          return res.status(409).json({
+            success: false,
+            message: `El código de referencia "${candidateCode}" ya está asignado al activo "${dupCodeRows[0].articulo_nombre}".`
+          });
+        }
+      }
+      nextCodigoOriginal = candidateCode;
+    }
+
+    let nextSerieImei = prev.serie_imei;
+    if (serie_imei !== undefined) {
+      const cleanSerie = typeof serie_imei === 'string' && serie_imei.trim() !== '' ? serie_imei.trim() : null;
+      const serialKey = normalizeSerialKey(cleanSerie);
+      if (serialKey) {
+        const [dupSerRows] = await conn.query(
+          'SELECT id, articulo_nombre FROM inv_articulos WHERE activo = 1 AND UPPER(TRIM(serie_imei)) = ? AND id <> ? LIMIT 1 FOR UPDATE',
+          [serialKey, id]
+        );
+        if (dupSerRows.length > 0) {
+          inTransaction = false;
+          await safeRollback(conn);
+          return res.status(409).json({
+            success: false,
+            message: `El serial/IMEI "${cleanSerie}" ya pertenece a otro activo activo ("${dupSerRows[0].articulo_nombre}").`
+          });
+        }
+      }
+      nextSerieImei = cleanSerie;
+    }
+
+    // Validar que el destino (campamento_id / ubicacion_nombre) pertenezca también al ámbito autorizado
+    if (!scope.isGlobal && (campamento_id !== undefined || ubicacion_nombre !== undefined)) {
+      if (campamento_id !== undefined && (campamento_id === null || String(campamento_id).trim() === '')) {
+        inTransaction = false;
+        await safeRollback(conn);
+        return res.status(403).json({
+          success: false,
+          message: 'Acceso denegado: Solo perfiles globales pueden desvincular un artículo de su sede.'
+        });
+      }
+      const campChanged = campamento_id !== undefined && Number(campamento_id) !== Number(prev.campamento_id);
+      const hasNewUbic = typeof ubicacion_nombre === 'string' && ubicacion_nombre.trim() !== '';
+      const ubicChanged = hasNewUbic && normalizeExactLocation(ubicacion_nombre) !== normalizeExactLocation(prev.ubicacion_nombre);
+
+      if (campChanged || ubicChanged) {
+        const targetCampId = campamento_id !== undefined ? campamento_id : prev.campamento_id;
+        const targetUbic = hasNewUbic ? ubicacion_nombre : prev.ubicacion_nombre;
+        if (!canTargetCampamento(scope, targetCampId, targetUbic)) {
+          inTransaction = false;
+          await safeRollback(conn);
+          return res.status(403).json({
+            success: false,
+            message: 'Acceso denegado: No tiene autorización para trasladar o reasignar el artículo a otra sede o campamento.'
+          });
+        }
+      }
+    }
+
+    let newCant = prev.cantidad_num !== null ? Number(prev.cantidad_num) : null;
+    if (cantidad_num !== undefined) {
+      newCant = (cantidad_num === null || String(cantidad_num).trim() === '') ? null : Number(cantidad_num);
+    }
     const newCantVerif = newCant !== null ? 1 : 0;
+    const newEstadoCantidad = newCant !== null ? 'VERIFICADO' : 'PENDIENTE_VERIFICACION';
 
     let finalCampId = prev.campamento_id;
     let finalAlmId = prev.almacen_id;
     let finalEstadoVinc = prev.estado_vinculacion_sede;
 
-    if (campamento_id !== undefined || ubicacion_nombre !== undefined) {
-      const vinc = resolveCampamentoVinculacion(
-        campamento_id !== undefined ? campamento_id : prev.campamento_id,
-        ubicacion_nombre !== undefined ? ubicacion_nombre : prev.ubicacion_nombre
-      );
-      finalCampId = vinc.campamento_id;
-      finalAlmId = vinc.almacen_id || prev.almacen_id;
-      finalEstadoVinc = vinc.estado_vinculacion_sede;
+    if (campamento_id !== undefined) {
+      if (campamento_id === null || String(campamento_id).trim() === '') {
+        finalCampId = null;
+        finalAlmId = null;
+        finalEstadoVinc = 'SIN_SEDE';
+      } else {
+        const parsedCampId = parsePositiveInt(campamento_id);
+        if (!parsedCampId) {
+          inTransaction = false;
+          await safeRollback(conn);
+          return res.status(400).json({ success: false, message: 'ID de campamento inválido.' });
+        }
+        if (!scope.isGlobal && !scope.campamentoIds.includes(parsedCampId)) {
+          inTransaction = false;
+          await safeRollback(conn);
+          return res.status(403).json({
+            success: false,
+            message: 'Acceso denegado: No tiene autorización para trasladar o reasignar el artículo a otra sede o campamento.'
+          });
+        }
+        const vinc = await resolveCampamentoVinculacion(conn, parsedCampId, null);
+        if (vinc.campamento_invalido) {
+          inTransaction = false;
+          await safeRollback(conn);
+          return res.status(400).json({
+            success: false,
+            message: 'El campamento seleccionado no existe o está inactivo.'
+          });
+        }
+        finalCampId = vinc.campamento_id;
+        finalAlmId = (prev.campamento_id !== null && Number(prev.campamento_id) === Number(vinc.campamento_id))
+          ? (prev.almacen_id ?? vinc.almacen_id)
+          : vinc.almacen_id;
+        finalEstadoVinc = vinc.estado_vinculacion_sede;
+      }
+    } else if (ubicacion_nombre !== undefined) {
+      const hasNewUbic = typeof ubicacion_nombre === 'string' && ubicacion_nombre.trim() !== '';
+      if (hasNewUbic) {
+        const vinc = await resolveCampamentoVinculacion(conn, null, ubicacion_nombre);
+        if (vinc.estado_vinculacion_sede === 'CONFIRMADO') {
+          if (!scope.isGlobal && !scope.campamentoIds.includes(vinc.campamento_id)) {
+            inTransaction = false;
+            await safeRollback(conn);
+            return res.status(403).json({
+              success: false,
+              message: 'Acceso denegado: No tiene autorización para trasladar o reasignar el artículo a otra sede o campamento.'
+            });
+          }
+          finalCampId = vinc.campamento_id;
+          finalAlmId = (prev.campamento_id !== null && Number(prev.campamento_id) === Number(vinc.campamento_id))
+            ? (prev.almacen_id ?? vinc.almacen_id)
+            : vinc.almacen_id;
+          finalEstadoVinc = 'CONFIRMADO';
+        } else if (vinc.estado_vinculacion_sede === 'SEDE_AMBIGUA') {
+          if (!scope.isGlobal) {
+            inTransaction = false;
+            await safeRollback(conn);
+            return res.status(403).json({
+              success: false,
+              message: 'Acceso denegado: No tiene autorización para trasladar o reasignar el artículo a una sede ambigua.'
+            });
+          }
+          finalCampId = null;
+          finalAlmId = null;
+          finalEstadoVinc = 'SEDE_AMBIGUA';
+        }
+      }
     }
 
-    await db.query(
+    const schemaCaps = await getSchemaCapabilities(conn);
+    const nextNombre = articulo_nombre !== undefined ? articulo_nombre.trim() : prev.articulo_nombre;
+    const nextCategoria = categoria !== undefined ? (asNonEmptyString(categoria) || prev.categoria) : prev.categoria;
+    const nextMarca = marca_modelo !== undefined ? (asNonEmptyString(marca_modelo)) : prev[schemaCaps.articulos.brandCol];
+    const nextSpec = tipo_caracteristicas !== undefined ? (asNonEmptyString(tipo_caracteristicas)) : prev[schemaCaps.articulos.specCol];
+    const nextProp = propietario !== undefined ? (asNonEmptyString(propietario) || prev.propietario) : prev.propietario;
+    const nextAsignado = asignado_a !== undefined ? asNonEmptyString(asignado_a) : prev.asignado_a;
+    const nextUnidad = unidad_medida !== undefined ? (asNonEmptyString(unidad_medida) || prev.unidad_medida) : prev.unidad_medida;
+    const nextEstado = estado_fisico !== undefined ? normalizeEstadoFisico(estado_fisico) : prev.estado_fisico;
+    const nextUbic = (ubicacion_nombre !== undefined && typeof ubicacion_nombre === 'string' && ubicacion_nombre.trim())
+      ? ubicacion_nombre.trim()
+      : prev.ubicacion_nombre;
+    const nextZona = zona_estante !== undefined ? asNonEmptyString(zona_estante) : prev.zona_estante;
+    const nextFechaRev = fecha_revision !== undefined ? (fecha_revision || null) : prev.fecha_revision;
+    const nextObs = observaciones !== undefined ? asNonEmptyString(observaciones) : prev.observaciones;
+
+    await conn.query(
       `UPDATE inv_articulos SET
-        articulo_nombre = COALESCE(?, articulo_nombre),
-        categoria = COALESCE(?, categoria),
-        marca_modelo = COALESCE(?, marca_modelo),
-        tipo_caracteristicas = COALESCE(?, tipo_caracteristicas),
-        serie_imei = COALESCE(?, serie_imei),
-        propietario = COALESCE(?, propietario),
-        asignado_a = COALESCE(?, asignado_a),
+        codigo_original = ?,
+        articulo_nombre = ?,
+        categoria = ?,
+        ${schemaCaps.articulos.brandCol} = ?,
+        ${schemaCaps.articulos.specCol} = ?,
+        serie_imei = ?,
+        propietario = ?,
+        asignado_a = ?,
         cantidad_num = ?,
         cantidad_texto = ?,
         cantidad_verificada = ?,
-        unidad_medida = COALESCE(?, unidad_medida),
-        estado_fisico = COALESCE(?, estado_fisico),
-        ubicacion_nombre = COALESCE(?, ubicacion_nombre),
-        zona_estante = COALESCE(?, zona_estante),
-        fecha_revision = COALESCE(?, fecha_revision),
-        observaciones = COALESCE(?, observaciones),
+        estado_cantidad = ?,
+        unidad_medida = ?,
+        estado_fisico = ?,
+        ubicacion_nombre = ?,
+        zona_estante = ?,
+        fecha_revision = ?,
+        observaciones = ?,
         campamento_id = ?,
         almacen_id = ?,
         estado_vinculacion_sede = ?
       WHERE id = ?`,
       [
-        articulo_nombre,
-        categoria,
-        marca_modelo,
-        tipo_caracteristicas,
-        serie_imei,
-        propietario,
-        asignado_a,
+        nextCodigoOriginal,
+        nextNombre,
+        nextCategoria,
+        nextMarca,
+        nextSpec,
+        nextSerieImei,
+        nextProp,
+        nextAsignado,
         newCant,
-        newCant !== null ? String(newCant) : prev.cantidad_texto,
+        newCant !== null ? String(newCant) : null,
         newCantVerif,
-        unidad_medida,
-        estado_fisico ? normalizeEstadoFisico(estado_fisico) : null,
-        ubicacion_nombre,
-        zona_estante,
-        fecha_revision,
-        observaciones,
+        newEstadoCantidad,
+        nextUnidad,
+        nextEstado,
+        nextUbic,
+        nextZona,
+        nextFechaRev,
+        nextObs,
         finalCampId,
         finalAlmId,
         finalEstadoVinc,
@@ -1644,31 +3464,33 @@ router.put('/articulos/:id', requireAuth, requirePermission('inv:editar'), async
       ]
     );
 
+    const movCant = newCant !== null ? newCant : 0;
+
     // If location changed, record movement TRASLADO
-    if (ubicacion_nombre && ubicacion_nombre !== prev.ubicacion_nombre) {
-      await db.query(
+    if (nextUbic !== prev.ubicacion_nombre) {
+      await conn.query(
         `INSERT INTO inv_movimientos (
           articulo_id, tipo_movimiento, cantidad, unidad_medida,
           ubicacion_origen, ubicacion_destino, estado_previo, estado_nuevo,
           motivo, usuario_id, es_sintetico
         ) VALUES (?, 'TRASLADO', ?, ?, ?, ?, ?, ?, 'Cambio de ubicación', ?, ?)`,
-        [id, newCant || 1, unidad_medida || prev.unidad_medida, prev.ubicacion_nombre, ubicacion_nombre, prev.estado_fisico, estado_fisico || prev.estado_fisico, req.user.id, prev.es_sintetico || 0]
+        [id, movCant, nextUnidad, prev.ubicacion_nombre, nextUbic, prev.estado_fisico, nextEstado, req.user.id, prev.es_sintetico || 0]
       );
     }
 
     // If assignee changed, record ASIGNACION
-    if (asignado_a !== undefined && asignado_a !== prev.asignado_a) {
-      await db.query(
+    if (asignado_a !== undefined && nextAsignado !== prev.asignado_a) {
+      await conn.query(
         `INSERT INTO inv_movimientos (
           articulo_id, tipo_movimiento, cantidad, unidad_medida,
           custodio_origen, custodio_destino, motivo, usuario_id, es_sintetico
         ) VALUES (?, 'ASIGNACION', ?, ?, ?, ?, 'Reasignación de custodio', ?, ?)`,
-        [id, newCant || 1, unidad_medida || prev.unidad_medida, prev.asignado_a, asignado_a, req.user.id, prev.es_sintetico || 0]
+        [id, movCant, nextUnidad, prev.asignado_a, nextAsignado, req.user.id, prev.es_sintetico || 0]
       );
     }
 
-    // Audit
-    await logAudit(db, {
+    // Audit inside transaction
+    await logAudit(conn, {
       usuario_id: req.user.id,
       usuario_nombre: req.user.nombre,
       accion: 'EDICION_ARTICULO',
@@ -1679,40 +3501,66 @@ router.put('/articulos/:id', requireAuth, requirePermission('inv:editar'), async
       req
     });
 
+    await conn.commit();
+    inTransaction = false;
+
     res.json({ success: true, message: 'Artículo actualizado exitosamente.' });
   } catch (error) {
+    if (conn && inTransaction) {
+      await safeRollback(conn);
+    }
     console.error('Update articulo error:', error);
-    res.status(500).json({ success: false, message: 'Error actualizando artículo.' });
+    const status = isDbUnavailableError(error, conn) ? 503 : 500;
+    res.status(status).json({
+      success: false,
+      message: status === 503
+        ? 'Base de datos temporalmente no disponible. Intente nuevamente.'
+        : 'Error actualizando artículo.'
+    });
+  } finally {
+    safeRelease(conn);
   }
 });
 
 // DELETE ITEM (Soft Delete - Exige permiso inv:eliminar)
 router.delete('/articulos/:id', requireAuth, requirePermission('inv:eliminar'), async (req, res) => {
+  const pool = getPool();
+  let conn = null;
+  let inTransaction = false;
   try {
-    const db = getPool();
-    const id = req.params.id;
+    const id = parsePositiveInt(req.params.id);
+    if (!id) {
+      return res.status(400).json({ success: false, message: 'ID de artículo inválido.' });
+    }
 
-    const [rows] = await db.query('SELECT * FROM inv_articulos WHERE id = ?', [id]);
+    conn = await pool.getConnection();
+    if (!conn) {
+      return res.status(503).json({ success: false, message: 'Servicio de base de datos no disponible temporalmente.' });
+    }
+    await conn.beginTransaction();
+    inTransaction = true;
+
+    const [rows] = await conn.query('SELECT * FROM inv_articulos WHERE id = ? AND activo = 1 FOR UPDATE', [id]);
     if (rows.length === 0) {
+      inTransaction = false;
+      await safeRollback(conn);
       return res.status(404).json({ success: false, message: 'Artículo no encontrado.' });
     }
 
-    // Verificar ámbito de campamento
-    const scope = await getUserAllowedCampamentos(db, req.user);
-    if (!scope.isGlobal) {
-      const campMatch = rows[0].campamento_id && scope.campamentoIds.includes(rows[0].campamento_id);
-      const nameMatch = rows[0].ubicacion_nombre && scope.campamentoNombres.some(cn => rows[0].ubicacion_nombre.toLowerCase().includes(cn.toLowerCase()));
-      if (!campMatch && !nameMatch) {
-        return res.status(403).json({
-          success: false,
-          message: 'Acceso denegado: No puede eliminar artículos de otra sede o campamento.'
-        });
-      }
+    // Verificar ámbito de campamento sin coincidencia parcial (.includes)
+    const scope = await getUserAllowedCampamentos(conn, req.user);
+    if (!canAccessArticle(scope, rows[0])) {
+      inTransaction = false;
+      await safeRollback(conn);
+      return res.status(403).json({
+        success: false,
+        message: 'Acceso denegado: No puede eliminar artículos de otra sede o campamento.'
+      });
     }
 
-    await db.query('UPDATE inv_articulos SET activo = 0 WHERE id = ?', [id]);
+    await conn.query('UPDATE inv_articulos SET activo = 0 WHERE id = ?', [id]);
 
-    await logAudit(db, {
+    await logAudit(conn, {
       usuario_id: req.user.id,
       usuario_nombre: req.user.nombre,
       accion: 'DESACTIVACION_ARTICULO',
@@ -1722,10 +3570,24 @@ router.delete('/articulos/:id', requireAuth, requirePermission('inv:eliminar'), 
       req
     });
 
+    await conn.commit();
+    inTransaction = false;
+
     res.json({ success: true, message: 'Artículo desactivado exitosamente.' });
   } catch (error) {
+    if (conn && inTransaction) {
+      await safeRollback(conn);
+    }
     console.error('Delete articulo error:', error);
-    res.status(500).json({ success: false, message: 'Error eliminando artículo.' });
+    const status = isDbUnavailableError(error, conn) ? 503 : 500;
+    res.status(status).json({
+      success: false,
+      message: status === 503
+        ? 'Base de datos temporalmente no disponible. Intente nuevamente.'
+        : 'Error eliminando artículo.'
+    });
+  } finally {
+    safeRelease(conn);
   }
 });
 
@@ -1737,9 +3599,11 @@ router.get('/movimientos', requireAuth, requirePermission('inv:movimientos_ver')
   try {
     const db = getPool();
     const scope = await getUserAllowedCampamentos(db, req.user);
-    const limit = parseInt(req.query.limit) || 100;
+    const limit = sanitizeLimit(req.query.limit, 100, 1000);
     const includeSynthetic = req.query.incluir_sinteticos === 'true';
-    const { campamento_id } = req.query;
+    const { campamento_id, sin_sede, sinSede } = req.query;
+    const campamentoParam = asNonEmptyString(campamento_id);
+    const isSinSedeReq = campamentoParam === 'SIN_SEDE' || sin_sede === 'true' || sinSede === 'true';
 
     let query = `
       SELECT m.*, a.articulo_nombre, a.codigo_original, a.area, a.campamento_id,
@@ -1757,26 +3621,31 @@ router.get('/movimientos', requireAuth, requirePermission('inv:movimientos_ver')
       conds.push('m.es_sintetico = 0 AND a.es_sintetico = 0');
     }
 
-    if (!scope.isGlobal && (scope.campamentoNombres.length > 0 || scope.campamentoIds.length > 0)) {
-      const movConds = [];
-      if (scope.campamentoIds.length > 0) {
-        movConds.push('a.campamento_id IN (?)');
-        params.push(scope.campamentoIds);
+    if (!scope.isGlobal) {
+      if (isSinSedeReq) {
+        return res.status(403).json({ success: false, message: 'Acceso denegado a movimientos sin sede verificada.' });
       }
-      if (scope.campamentoNombres.length > 0) {
-        movConds.push('m.ubicacion_origen IN (?) OR m.ubicacion_destino IN (?) OR a.ubicacion_nombre IN (?)');
-        params.push(scope.campamentoNombres, scope.campamentoNombres, scope.campamentoNombres);
-      }
-      conds.push(`(${movConds.join(' OR ')})`);
-    } else if (!scope.isGlobal) {
-      conds.push('1 = 0');
-    } else if (campamento_id && campamento_id !== 'TODOS') {
-      if (campamento_id === 'SIN_SEDE') {
-        conds.push('a.campamento_id IS NULL');
-      } else {
+      if (campamento_id !== undefined && campamento_id !== '' && campamentoParam !== 'TODOS') {
+        const reqCid = parsePositiveInt(campamento_id);
+        if (!reqCid || !scope.campamentoIds.includes(reqCid)) {
+          return res.status(403).json({ success: false, message: 'Acceso denegado a la sede solicitada.' });
+        }
         conds.push('a.campamento_id = ?');
-        params.push(parseInt(campamento_id));
+        params.push(reqCid);
+      } else {
+        const scopeFilter = buildArticleScopeFilter(scope, 'a');
+        conds.push(scopeFilter.sql);
+        params.push(...scopeFilter.params);
       }
+    } else if (isSinSedeReq) {
+      conds.push('a.campamento_id IS NULL');
+    } else if (campamento_id !== undefined && campamento_id !== '' && campamentoParam !== 'TODOS') {
+      const reqCid = parsePositiveInt(campamento_id);
+      if (!reqCid) {
+        return res.status(400).json({ success: false, message: 'Parámetro campamento_id inválido.' });
+      }
+      conds.push('a.campamento_id = ?');
+      params.push(reqCid);
     }
 
     if (conds.length > 0) {
@@ -1789,7 +3658,9 @@ router.get('/movimientos', requireAuth, requirePermission('inv:movimientos_ver')
     const [rows] = await db.query(query, params);
     res.json({ success: true, movimientos: rows });
   } catch (error) {
-    res.status(500).json({ success: false, message: 'Error consultando movimientos.' });
+    console.error('List movimientos error:', error);
+    const status = isDbUnavailableError(error) ? 503 : 500;
+    res.status(status).json({ success: false, message: 'Error consultando movimientos.' });
   }
 });
 
@@ -1797,7 +3668,8 @@ const TIPOS_MOVIMIENTO_VALIDOS = ['ENTRADA', 'SALIDA', 'TRASLADO', 'ASIGNACION',
 
 router.post('/movimientos', requireAuth, requirePermission('inv:movimientos_registrar'), async (req, res) => {
   const pool = getPool();
-  const conn = await pool.getConnection();
+  let conn = null;
+  let inTransaction = false;
   try {
     const {
       articulo_id,
@@ -1807,14 +3679,25 @@ router.post('/movimientos', requireAuth, requirePermission('inv:movimientos_regi
       custodio_destino,
       estado_nuevo,
       motivo,
-      observaciones
-    } = req.body;
+      observaciones,
+      campamento_id: campamentoIdBody,
+      campamento_destino_id: campamentoDestinoIdBody
+    } = req.body || {};
+    const campamentoDestinoId =
+      campamentoDestinoIdBody !== undefined && campamentoDestinoIdBody !== null && String(campamentoDestinoIdBody).trim() !== ''
+        ? campamentoDestinoIdBody
+        : campamentoIdBody;
 
-    if (!articulo_id || !tipo_movimiento || !motivo) {
+    if (!articulo_id || !tipo_movimiento || typeof motivo !== 'string' || !motivo.trim()) {
       return res.status(400).json({
         success: false,
         message: 'Artículo, tipo de movimiento y motivo son obligatorios.'
       });
+    }
+
+    const artId = parsePositiveInt(articulo_id);
+    if (!artId) {
+      return res.status(400).json({ success: false, message: 'ID de artículo inválido.' });
     }
 
     if (!TIPOS_MOVIMIENTO_VALIDOS.includes(tipo_movimiento)) {
@@ -1822,6 +3705,10 @@ router.post('/movimientos', requireAuth, requirePermission('inv:movimientos_regi
         success: false,
         message: `Tipo de movimiento no válido. Valores permitidos: ${TIPOS_MOVIMIENTO_VALIDOS.join(', ')}.`
       });
+    }
+
+    if (ubicacion_destino !== undefined && ubicacion_destino !== null && typeof ubicacion_destino !== 'string') {
+      return res.status(400).json({ success: false, message: 'Ubicación destino inválida.' });
     }
 
     const cantMov = Number(cantidad);
@@ -1858,61 +3745,107 @@ router.post('/movimientos', requireAuth, requirePermission('inv:movimientos_regi
 
     const estadoNuevoNormalizado = estado_nuevo ? normalizeEstadoFisico(estado_nuevo) : null;
 
+    conn = await pool.getConnection();
     await conn.beginTransaction();
+    inTransaction = true;
 
-    const [artRows] = await conn.query('SELECT * FROM inv_articulos WHERE id = ? FOR UPDATE', [articulo_id]);
+    const [artRows] = await conn.query('SELECT * FROM inv_articulos WHERE id = ? AND activo = 1 FOR UPDATE', [artId]);
     if (artRows.length === 0) {
-      await conn.rollback();
+      inTransaction = false;
+      await safeRollback(conn);
       return res.status(404).json({ success: false, message: 'Artículo no encontrado.' });
     }
     const articulo = artRows[0];
 
-    // Verificar ámbito de campamento para el artículo
+    // Verificar ámbito de campamento origen y destino sin coincidencia parcial (.includes)
     const scope = await getUserAllowedCampamentos(conn, req.user);
-    if (!scope.isGlobal) {
-      const campMatch = articulo.campamento_id && scope.campamentoIds.includes(articulo.campamento_id);
-      const nameMatch = articulo.ubicacion_nombre && scope.campamentoNombres.some(cn => articulo.ubicacion_nombre.toLowerCase().includes(cn.toLowerCase()));
-      if (!campMatch && !nameMatch) {
-        await conn.rollback();
+    if (!canAccessArticle(scope, articulo)) {
+      inTransaction = false;
+      await safeRollback(conn);
+      return res.status(403).json({
+        success: false,
+        message: 'Acceso denegado: El activo pertenece a otra sede o campamento no autorizado.'
+      });
+    }
+
+    const hasDestUbic = typeof ubicacion_destino === 'string' && ubicacion_destino.trim() !== '';
+    const hasDestCamp = campamentoDestinoId !== undefined && campamentoDestinoId !== null && String(campamentoDestinoId).trim() !== '';
+    if (hasDestCamp && !parsePositiveInt(campamentoDestinoId)) {
+      inTransaction = false;
+      await safeRollback(conn);
+      return res.status(400).json({ success: false, message: 'ID de campamento destino inválido.' });
+    }
+
+    if (tipo_movimiento === 'TRASLADO' && !hasDestUbic && !hasDestCamp) {
+      inTransaction = false;
+      await safeRollback(conn);
+      return res.status(400).json({
+        success: false,
+        message: 'Para registrar un TRASLADO debe especificar un campamento o ubicación de destino.'
+      });
+    }
+
+    if (!scope.isGlobal && (hasDestUbic || hasDestCamp)) {
+      const sameAsArticleLocation = hasDestUbic && !hasDestCamp &&
+        normalizeExactLocation(ubicacion_destino) === normalizeExactLocation(articulo.ubicacion_nombre);
+      if (!sameAsArticleLocation && !canTargetCampamento(scope, campamentoDestinoId, ubicacion_destino)) {
+        inTransaction = false;
+        await safeRollback(conn);
         return res.status(403).json({
           success: false,
-          message: 'Acceso denegado: El activo pertenece a otra sede o campamento no autorizado.'
+          message: 'Acceso denegado: No tiene autorización para mover artículos hacia una sede o campamento externo.'
         });
       }
     }
 
     const currentCant = articulo.cantidad_num !== null ? parseFloat(articulo.cantidad_num) : null;
+    const isVerified = currentCant !== null && Number(articulo.cantidad_verificada) !== 0;
+
+    if ((tipo_movimiento === 'SALIDA' || tipo_movimiento === 'TRASLADO' || tipo_movimiento === 'ASIGNACION') && !isVerified) {
+      inTransaction = false;
+      await safeRollback(conn);
+      return res.status(409).json({
+        success: false,
+        message: 'Stock no verificado (cantidad pendiente o NULL). Registre primero una ENTRADA o AJUSTE físico antes de realizar SALIDA, TRASLADO o ASIGNACION.'
+      });
+    }
+
     let nuevaCantidad = currentCant;
+    let nextCantidadVerificada = Number(articulo.cantidad_verificada) || 0;
+    let nextEstadoCantidad = articulo.estado_cantidad || (isVerified ? 'VERIFICADO' : 'PENDIENTE_VERIFICACION');
 
     if (tipo_movimiento === 'SALIDA') {
-      if (currentCant !== null) {
-        if (currentCant < cantMov) {
-          await conn.rollback();
-          return res.status(400).json({
-            success: false,
-            message: `Stock insuficiente (${currentCant} disponibles) para retirar ${cantMov}.`
-          });
-        }
-        nuevaCantidad = Number((currentCant - cantMov).toFixed(2));
-        if (nuevaCantidad < 0) {
-          await conn.rollback();
-          return res.status(400).json({
-            success: false,
-            message: 'La operación resultaría en un stock negativo.'
-          });
-        }
+      if (currentCant < cantMov) {
+        inTransaction = false;
+        await safeRollback(conn);
+        return res.status(400).json({
+          success: false,
+          message: `Stock insuficiente (${currentCant} disponibles) para retirar ${cantMov}.`
+        });
+      }
+      nuevaCantidad = Number((currentCant - cantMov).toFixed(2));
+      if (nuevaCantidad < 0) {
+        inTransaction = false;
+        await safeRollback(conn);
+        return res.status(400).json({
+          success: false,
+          message: 'La operación resultaría en un stock negativo.'
+        });
       }
     } else if (tipo_movimiento === 'ENTRADA' || tipo_movimiento === 'DEVOLUCION') {
-      if (currentCant !== null) {
-        nuevaCantidad = Number(((currentCant || 0) + cantMov).toFixed(2));
-      } else {
-        nuevaCantidad = Number(cantMov.toFixed(2));
-      }
+      nuevaCantidad = currentCant !== null
+        ? Number(((currentCant || 0) + cantMov).toFixed(2))
+        : Number(cantMov.toFixed(2));
+      nextCantidadVerificada = 1;
+      nextEstadoCantidad = 'VERIFICADO';
     } else if (tipo_movimiento === 'AJUSTE') {
       nuevaCantidad = Number(cantMov.toFixed(2));
+      nextCantidadVerificada = 1;
+      nextEstadoCantidad = 'VERIFICADO';
     } else if (tipo_movimiento === 'TRASLADO' || tipo_movimiento === 'ASIGNACION') {
-      if (currentCant !== null && currentCant < cantMov) {
-        await conn.rollback();
+      if (currentCant < cantMov) {
+        inTransaction = false;
+        await safeRollback(conn);
         return res.status(400).json({
           success: false,
           message: `No se puede transferir/asignar más del stock disponible (${currentCant} disponibles).`
@@ -1920,45 +3853,120 @@ router.post('/movimientos', requireAuth, requirePermission('inv:movimientos_regi
       }
     }
 
+    // Resolver vinculación territorial destino para TRASLADO o si se especifica destino explícito
+    let nextCampamentoId = articulo.campamento_id ?? null;
+    let nextAlmacenId = articulo.almacen_id ?? null;
+    let nextEstadoVinc = articulo.estado_vinculacion_sede || (nextCampamentoId ? 'CONFIRMADO' : 'SIN_SEDE');
+    let nextUbicacionNombre = hasDestUbic ? ubicacion_destino.trim() : articulo.ubicacion_nombre;
+
+    if (tipo_movimiento === 'TRASLADO' || hasDestCamp || (hasDestUbic && normalizeExactLocation(ubicacion_destino) !== normalizeExactLocation(articulo.ubicacion_nombre))) {
+      const destVinc = await resolveCampamentoVinculacion(
+        conn,
+        hasDestCamp ? parsePositiveInt(campamentoDestinoId) : null,
+        hasDestUbic ? ubicacion_destino.trim() : null
+      );
+      if (destVinc.campamento_invalido) {
+        inTransaction = false;
+        await safeRollback(conn);
+        return res.status(400).json({
+          success: false,
+          message: 'El campamento de destino seleccionado no existe o está inactivo.'
+        });
+      }
+
+      if (!hasDestUbic && destVinc.campamento_id) {
+        const [destCampRows] = await conn.query('SELECT nombre FROM inv_campamentos WHERE id = ? LIMIT 1', [destVinc.campamento_id]);
+        if (destCampRows.length > 0 && destCampRows[0].nombre) {
+          nextUbicacionNombre = destCampRows[0].nombre;
+        }
+      }
+
+      if (!scope.isGlobal && !canTargetCampamento(scope, destVinc.campamento_id, nextUbicacionNombre)) {
+        inTransaction = false;
+        await safeRollback(conn);
+        return res.status(403).json({
+          success: false,
+          message: 'Acceso denegado: No tiene autorización para trasladar activos a esa sede.'
+        });
+      }
+
+      if (tipo_movimiento === 'TRASLADO' || destVinc.estado_vinculacion_sede === 'CONFIRMADO') {
+        nextCampamentoId = destVinc.campamento_id;
+        nextAlmacenId = (articulo.campamento_id !== null && Number(articulo.campamento_id) === Number(destVinc.campamento_id))
+          ? (articulo.almacen_id ?? destVinc.almacen_id)
+          : destVinc.almacen_id;
+        nextEstadoVinc = destVinc.estado_vinculacion_sede;
+      } else if (destVinc.estado_vinculacion_sede === 'SEDE_AMBIGUA') {
+        if (!scope.isGlobal) {
+          inTransaction = false;
+          await safeRollback(conn);
+          return res.status(403).json({
+            success: false,
+            message: 'Acceso denegado: La ubicación destino es ambigua.'
+          });
+        }
+        nextCampamentoId = null;
+        nextAlmacenId = null;
+        nextEstadoVinc = 'SEDE_AMBIGUA';
+      }
+    }
+
+    const nextCustodio = (typeof custodio_destino === 'string' && custodio_destino.trim() !== '')
+      ? custodio_destino.trim()
+      : articulo.asignado_a;
+    const nextEstadoFisico = estadoNuevoNormalizado || articulo.estado_fisico;
+    const artEsSintetico = Number(articulo.es_sintetico) === 1 ? 1 : 0;
+
     // Update item
     await conn.query(`
       UPDATE inv_articulos SET
         cantidad_num = ?,
         cantidad_texto = ?,
-        ubicacion_nombre = COALESCE(?, ubicacion_nombre),
-        asignado_a = COALESCE(?, asignado_a),
-        estado_fisico = COALESCE(?, estado_fisico)
+        cantidad_verificada = ?,
+        estado_cantidad = ?,
+        ubicacion_nombre = ?,
+        campamento_id = ?,
+        almacen_id = ?,
+        estado_vinculacion_sede = ?,
+        asignado_a = ?,
+        estado_fisico = ?
       WHERE id = ?
     `, [
       nuevaCantidad,
       nuevaCantidad !== null ? String(nuevaCantidad) : articulo.cantidad_texto,
-      ubicacion_destino || null,
-      custodio_destino || null,
-      estadoNuevoNormalizado || null,
-      articulo_id
+      nextCantidadVerificada,
+      nextEstadoCantidad,
+      nextUbicacionNombre,
+      nextCampamentoId,
+      nextAlmacenId,
+      nextEstadoVinc,
+      nextCustodio,
+      nextEstadoFisico,
+      artId
     ]);
 
-    // Insert movement
-    await conn.query(`
+    // Insert movement (propagando es_sintetico desde inv_articulos)
+    const [movInsertRes] = await conn.query(`
       INSERT INTO inv_movimientos (
         articulo_id, tipo_movimiento, cantidad, unidad_medida,
         ubicacion_origen, ubicacion_destino, custodio_origen, custodio_destino,
-        estado_previo, estado_nuevo, motivo, observaciones, usuario_id
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        estado_previo, estado_nuevo, motivo, observaciones, usuario_id, es_sintetico
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `, [
-      articulo_id,
+      artId,
       tipo_movimiento,
       cantMov,
       articulo.unidad_medida,
       articulo.ubicacion_nombre,
-      ubicacion_destino || articulo.ubicacion_nombre,
+      nextUbicacionNombre,
       articulo.asignado_a,
-      custodio_destino || articulo.asignado_a,
+      nextCustodio,
       articulo.estado_fisico,
-      estadoNuevoNormalizado || articulo.estado_fisico,
-      motivo,
+      nextEstadoFisico,
+      motivo.trim(),
       observaciones || null,
-      req.user.id
+      req.user.id,
+      artEsSintetico
     ]);
 
     // Atomic Audit Log inside transaction
@@ -1967,10 +3975,13 @@ router.post('/movimientos', requireAuth, requirePermission('inv:movimientos_regi
       usuario_nombre: req.user.nombre,
       accion: `MOVIMIENTO_${tipo_movimiento}`,
       entidad: 'inv_movimientos',
-      entidad_id: articulo_id,
+      entidad_id: artId,
       detalles_previos: {
         cantidad_num: articulo.cantidad_num,
+        cantidad_verificada: articulo.cantidad_verificada,
         ubicacion: articulo.ubicacion_nombre,
+        campamento_id: articulo.campamento_id,
+        almacen_id: articulo.almacen_id,
         custodio: articulo.asignado_a,
         estado: articulo.estado_fisico
       },
@@ -1978,27 +3989,43 @@ router.post('/movimientos', requireAuth, requirePermission('inv:movimientos_regi
         tipo_movimiento,
         cantidad: cantMov,
         nueva_cantidad: nuevaCantidad,
-        ubicacion_destino: ubicacion_destino || articulo.ubicacion_nombre,
-        custodio_destino: custodio_destino || articulo.asignado_a,
-        estado_nuevo: estadoNuevoNormalizado || articulo.estado_fisico,
-        motivo
+        cantidad_verificada: nextCantidadVerificada,
+        ubicacion_destino: nextUbicacionNombre,
+        campamento_id_destino: nextCampamentoId,
+        almacen_id_destino: nextAlmacenId,
+        custodio_destino: nextCustodio,
+        estado_nuevo: nextEstadoFisico,
+        motivo: motivo.trim()
       },
       req
     });
 
     await conn.commit();
+    inTransaction = false;
 
     res.json({
       success: true,
       message: `Movimiento de ${tipo_movimiento} registrado con éxito.`,
-      nuevaCantidad
+      movimiento_id: movInsertRes.insertId,
+      nuevaCantidad,
+      campamento_id: nextCampamentoId,
+      almacen_id: nextAlmacenId,
+      estado_vinculacion_sede: nextEstadoVinc
     });
   } catch (error) {
-    await conn.rollback();
+    if (conn && inTransaction) {
+      await safeRollback(conn);
+    }
     console.error('Movement error:', error);
-    res.status(500).json({ success: false, message: 'Error procesando movimiento transaccional.' });
+    const status = isDbUnavailableError(error, conn) ? 503 : 500;
+    res.status(status).json({
+      success: false,
+      message: status === 503
+        ? 'Base de datos temporalmente no disponible. Intente nuevamente.'
+        : 'Error procesando movimiento transaccional.'
+    });
   } finally {
-    conn.release();
+    safeRelease(conn);
   }
 });
 
@@ -2011,7 +4038,13 @@ router.get('/reportes/consolidado', requireAuth, requirePermission('rep:ver'), a
     const db = getPool();
     const scope = await getUserAllowedCampamentos(db, req.user);
     const includeSynthetic = req.query.incluir_sinteticos === 'true';
-    const { campamento_id, area, estado } = req.query;
+    const { area, estado } = req.query;
+
+    const campFilter = await resolveRequestedCampamentoFilter(db, scope, req.query);
+    if (campFilter.errorStatus) {
+      return res.status(campFilter.errorStatus).json({ success: false, message: campFilter.errorMessage });
+    }
+    const { isSinSedeReq, selectedCid } = campFilter;
 
     let whereArt = 'WHERE a.activo = 1';
     if (!includeSynthetic) {
@@ -2020,44 +4053,30 @@ router.get('/reportes/consolidado', requireAuth, requirePermission('rep:ver'), a
     const paramsArt = [];
 
     if (!scope.isGlobal) {
-      if (campamento_id === 'SIN_SEDE') {
-        return res.status(403).json({ success: false, message: 'Acceso denegado a artículos sin sede verificada.' });
-      }
-      if (campamento_id && campamento_id !== 'TODOS') {
-        const reqCid = parseInt(campamento_id);
-        if (!scope.campamentoIds.includes(reqCid)) {
-          return res.status(403).json({ success: false, message: 'Acceso denegado a la sede solicitada.' });
-        }
+      if (selectedCid !== null) {
         whereArt += ' AND a.campamento_id = ?';
-        paramsArt.push(reqCid);
-      } else if (scope.campamentoIds.length > 0 && scope.campamentoNombres.length > 0) {
-        whereArt += ' AND (a.campamento_id IN (?) OR a.ubicacion_nombre IN (?))';
-        paramsArt.push(scope.campamentoIds, scope.campamentoNombres);
-      } else if (scope.campamentoIds.length > 0) {
-        whereArt += ' AND a.campamento_id IN (?)';
-        paramsArt.push(scope.campamentoIds);
-      } else if (scope.campamentoNombres.length > 0) {
-        whereArt += ' AND a.ubicacion_nombre IN (?)';
-        paramsArt.push(scope.campamentoNombres);
+        paramsArt.push(selectedCid);
       } else {
-        whereArt += ' AND 1 = 0';
+        const scopeFilter = buildArticleScopeFilter(scope, 'a');
+        whereArt += ` AND ${scopeFilter.sql}`;
+        paramsArt.push(...scopeFilter.params);
       }
-    } else if (campamento_id && campamento_id !== 'TODOS') {
-      if (campamento_id === 'SIN_SEDE') {
-        whereArt += ' AND a.campamento_id IS NULL';
-      } else {
-        whereArt += ' AND a.campamento_id = ?';
-        paramsArt.push(parseInt(campamento_id));
-      }
+    } else if (isSinSedeReq) {
+      whereArt += ' AND a.campamento_id IS NULL';
+    } else if (selectedCid !== null) {
+      whereArt += ' AND a.campamento_id = ?';
+      paramsArt.push(selectedCid);
     }
 
-    if (area && area !== 'TODOS') {
+    const areaParam = asNonEmptyString(area);
+    if (areaParam && areaParam.toUpperCase() !== 'TODOS') {
       whereArt += ' AND a.area = ?';
-      paramsArt.push(area.toUpperCase());
+      paramsArt.push(areaParam.toUpperCase());
     }
 
-    if (estado && estado !== 'TODOS') {
-      const normEstado = normalizeEstadoParam(estado);
+    const estadoParam = asNonEmptyString(estado);
+    if (estadoParam && estadoParam.toUpperCase() !== 'TODOS') {
+      const normEstado = normalizeEstadoParam(estadoParam);
       if (normEstado) {
         whereArt += ' AND a.estado_fisico = ?';
         paramsArt.push(normEstado);
@@ -2145,9 +4164,16 @@ router.get('/reportes/consolidado', requireAuth, requirePermission('rep:ver'), a
 router.get('/reportes/exportar', requireAuth, requirePermission('rep:exportar'), async (req, res) => {
   try {
     const db = getPool();
+    const schemaCaps = await getSchemaCapabilities(db);
     const scope = await getUserAllowedCampamentos(db, req.user);
-    const { area, estado, campamento_id, sinSerial, sinCantidad, incluir_sinteticos } = req.query;
+    const { area, categoria, estado, ubicacion, search, sinSerial, sinCantidad, sortBy = 'id', sortOrder = 'ASC', incluir_sinteticos } = req.query;
     const includeSynthetic = incluir_sinteticos === 'true';
+
+    const campFilter = await resolveRequestedCampamentoFilter(db, scope, req.query);
+    if (campFilter.errorStatus) {
+      return res.status(campFilter.errorStatus).json({ success: false, message: campFilter.errorMessage });
+    }
+    const { isSinSedeReq, selectedCid } = campFilter;
 
     let query = `
       SELECT a.*,
@@ -2166,70 +4192,98 @@ router.get('/reportes/exportar', requireAuth, requirePermission('rep:exportar'),
     }
 
     if (!scope.isGlobal) {
-      if (campamento_id === 'SIN_SEDE') {
-        return res.status(403).json({ success: false, message: 'Acceso denegado a artículos sin sede verificada.' });
-      }
-      if (campamento_id && campamento_id !== 'TODOS') {
-        const reqCid = parseInt(campamento_id);
-        if (!scope.campamentoIds.includes(reqCid)) {
-          return res.status(403).json({ success: false, message: 'Acceso denegado a la sede solicitada.' });
-        }
+      if (selectedCid !== null) {
         query += ' AND a.campamento_id = ?';
-        params.push(reqCid);
-      } else if (scope.campamentoIds.length > 0 && scope.campamentoNombres.length > 0) {
-        query += ' AND (a.campamento_id IN (?) OR a.ubicacion_nombre IN (?))';
-        params.push(scope.campamentoIds, scope.campamentoNombres);
-      } else if (scope.campamentoIds.length > 0) {
-        query += ' AND a.campamento_id IN (?)';
-        params.push(scope.campamentoIds);
-      } else if (scope.campamentoNombres.length > 0) {
-        query += ' AND a.ubicacion_nombre IN (?)';
-        params.push(scope.campamentoNombres);
+        params.push(selectedCid);
       } else {
-        query += ' AND 1 = 0';
+        const scopeFilter = buildArticleScopeFilter(scope, 'a');
+        query += ` AND ${scopeFilter.sql}`;
+        params.push(...scopeFilter.params);
       }
-    } else if (campamento_id && campamento_id !== 'TODOS') {
-      if (campamento_id === 'SIN_SEDE') {
-        query += ' AND a.campamento_id IS NULL';
-      } else {
-        query += ' AND a.campamento_id = ?';
-        params.push(parseInt(campamento_id));
-      }
+    } else if (isSinSedeReq) {
+      query += ' AND a.campamento_id IS NULL';
+    } else if (selectedCid !== null) {
+      query += ' AND a.campamento_id = ?';
+      params.push(selectedCid);
     }
 
-    if (area && area !== 'TODOS') {
+    const areaParam = asNonEmptyString(area);
+    if (areaParam && areaParam.toUpperCase() !== 'TODOS') {
       query += ' AND a.area = ?';
-      params.push(area.toUpperCase());
+      params.push(areaParam.toUpperCase());
     }
-    if (estado && estado !== 'TODOS') {
-      const normEstado = normalizeEstadoParam(estado);
+    const categoriaParam = asNonEmptyString(categoria);
+    if (categoriaParam && categoriaParam.toUpperCase() !== 'TODAS') {
+      query += ' AND a.categoria = ?';
+      params.push(categoriaParam);
+    }
+    const ubicacionParam = asNonEmptyString(ubicacion);
+    if (ubicacionParam && ubicacionParam.toUpperCase() !== 'TODAS') {
+      query += ' AND a.ubicacion_nombre = ?';
+      params.push(ubicacionParam);
+    }
+    const estadoParam = asNonEmptyString(estado);
+    if (estadoParam && estadoParam.toUpperCase() !== 'TODOS') {
+      const normEstado = normalizeEstadoParam(estadoParam);
       if (normEstado) {
         query += ' AND a.estado_fisico = ?';
         params.push(normEstado);
       }
     }
     if (sinSerial === 'true') {
-      query += ` AND (a.serie_imei IS NULL OR TRIM(a.serie_imei) = '' OR UPPER(TRIM(a.serie_imei)) IN ('N/A', 'S/N', 'SIN SERIE', 'NONE', 'NULL', '--', '-'))`;
+      query += ` AND ${buildSqlSinSerialCondition('a.serie_imei')}`;
     }
     if (sinCantidad === 'true') {
       query += ' AND (a.cantidad_num IS NULL OR a.cantidad_verificada = 0)';
     }
+    const searchParam = asNonEmptyString(search);
+    if (searchParam) {
+      const q = `%${searchParam}%`;
+      query += ` AND (
+        a.codigo_original LIKE ? OR
+        a.articulo_nombre LIKE ? OR
+        a.${schemaCaps.articulos.brandCol} LIKE ? OR
+        a.serie_imei LIKE ? OR
+        a.asignado_a LIKE ? OR
+        a.ubicacion_nombre LIKE ? OR
+        a.categoria LIKE ? OR
+        a.observaciones LIKE ?
+      )`;
+      params.push(q, q, q, q, q, q, q, q);
+    }
 
-    query += ' ORDER BY a.id ASC';
+    const exportSortMap = {
+      id: 'a.id',
+      codigo_original: 'a.codigo_original',
+      articulo_nombre: 'a.articulo_nombre',
+      categoria: 'a.categoria',
+      area: 'a.area',
+      estado_fisico: 'a.estado_fisico',
+      ubicacion_nombre: 'a.ubicacion_nombre',
+      cantidad_num: 'a.cantidad_num',
+      asignado_a: 'a.asignado_a',
+      campamento_id: 'a.campamento_id'
+    };
+    const safeExportSort = (typeof sortBy === 'string' && Object.hasOwn(exportSortMap, sortBy))
+      ? exportSortMap[sortBy]
+      : 'a.id';
+    const safeExportOrder = typeof sortOrder === 'string' && sortOrder.toUpperCase() === 'DESC' ? 'DESC' : 'ASC';
+    query += ` ORDER BY ${safeExportSort} ${safeExportOrder}`;
 
     const [rows] = await db.query(query, params);
-    const totalUnidadesFisicas = rows.reduce((acc, r) => acc + (r.cantidad_num !== null ? parseFloat(r.cantidad_num) : 0), 0);
-    const articulosSinCantidad = rows.filter(r => r.cantidad_num === null || r.cantidad_verificada === 0).length;
+    const sanitizedRows = rows.map(sanitizeListArticleRow);
+    const totalUnidadesFisicas = sanitizedRows.reduce((acc, r) => acc + (r.cantidad_num !== null ? parseFloat(r.cantidad_num) : 0), 0);
+    const articulosSinCantidad = sanitizedRows.filter(r => r.cantidad_num === null || r.cantidad_verificada === 0).length;
 
     res.json({
       success: true,
-      count: rows.length,
+      count: sanitizedRows.length,
       resumen: {
-        totalRegistros: rows.length,
+        totalRegistros: sanitizedRows.length,
         totalUnidadesFisicas,
         articulosSinCantidad
       },
-      data: rows
+      data: sanitizedRows
     });
   } catch (error) {
     console.error('Reporte exportar error:', error);
@@ -2241,23 +4295,82 @@ router.get('/reportes/exportar', requireAuth, requirePermission('rep:exportar'),
 // 6. AUDITORIA
 // ==========================================
 
-router.get('/auditoria', requireAuth, requireRole(['admin', 'auditor', 'gerencia']), async (req, res) => {
+function requireAuditoriaAccess(req, res, next) {
+  if (!req.user) {
+    return res.status(401).json({ success: false, message: 'No autenticado.' });
+  }
+  if (req.user.rol === 'developer' || req.user.es_developer === 1) {
+    return next();
+  }
+  const perms = Array.isArray(req.user.permisos) ? req.user.permisos : [];
+  if (perms.includes('*') || perms.includes('aud:ver')) {
+    return next();
+  }
+  return res.status(403).json({
+    success: false,
+    message: 'Acceso denegado: No dispone de autorización para consultar la bitácora de auditoría.'
+  });
+}
+
+router.get('/auditoria', requireAuth, requireAuditoriaAccess, async (req, res) => {
   try {
     const db = getPool();
-    const limit = parseInt(req.query.limit) || 100;
+    const scope = await getUserAllowedCampamentos(db, req.user);
+    const limit = sanitizeLimit(req.query.limit, 100, 1000);
+
+    if (scope.isGlobal) {
+      const [rows] = await db.query(
+        'SELECT * FROM inv_auditoria ORDER BY fecha DESC LIMIT ?',
+        [limit]
+      );
+      return res.json({ success: true, logs: normalizeAuditLogRows(rows) });
+    }
+
+    if (scope.campamentoIds.length === 0) {
+      return res.json({ success: true, logs: [] });
+    }
+
+    const artScope = buildArticleScopeFilter(scope, 'a');
     const [rows] = await db.query(
-      'SELECT * FROM inv_auditoria ORDER BY fecha DESC LIMIT ?',
-      [limit]
+      `SELECT aud.*
+       FROM inv_auditoria aud
+       WHERE (
+         (aud.entidad IN ('inv_articulos', 'inv_movimientos') AND EXISTS (
+           SELECT 1 FROM inv_articulos a WHERE a.id = aud.entidad_id AND ${artScope.sql}
+         ))
+         OR (aud.entidad = 'inv_levantamientos' AND EXISTS (
+           SELECT 1 FROM inv_levantamientos l WHERE l.id = aud.entidad_id AND l.campamento_id IN (?)
+         ))
+         OR (aud.entidad = 'inv_levantamiento_items' AND EXISTS (
+           SELECT 1 FROM inv_levantamiento_items li
+           JOIN inv_levantamientos l ON li.levantamiento_id = l.id
+           WHERE li.id = aud.entidad_id AND l.campamento_id IN (?)
+         ))
+         OR (aud.entidad = 'inv_campamentos' AND aud.entidad_id IN (?))
+       )
+       ORDER BY aud.fecha DESC
+       LIMIT ?`,
+      [...artScope.params, scope.campamentoIds, scope.campamentoIds, scope.campamentoIds, limit]
     );
-    res.json({ success: true, logs: rows });
+    res.json({ success: true, logs: normalizeAuditLogRows(rows) });
   } catch (error) {
-    res.status(500).json({ success: false, message: 'Error consultando bitácora de auditoría.' });
+    console.error('List auditoria error:', error);
+    const status = isDbUnavailableError(error) ? 503 : 500;
+    res.status(status).json({ success: false, message: 'Error consultando bitácora de auditoría.' });
   }
 });
 
 // ==========================================
 // 7. GESTIÓN EXCLUSIVA DE USUARIOS (SOLO DEVELOPER)
 // ==========================================
+
+router.get('/usuarios/permisos-catalogo', requireAuth, requireDeveloper, (req, res) => {
+  res.json({
+    success: true,
+    roles: VALID_OPERATIONAL_ROLES,
+    permisos: KNOWN_PERMISSION_KEYS
+  });
+});
 
 router.get('/usuarios', requireAuth, requireDeveloper, async (req, res) => {
   try {
@@ -2287,17 +4400,15 @@ router.get('/usuarios', requireAuth, requireDeveloper, async (req, res) => {
         WHERE a.activo = 1
       `);
       almsRows = aRows;
-    } catch (e) {
+    } catch (almErr) {
+      if (almErr?.code !== 'ER_NO_SUCH_TABLE') {
+        console.warn('[USUARIOS] Error consultando inv_usuario_almacenes:', almErr?.message || almErr);
+      }
       almsRows = [];
     }
 
     const result = rows.map(u => {
-      let perms = [];
-      try {
-        perms = u.permisos_json ? (typeof u.permisos_json === 'string' ? JSON.parse(u.permisos_json) : u.permisos_json) : (u.rol === 'developer' ? ['*'] : []);
-      } catch (e) {
-        perms = u.rol === 'developer' ? ['*'] : [];
-      }
+      const perms = parsePermisosJson(u.permisos_json, u.rol, u.es_developer);
 
       return {
         ...u,
@@ -2310,13 +4421,16 @@ router.get('/usuarios', requireAuth, requireDeveloper, async (req, res) => {
     res.json({ success: true, usuarios: result });
   } catch (error) {
     console.error('List usuarios error:', error);
-    res.status(500).json({ success: false, message: 'Error consultando usuarios.' });
+    const status = isDbUnavailableError(error) ? 503 : 500;
+    res.status(status).json({ success: false, message: 'Error consultando usuarios.' });
   }
 });
 
 router.post('/usuarios', requireAuth, requireDeveloper, async (req, res) => {
+  let conn = null;
   try {
     const db = getPool();
+    const body = req.body || {};
     const {
       nombre,
       email,
@@ -2324,77 +4438,159 @@ router.post('/usuarios', requireAuth, requireDeveloper, async (req, res) => {
       rol = 'almacen',
       cargo,
       area,
-      campamento_id,
-      campamentos_adicionales = [],
-      almacenes = [],
+      almacenes,
       permisos = []
-    } = req.body;
+    } = body;
 
-    if (!nombre || !email || !password) {
+    if (
+      typeof nombre !== 'string' || !nombre.trim() ||
+      typeof email !== 'string' || !email.trim() ||
+      typeof password !== 'string' || !password
+    ) {
       return res.status(400).json({ success: false, message: 'Nombre, email y contraseña son obligatorios.' });
     }
 
+    if (!isValidEmailFormat(email)) {
+      return res.status(400).json({ success: false, message: 'El formato del correo electrónico no es válido.' });
+    }
+
+    const pwdCheck = validateStrongPassword(password);
+    if (!pwdCheck.valid) {
+      return res.status(400).json({ success: false, message: pwdCheck.message });
+    }
+
     // Regla de Seguridad Absoluta: Solo puede existir un único developer principal
-    if (rol === 'developer' || req.body.es_developer) {
+    if (rol === 'developer' || isTruthyFlag(body.es_developer)) {
       return res.status(403).json({
         success: false,
         message: 'Política de seguridad estricta: No se permite crear cuentas adicionales con rol developer.'
       });
     }
 
+    if (typeof rol !== 'string' || !VALID_OPERATIONAL_ROLES.includes(rol)) {
+      return res.status(400).json({
+        success: false,
+        message: `Rol inválido. Los roles operativos permitidos son: ${VALID_OPERATIONAL_ROLES.join(', ')}.`
+      });
+    }
+
+    const permValidation = validateAndSanitizePermissions(permisos, false);
+    if (permValidation.errorStatus) {
+      return res.status(permValidation.errorStatus).json({
+        success: false,
+        message: permValidation.errorMessage
+      });
+    }
+
+    if (almacenes !== undefined && almacenes !== null && !Array.isArray(almacenes)) {
+      return res.status(400).json({ success: false, message: 'El campo almacenes debe ser un arreglo de IDs válidos.' });
+    }
+
+    const parsedAlmacenes = [];
+    if (Array.isArray(almacenes)) {
+      const seenAlm = new Set();
+      for (const rawAid of almacenes) {
+        const aid = parsePositiveInt(rawAid);
+        if (!aid) {
+          return res.status(400).json({ success: false, message: 'Todos los almacenes seleccionados deben tener un ID válido.' });
+        }
+        if (!seenAlm.has(aid)) {
+          seenAlm.add(aid);
+          parsedAlmacenes.push(aid);
+        }
+      }
+    }
+
     const cleanEmail = email.toLowerCase().trim();
-    const [existing] = await db.query('SELECT id FROM inv_usuarios WHERE email = ?', [cleanEmail]);
+    const cleanArea = asNonEmptyString(area);
+    const cleanCargo = asNonEmptyString(cargo);
+
+    conn = await db.getConnection();
+    if (!conn) {
+      return res.status(503).json({ success: false, message: 'Servicio de base de datos no disponible temporalmente.' });
+    }
+    await conn.beginTransaction();
+
+    const [existing] = await conn.query('SELECT id FROM inv_usuarios WHERE LOWER(email) = ? FOR UPDATE', [cleanEmail]);
     if (existing.length > 0) {
+      await safeRollback(conn);
       return res.status(409).json({ success: false, message: 'El correo electrónico ya se encuentra registrado.' });
     }
 
-    const hash = await hashPassword(password);
-    const permisosStr = JSON.stringify(Array.isArray(permisos) ? permisos : []);
+    const campSelection = await parseUserCampamentoSelection(conn, body);
+    if (campSelection.errorStatus) {
+      await safeRollback(conn);
+      return res.status(campSelection.errorStatus).json({
+        success: false,
+        message: campSelection.errorMessage
+      });
+    }
 
-    const [result] = await db.query(
+    if (parsedAlmacenes.length > 0) {
+      const [validAlmRows] = await conn.query(
+        'SELECT id FROM inv_almacenes WHERE id IN (?) AND activo = 1',
+        [parsedAlmacenes]
+      );
+      const validAlmSet = new Set(validAlmRows.map(r => Number(r.id)));
+      const invalidAlms = parsedAlmacenes.filter(aid => !validAlmSet.has(aid));
+      if (invalidAlms.length > 0) {
+        await safeRollback(conn);
+        return res.status(400).json({
+          success: false,
+          message: `Uno o más almacenes seleccionados no existen o están inactivos (IDs: ${invalidAlms.join(', ')}).`
+        });
+      }
+    }
+
+    const hash = await hashPassword(password);
+    const sanitizedPerms = permValidation.permisos;
+    const permisosStr = JSON.stringify(sanitizedPerms);
+
+    const [result] = await conn.query(
       `INSERT INTO inv_usuarios (
         nombre, email, password_hash, rol, cargo, area, activo,
         es_developer, campamento_id, permisos_json
       ) VALUES (?, ?, ?, ?, ?, ?, 1, 0, ?, ?)`,
-      [nombre.trim(), cleanEmail, hash, rol, cargo ? cargo.trim() : null, area ? area.trim() : null, campamento_id || null, permisosStr]
+      [nombre.trim(), cleanEmail, hash, rol, cleanCargo, cleanArea, campSelection.principalCampId, permisosStr]
     );
 
     const newUserId = result.insertId;
 
-    // Asignar campamentos
-    const allCampsToAssign = new Set();
-    if (campamento_id) allCampsToAssign.add(parseInt(campamento_id));
-    if (Array.isArray(campamentos_adicionales)) {
-      campamentos_adicionales.forEach(cid => allCampsToAssign.add(parseInt(cid)));
-    }
-
-    for (const cid of allCampsToAssign) {
-      const isPrincipal = cid === parseInt(campamento_id) ? 1 : 0;
-      await db.query(
+    for (const cid of campSelection.campamentoIds) {
+      const isPrincipal = cid === campSelection.principalCampId ? 1 : 0;
+      await conn.query(
         'INSERT IGNORE INTO inv_usuario_campamentos (usuario_id, campamento_id, es_principal) VALUES (?, ?, ?)',
         [newUserId, cid, isPrincipal]
       );
     }
 
-    // Asignar almacenes si fueron provistos
-    if (Array.isArray(almacenes)) {
-      for (const aid of almacenes) {
-        await db.query(
-          'INSERT IGNORE INTO inv_usuario_almacenes (usuario_id, almacen_id) VALUES (?, ?)',
-          [newUserId, parseInt(aid)]
-        );
-      }
+    for (const aid of parsedAlmacenes) {
+      await conn.query(
+        'INSERT IGNORE INTO inv_usuario_almacenes (usuario_id, almacen_id) VALUES (?, ?)',
+        [newUserId, aid]
+      );
     }
 
-    await logAudit(db, {
+    await logAudit(conn, {
       usuario_id: req.user.id,
       usuario_nombre: req.user.nombre,
       accion: 'CREACION_USUARIO',
       entidad: 'inv_usuarios',
       entidad_id: newUserId,
-      detalles_nuevos: { nombre, email: cleanEmail, rol, cargo, campamentos: Array.from(allCampsToAssign), permisos },
+      detalles_nuevos: {
+        nombre: nombre.trim(),
+        email: cleanEmail,
+        rol,
+        cargo: cleanCargo,
+        area: cleanArea,
+        campamento_id: campSelection.principalCampId,
+        campamentos: campSelection.campamentoIds,
+        permisos: sanitizedPerms
+      },
       req
     });
+
+    await conn.commit();
 
     res.status(201).json({
       success: true,
@@ -2402,137 +4598,322 @@ router.post('/usuarios', requireAuth, requireDeveloper, async (req, res) => {
       id: newUserId
     });
   } catch (error) {
+    await safeRollback(conn);
     console.error('Create usuario error:', error);
-    res.status(500).json({ success: false, message: 'Error creando usuario.' });
+    if (error?.code === 'ER_DUP_ENTRY') {
+      return res.status(409).json({ success: false, message: 'El correo electrónico ya se encuentra registrado.' });
+    }
+    const status = isDbUnavailableError(error, conn) ? 503 : 500;
+    res.status(status).json({ success: false, message: 'Error creando usuario.' });
+  } finally {
+    safeRelease(conn);
   }
 });
 
 router.put('/usuarios/:id', requireAuth, requireDeveloper, async (req, res) => {
+  let conn = null;
   try {
     const db = getPool();
-    const targetId = parseInt(req.params.id);
+    const targetId = parsePositiveInt(req.params.id);
+    if (!targetId) {
+      return res.status(400).json({ success: false, message: 'ID de usuario inválido.' });
+    }
+    const body = req.body || {};
     const {
       nombre,
       email,
       cargo,
+      area,
       rol,
-      campamento_id,
-      campamentos_adicionales,
       almacenes,
       permisos,
       activo
-    } = req.body;
+    } = body;
 
-    const [prevRows] = await db.query('SELECT * FROM inv_usuarios WHERE id = ?', [targetId]);
+    if (nombre !== undefined && (typeof nombre !== 'string' || !nombre.trim())) {
+      return res.status(400).json({ success: false, message: 'El nombre del usuario no puede estar vacío.' });
+    }
+
+    if (email !== undefined && !isValidEmailFormat(email)) {
+      return res.status(400).json({ success: false, message: 'El formato del correo electrónico no es válido.' });
+    }
+
+    if (almacenes !== undefined && almacenes !== null && !Array.isArray(almacenes)) {
+      return res.status(400).json({ success: false, message: 'El campo almacenes debe ser un arreglo de IDs válidos.' });
+    }
+
+    const parsedAlmacenes = [];
+    if (Array.isArray(almacenes)) {
+      const seenAlm = new Set();
+      for (const rawAid of almacenes) {
+        const aid = parsePositiveInt(rawAid);
+        if (!aid) {
+          return res.status(400).json({ success: false, message: 'Todos los almacenes seleccionados deben tener un ID válido.' });
+        }
+        if (!seenAlm.has(aid)) {
+          seenAlm.add(aid);
+          parsedAlmacenes.push(aid);
+        }
+      }
+    }
+
+    conn = await db.getConnection();
+    if (!conn) {
+      return res.status(503).json({ success: false, message: 'Servicio de base de datos no disponible temporalmente.' });
+    }
+    await conn.beginTransaction();
+
+    const [prevRows] = await conn.query('SELECT * FROM inv_usuarios WHERE id = ? FOR UPDATE', [targetId]);
     if (prevRows.length === 0) {
+      await safeRollback(conn);
       return res.status(404).json({ success: false, message: 'Usuario no encontrado.' });
     }
     const targetUser = prevRows[0];
+    const isTargetDeveloper = targetUser.es_developer === 1 || targetUser.rol === 'developer';
 
     // Protección de la cuenta developer principal
-    if (targetUser.es_developer === 1 || targetUser.rol === 'developer') {
-      if (rol && rol !== 'developer') {
+    if (isTargetDeveloper) {
+      if (rol !== undefined && rol !== 'developer') {
+        await safeRollback(conn);
         return res.status(403).json({ success: false, message: 'No se puede revocar el rol de la cuenta Desarrollador Principal.' });
       }
-      if (activo === 0 || activo === false) {
+      if (activo !== undefined && !isTruthyFlag(activo)) {
+        await safeRollback(conn);
         return res.status(403).json({ success: false, message: 'No se puede desactivar la cuenta del Desarrollador Principal.' });
+      }
+    } else {
+      // Evitar que otro usuario sea elevado a developer
+      if (rol === 'developer' || (body.es_developer !== undefined && isTruthyFlag(body.es_developer))) {
+        await safeRollback(conn);
+        return res.status(403).json({ success: false, message: 'Política de seguridad: Solo puede existir un único Desarrollador Principal.' });
+      }
+      if (rol !== undefined && (typeof rol !== 'string' || !VALID_OPERATIONAL_ROLES.includes(rol))) {
+        await safeRollback(conn);
+        return res.status(400).json({
+          success: false,
+          message: `Rol inválido. Los roles operativos permitidos son: ${VALID_OPERATIONAL_ROLES.join(', ')}.`
+        });
       }
     }
 
-    // Evitar que otro usuario sea elevado a developer
-    if (rol === 'developer' && targetUser.es_developer !== 1) {
-      return res.status(403).json({ success: false, message: 'Política de seguridad: Solo puede existir un único Desarrollador Principal.' });
+    let cleanEmail = targetUser.email;
+    if (email !== undefined) {
+      cleanEmail = email.toLowerCase().trim();
+      const [dupRows] = await conn.query(
+        'SELECT id FROM inv_usuarios WHERE LOWER(email) = ? AND id <> ? FOR UPDATE',
+        [cleanEmail, targetId]
+      );
+      if (dupRows.length > 0) {
+        await safeRollback(conn);
+        return res.status(409).json({ success: false, message: 'El correo electrónico ya está asignado a otro usuario.' });
+      }
     }
 
-    const permisosStr = permisos !== undefined ? JSON.stringify(Array.isArray(permisos) ? permisos : []) : targetUser.permisos_json;
+    const prevPermisos = parsePermisosJson(targetUser.permisos_json, targetUser.rol, targetUser.es_developer);
+    const prevPermisosStr = JSON.stringify(prevPermisos);
+    let nextPerms = prevPermisos;
+    let nextPermisosStr = prevPermisosStr;
 
-    await db.query(`
+    if (permisos !== undefined) {
+      const permValidation = validateAndSanitizePermissions(permisos, isTargetDeveloper);
+      if (permValidation.errorStatus) {
+        await safeRollback(conn);
+        return res.status(permValidation.errorStatus).json({
+          success: false,
+          message: permValidation.errorMessage
+        });
+      }
+      if (isTargetDeveloper && !permValidation.permisos.includes('*')) {
+        await safeRollback(conn);
+        return res.status(403).json({
+          success: false,
+          message: 'No se puede revocar el acceso comodín (*) de la cuenta Desarrollador Principal.'
+        });
+      }
+      nextPerms = permValidation.permisos;
+      nextPermisosStr = JSON.stringify(nextPerms);
+    }
+
+    const campSelection = await parseUserCampamentoSelection(conn, body);
+    if (campSelection.errorStatus) {
+      await safeRollback(conn);
+      return res.status(campSelection.errorStatus).json({
+        success: false,
+        message: campSelection.errorMessage
+      });
+    }
+
+    if (parsedAlmacenes.length > 0) {
+      const [validAlmRows] = await conn.query(
+        'SELECT id FROM inv_almacenes WHERE id IN (?) AND activo = 1',
+        [parsedAlmacenes]
+      );
+      const validAlmSet = new Set(validAlmRows.map(r => Number(r.id)));
+      const invalidAlms = parsedAlmacenes.filter(aid => !validAlmSet.has(aid));
+      if (invalidAlms.length > 0) {
+        await safeRollback(conn);
+        return res.status(400).json({
+          success: false,
+          message: `Uno o más almacenes seleccionados no existen o están inactivos (IDs: ${invalidAlms.join(', ')}).`
+        });
+      }
+    }
+
+    const nextNombre = nombre !== undefined ? nombre.trim() : targetUser.nombre;
+    const nextCargo = cargo !== undefined ? asNonEmptyString(cargo) : targetUser.cargo;
+    const nextArea = area !== undefined ? asNonEmptyString(area) : targetUser.area;
+    const nextRol = rol !== undefined ? rol : targetUser.rol;
+    const nextCampamentoId = campSelection.hasSelection ? campSelection.principalCampId : targetUser.campamento_id;
+    const nextActivo = activo !== undefined ? (isTruthyFlag(activo) ? 1 : 0) : Number(targetUser.activo);
+
+    const [prevCampRows] = await conn.query(
+      'SELECT campamento_id FROM inv_usuario_campamentos WHERE usuario_id = ? ORDER BY campamento_id ASC',
+      [targetId]
+    );
+    const prevCampIds = prevCampRows.map(r => Number(r.campamento_id)).filter(n => n > 0);
+
+    await conn.query(`
       UPDATE inv_usuarios SET
-        nombre = COALESCE(?, nombre),
-        email = COALESCE(?, email),
-        cargo = COALESCE(?, cargo),
-        rol = COALESCE(?, rol),
+        nombre = ?,
+        email = ?,
+        cargo = ?,
+        area = ?,
+        rol = ?,
         campamento_id = ?,
         permisos_json = ?,
-        activo = COALESCE(?, activo)
+        activo = ?
       WHERE id = ?
     `, [
-      nombre ? nombre.trim() : null,
-      email ? email.toLowerCase().trim() : null,
-      cargo ? cargo.trim() : null,
-      rol || null,
-      campamento_id !== undefined ? (campamento_id || null) : targetUser.campamento_id,
-      permisosStr,
-      activo !== undefined ? (activo ? 1 : 0) : targetUser.activo,
+      nextNombre,
+      cleanEmail,
+      nextCargo,
+      nextArea,
+      nextRol,
+      nextCampamentoId,
+      nextPermisosStr,
+      nextActivo,
       targetId
     ]);
 
-    // Actualizar campamentos asignados si se enviaron
-    if (campamento_id !== undefined || campamentos_adicionales !== undefined) {
-      await db.query('DELETE FROM inv_usuario_campamentos WHERE usuario_id = ?', [targetId]);
-      const campsSet = new Set();
-      if (campamento_id) campsSet.add(parseInt(campamento_id));
-      if (Array.isArray(campamentos_adicionales)) {
-        campamentos_adicionales.forEach(cid => campsSet.add(parseInt(cid)));
-      }
-      for (const cid of campsSet) {
-        const isPrincipal = cid === parseInt(campamento_id) ? 1 : 0;
-        await db.query(
+    let campsChanged = false;
+    if (campSelection.hasSelection) {
+      await conn.query('DELETE FROM inv_usuario_campamentos WHERE usuario_id = ?', [targetId]);
+      for (const cid of campSelection.campamentoIds) {
+        const isPrincipal = cid === campSelection.principalCampId ? 1 : 0;
+        await conn.query(
           'INSERT IGNORE INTO inv_usuario_campamentos (usuario_id, campamento_id, es_principal) VALUES (?, ?, ?)',
           [targetId, cid, isPrincipal]
         );
       }
+      const nextSorted = [...campSelection.campamentoIds].sort((a, b) => a - b);
+      campsChanged =
+        prevCampIds.length !== nextSorted.length ||
+        prevCampIds.some((cid, idx) => cid !== nextSorted[idx]) ||
+        Number(nextCampamentoId || 0) !== Number(targetUser.campamento_id || 0);
     }
 
-    // Actualizar almacenes si se enviaron
     if (Array.isArray(almacenes)) {
-      await db.query('DELETE FROM inv_usuario_almacenes WHERE usuario_id = ?', [targetId]);
-      for (const aid of almacenes) {
-        await db.query(
+      await conn.query('DELETE FROM inv_usuario_almacenes WHERE usuario_id = ?', [targetId]);
+      for (const aid of parsedAlmacenes) {
+        await conn.query(
           'INSERT IGNORE INTO inv_usuario_almacenes (usuario_id, almacen_id) VALUES (?, ?)',
-          [targetId, parseInt(aid)]
+          [targetId, aid]
         );
       }
     }
 
-    await logAudit(db, {
+    const roleChanged = nextRol !== targetUser.rol;
+    const areaChanged = (nextArea || null) !== (targetUser.area || null);
+    const activoChanged = Number(nextActivo) !== Number(targetUser.activo);
+    const permsChanged = permisos !== undefined && nextPermisosStr !== prevPermisosStr;
+
+    if (roleChanged || areaChanged || activoChanged || permsChanged || campsChanged) {
+      await bumpUserTokenVersion(conn, targetId);
+    }
+
+    await logAudit(conn, {
       usuario_id: req.user.id,
       usuario_nombre: req.user.nombre,
       accion: 'MODIFICACION_USUARIO',
       entidad: 'inv_usuarios',
       entidad_id: targetId,
-      detalles_previos: { nombre: targetUser.nombre, rol: targetUser.rol, activo: targetUser.activo },
-      detalles_nuevos: req.body,
+      detalles_previos: {
+        nombre: targetUser.nombre,
+        email: targetUser.email,
+        rol: targetUser.rol,
+        area: targetUser.area,
+        campamento_id: targetUser.campamento_id,
+        activo: targetUser.activo,
+        permisos: prevPermisos
+      },
+      detalles_nuevos: {
+        nombre: nextNombre,
+        email: cleanEmail,
+        rol: nextRol,
+        area: nextArea,
+        campamento_id: nextCampamentoId,
+        campamentos: campSelection.hasSelection ? campSelection.campamentoIds : prevCampIds,
+        activo: nextActivo,
+        permisos_actualizados: permisos !== undefined,
+        permisos: nextPerms
+      },
       req
     });
 
+    await conn.commit();
+
     res.json({ success: true, message: 'Usuario actualizado exitosamente.' });
   } catch (error) {
+    await safeRollback(conn);
     console.error('Update usuario error:', error);
-    res.status(500).json({ success: false, message: 'Error actualizando usuario.' });
+    if (error?.code === 'ER_DUP_ENTRY') {
+      return res.status(409).json({ success: false, message: 'El correo electrónico ya está asignado a otro usuario.' });
+    }
+    const status = isDbUnavailableError(error, conn) ? 503 : 500;
+    res.status(status).json({ success: false, message: 'Error actualizando usuario.' });
+  } finally {
+    safeRelease(conn);
   }
 });
 
 router.patch('/usuarios/:id/estado', requireAuth, requireDeveloper, async (req, res) => {
+  let conn = null;
   try {
     const db = getPool();
-    const targetId = parseInt(req.params.id);
-    const { activo } = req.body;
+    const targetId = parsePositiveInt(req.params.id);
+    if (!targetId) {
+      return res.status(400).json({ success: false, message: 'ID de usuario inválido.' });
+    }
+    const { activo } = req.body || {};
+    if (activo === undefined || activo === null) {
+      return res.status(400).json({ success: false, message: 'Debe indicar el nuevo estado (activo).' });
+    }
 
-    const [prevRows] = await db.query('SELECT id, nombre, rol, es_developer, activo FROM inv_usuarios WHERE id = ?', [targetId]);
+    conn = await db.getConnection();
+    if (!conn) {
+      return res.status(503).json({ success: false, message: 'Servicio de base de datos no disponible temporalmente.' });
+    }
+    await conn.beginTransaction();
+
+    const [prevRows] = await conn.query('SELECT id, nombre, rol, es_developer, activo FROM inv_usuarios WHERE id = ? FOR UPDATE', [targetId]);
     if (prevRows.length === 0) {
+      await safeRollback(conn);
       return res.status(404).json({ success: false, message: 'Usuario no encontrado.' });
     }
     const targetUser = prevRows[0];
 
     if (targetUser.es_developer === 1 || targetUser.rol === 'developer') {
+      await safeRollback(conn);
       return res.status(403).json({ success: false, message: 'No se puede desactivar la cuenta del Desarrollador Principal.' });
     }
 
-    const nuevoActivo = activo ? 1 : 0;
-    await db.query('UPDATE inv_usuarios SET activo = ? WHERE id = ?', [nuevoActivo, targetId]);
+    const nuevoActivo = isTruthyFlag(activo) ? 1 : 0;
+    await conn.query('UPDATE inv_usuarios SET activo = ? WHERE id = ?', [nuevoActivo, targetId]);
+    if (nuevoActivo === 0 || nuevoActivo !== Number(targetUser.activo)) {
+      await bumpUserTokenVersion(conn, targetId);
+    }
 
-    await logAudit(db, {
+    await logAudit(conn, {
       usuario_id: req.user.id,
       usuario_nombre: req.user.nombre,
       accion: 'CAMBIO_ESTADO_USUARIO',
@@ -2543,72 +4924,127 @@ router.patch('/usuarios/:id/estado', requireAuth, requireDeveloper, async (req, 
       req
     });
 
+    await conn.commit();
+
     res.json({
       success: true,
       message: `Cuenta de usuario ${nuevoActivo ? 'activada' : 'desactivada'} correctamente.`,
       activo: nuevoActivo
     });
   } catch (error) {
+    await safeRollback(conn);
     console.error('Change status error:', error);
-    res.status(500).json({ success: false, message: 'Error modificando estado del usuario.' });
+    const status = isDbUnavailableError(error, conn) ? 503 : 500;
+    res.status(status).json({ success: false, message: 'Error modificando estado del usuario.' });
+  } finally {
+    safeRelease(conn);
   }
 });
 
 router.put('/usuarios/:id/permisos', requireAuth, requireDeveloper, async (req, res) => {
+  let conn = null;
   try {
     const db = getPool();
-    const targetId = parseInt(req.params.id);
-    const { permisos } = req.body;
-
-    if (!Array.isArray(permisos)) {
-      return res.status(400).json({ success: false, message: 'El campo permisos debe ser un arreglo de cadenas.' });
+    const targetId = parsePositiveInt(req.params.id);
+    if (!targetId) {
+      return res.status(400).json({ success: false, message: 'ID de usuario inválido.' });
     }
+    const { permisos } = req.body || {};
 
-    const [prevRows] = await db.query('SELECT id, nombre, permisos_json, es_developer FROM inv_usuarios WHERE id = ?', [targetId]);
+    conn = await db.getConnection();
+    if (!conn) {
+      return res.status(503).json({ success: false, message: 'Servicio de base de datos no disponible temporalmente.' });
+    }
+    await conn.beginTransaction();
+
+    const [prevRows] = await conn.query('SELECT id, nombre, rol, permisos_json, es_developer FROM inv_usuarios WHERE id = ? FOR UPDATE', [targetId]);
     if (prevRows.length === 0) {
+      await safeRollback(conn);
       return res.status(404).json({ success: false, message: 'Usuario no encontrado.' });
     }
+    const targetUser = prevRows[0];
+    const isTargetDeveloper = targetUser.es_developer === 1 || targetUser.rol === 'developer';
 
-    const permisosStr = JSON.stringify(permisos);
-    await db.query('UPDATE inv_usuarios SET permisos_json = ? WHERE id = ?', [permisosStr, targetId]);
+    const permValidation = validateAndSanitizePermissions(permisos, isTargetDeveloper);
+    if (permValidation.errorStatus) {
+      await safeRollback(conn);
+      return res.status(permValidation.errorStatus).json({
+        success: false,
+        message: permValidation.errorMessage
+      });
+    }
 
-    await logAudit(db, {
+    if (isTargetDeveloper && !permValidation.permisos.includes('*')) {
+      await safeRollback(conn);
+      return res.status(403).json({
+        success: false,
+        message: 'No se puede revocar el acceso comodín (*) de la cuenta Desarrollador Principal.'
+      });
+    }
+
+    const sanitizedPerms = permValidation.permisos;
+    const permisosStr = JSON.stringify(sanitizedPerms);
+    await conn.query('UPDATE inv_usuarios SET permisos_json = ? WHERE id = ?', [permisosStr, targetId]);
+    await bumpUserTokenVersion(conn, targetId);
+
+    await logAudit(conn, {
       usuario_id: req.user.id,
       usuario_nombre: req.user.nombre,
       accion: 'ASIGNACION_PERMISOS',
       entidad: 'inv_usuarios',
       entidad_id: targetId,
-      detalles_previos: { permisos: prevRows[0].permisos_json },
-      detalles_nuevos: { permisos },
+      detalles_previos: {
+        permisos: parsePermisosJson(targetUser.permisos_json, targetUser.rol, targetUser.es_developer)
+      },
+      detalles_nuevos: { permisos: sanitizedPerms },
       req
     });
 
-    res.json({ success: true, message: 'Permisos actualizados correctamente.', permisos });
+    await conn.commit();
+
+    res.json({ success: true, message: 'Permisos actualizados correctamente.', permisos: sanitizedPerms });
   } catch (error) {
+    await safeRollback(conn);
     console.error('Update permisos error:', error);
-    res.status(500).json({ success: false, message: 'Error actualizando permisos.' });
+    const status = isDbUnavailableError(error, conn) ? 503 : 500;
+    res.status(status).json({ success: false, message: 'Error actualizando permisos.' });
+  } finally {
+    safeRelease(conn);
   }
 });
 
 router.post('/usuarios/:id/recuperar', requireAuth, requireDeveloper, async (req, res) => {
+  let conn = null;
   try {
     const db = getPool();
-    const targetId = parseInt(req.params.id);
-    const { nuevaPassword } = req.body;
+    const targetId = parsePositiveInt(req.params.id);
+    if (!targetId) {
+      return res.status(400).json({ success: false, message: 'ID de usuario inválido.' });
+    }
+    const { nuevaPassword } = req.body || {};
 
-    if (!nuevaPassword || nuevaPassword.trim().length < 8) {
-      return res.status(400).json({ success: false, message: 'La nueva contraseña debe tener al menos 8 caracteres.' });
+    const pwdCheck = validateStrongPassword(nuevaPassword);
+    if (!pwdCheck.valid) {
+      return res.status(400).json({ success: false, message: pwdCheck.message });
     }
 
-    const [prevRows] = await db.query('SELECT id, nombre, email FROM inv_usuarios WHERE id = ?', [targetId]);
+    conn = await db.getConnection();
+    if (!conn) {
+      return res.status(503).json({ success: false, message: 'Servicio de base de datos no disponible temporalmente.' });
+    }
+    await conn.beginTransaction();
+
+    const [prevRows] = await conn.query('SELECT id, nombre, email FROM inv_usuarios WHERE id = ? FOR UPDATE', [targetId]);
     if (prevRows.length === 0) {
+      await safeRollback(conn);
       return res.status(404).json({ success: false, message: 'Usuario no encontrado.' });
     }
 
-    const hash = await hashPassword(nuevaPassword.trim());
-    await db.query('UPDATE inv_usuarios SET password_hash = ? WHERE id = ?', [hash, targetId]);
+    const hash = await hashPassword(nuevaPassword);
+    await conn.query('UPDATE inv_usuarios SET password_hash = ? WHERE id = ?', [hash, targetId]);
+    await bumpUserTokenVersion(conn, targetId);
 
-    await logAudit(db, {
+    await logAudit(conn, {
       usuario_id: req.user.id,
       usuario_nombre: req.user.nombre,
       accion: 'RECUPERACION_ACCESO_USUARIO',
@@ -2618,10 +5054,16 @@ router.post('/usuarios/:id/recuperar', requireAuth, requireDeveloper, async (req
       req
     });
 
+    await conn.commit();
+
     res.json({ success: true, message: `Contraseña restablecida exitosamente para ${prevRows[0].email}.` });
   } catch (error) {
+    await safeRollback(conn);
     console.error('Recovery error:', error);
-    res.status(500).json({ success: false, message: 'Error restableciendo acceso.' });
+    const status = isDbUnavailableError(error, conn) ? 503 : 500;
+    res.status(status).json({ success: false, message: 'Error restableciendo acceso.' });
+  } finally {
+    safeRelease(conn);
   }
 });
 
@@ -2631,13 +5073,15 @@ router.get('/usuarios/auditoria', requireAuth, requireDeveloper, async (req, res
     const [rows] = await db.query(`
       SELECT * FROM inv_auditoria
       WHERE entidad = 'inv_usuarios'
-         OR accion IN ('CREACION_USUARIO', 'MODIFICACION_USUARIO', 'CAMBIO_ESTADO_USUARIO', 'ASIGNACION_PERMISOS', 'RECUPERACION_ACCESO_USUARIO')
+         OR accion IN ('CREACION_USUARIO', 'MODIFICACION_USUARIO', 'CAMBIO_ESTADO_USUARIO', 'ASIGNACION_PERMISOS', 'RECUPERACION_ACCESO_USUARIO', 'LOGOUT_USUARIO')
       ORDER BY fecha DESC
       LIMIT 100
     `);
-    res.json({ success: true, logs: rows });
+    res.json({ success: true, logs: normalizeAuditLogRows(rows) });
   } catch (error) {
-    res.status(500).json({ success: false, message: 'Error consultando auditoría de usuarios.' });
+    console.error('Usuarios auditoria error:', error);
+    const status = isDbUnavailableError(error) ? 503 : 500;
+    res.status(status).json({ success: false, message: 'Error consultando auditoría de usuarios.' });
   }
 });
 
@@ -2645,9 +5089,10 @@ router.get('/usuarios/auditoria', requireAuth, requireDeveloper, async (req, res
 // 8. CAMPAMENTOS Y ALMACENES (UBICACIONES DINÁMICAS)
 // ==========================================
 
-router.get('/campamentos', requireAuth, async (req, res) => {
+router.get('/campamentos', requireAuth, requirePermission('camp:ver'), async (req, res) => {
   try {
     const db = getPool();
+    const schemaCaps = await getSchemaCapabilities(db);
     const scope = await getUserAllowedCampamentos(db, req.user);
     const includeSynthetic = req.query.incluir_sinteticos === 'true';
     const soloConfirmados = req.query.solo_confirmados === 'true';
@@ -2660,10 +5105,10 @@ router.get('/campamentos', requireAuth, async (req, res) => {
       FROM inv_campamentos c
       WHERE c.activo = 1
     `;
-    if (!includeSynthetic) {
+    if (!includeSynthetic && schemaCaps.campamentos.hasEsSintetico) {
       campsQuery += ' AND c.es_sintetico = 0';
     }
-    if (soloConfirmados) {
+    if (soloConfirmados && schemaCaps.campamentos.hasClasificacionSede) {
       campsQuery += " AND c.clasificacion_sede = 'CONFIRMADO'";
     }
     const campsParams = [];
@@ -2675,42 +5120,56 @@ router.get('/campamentos', requireAuth, async (req, res) => {
         campsQuery += ' AND 1 = 0';
       }
     }
-    campsQuery += " ORDER BY CASE WHEN c.clasificacion_sede = 'CONFIRMADO' THEN 0 ELSE 1 END ASC, c.id ASC";
+    campsQuery += schemaCaps.campamentos.hasClasificacionSede
+      ? " ORDER BY CASE WHEN c.clasificacion_sede = 'CONFIRMADO' THEN 0 ELSE 1 END ASC, c.id ASC"
+      : ' ORDER BY c.id ASC';
 
     const [camps] = await db.query(campsQuery, campsParams);
-    const [alms] = await db.query(
-      `SELECT * FROM inv_almacenes WHERE activo = 1 ${includeSynthetic ? '' : 'AND es_sintetico = 0'} ORDER BY id ASC`
-    );
+
+    let alms = [];
+    const almSyntSql = (!includeSynthetic && schemaCaps.almacenes.hasEsSintetico) ? 'AND es_sintetico = 0' : '';
+    if (scope.isGlobal) {
+      const [aRows] = await db.query(
+        `SELECT * FROM inv_almacenes WHERE activo = 1 ${almSyntSql} ORDER BY id ASC`
+      );
+      alms = aRows;
+    } else if (scope.campamentoIds.length > 0) {
+      const [aRows] = await db.query(
+        `SELECT * FROM inv_almacenes WHERE activo = 1 ${almSyntSql} AND campamento_id IN (?) ORDER BY id ASC`,
+        [scope.campamentoIds]
+      );
+      alms = aRows;
+    }
+
+    let aliasesList = [];
+    if (schemaCaps.campamentoAlias?.exists && camps.length > 0) {
+      try {
+        const campIds = camps.map((c) => c.id);
+        const [alRows] = await db.query(
+          'SELECT * FROM inv_campamento_alias WHERE campamento_id IN (?) ORDER BY requiere_revision_historica ASC, id ASC',
+          [campIds]
+        );
+        aliasesList = alRows;
+      } catch (aliasErr) {
+        if (aliasErr?.code !== 'ER_NO_SUCH_TABLE') {
+          console.warn('[CAMPAMENTOS] Error consultando alias de campamentos:', aliasErr?.message || aliasErr);
+        }
+        aliasesList = [];
+      }
+    }
 
     const result = camps.map(c => ({
       ...c,
       total_articulos: parseInt(c.total_articulos || 0),
       total_fisico: parseFloat(c.total_fisico || 0),
       articulos_sin_cantidad: parseInt(c.articulos_sin_cantidad || 0),
-      almacenes: alms.filter(a => a.campamento_id === c.id)
+      almacenes: alms.filter(a => a.campamento_id === c.id),
+      aliases: aliasesList.filter(al => al.campamento_id === c.id)
     }));
 
-    let sinSedeVerificada = null;
-    if (scope.isGlobal) {
-      const [sinSedeRows] = await db.query(`
-        SELECT COUNT(*) as total_articulos,
-               COALESCE(SUM(COALESCE(cantidad_num, 0)), 0) as total_fisico,
-               SUM(CASE WHEN cantidad_num IS NULL OR cantidad_verificada = 0 THEN 1 ELSE 0 END) as articulos_sin_cantidad
-        FROM inv_articulos
-        WHERE activo = 1 AND campamento_id IS NULL ${includeSynthetic ? '' : 'AND es_sintetico = 0'}
-      `);
-      const sr = sinSedeRows[0] || {};
-      sinSedeVerificada = {
-        id: 'SIN_SEDE',
-        nombre: 'SIN SEDE VERIFICADA (PENDIENTE DE CLASIFICACIÓN)',
-        codigo: 'PEND-SEDE',
-        ubicacion_historica: 'KM 19 AUT DUARTE',
-        clasificacion_sede: 'SEDE_AMBIGUA',
-        total_articulos: parseInt(sr.total_articulos || 0),
-        total_fisico: parseFloat(sr.total_fisico || 0),
-        articulos_sin_cantidad: parseInt(sr.articulos_sin_cantidad || 0)
-      };
-    }
+    const sinSedeVerificada = scope.isGlobal
+      ? await buildSinSedeSummary(db, includeSynthetic)
+      : null;
 
     res.json({
       success: true,
@@ -2723,22 +5182,34 @@ router.get('/campamentos', requireAuth, async (req, res) => {
   }
 });
 
-router.post('/campamentos', requireAuth, requireRole(['admin', 'almacen', 'supervisor']), async (req, res) => {
+router.post('/campamentos', requireAuth, requirePermission('camp:operar'), async (req, res) => {
+  const pool = getPool();
+  let conn = null;
+  let inTransaction = false;
   try {
-    const db = getPool();
-    const { nombre, codigo, provincia, direccion, responsable, telefono, almacenesIniciales } = req.body;
+    const { nombre, codigo, provincia, direccion, responsable, telefono, almacenesIniciales } = req.body || {};
 
-    if (!nombre || nombre.trim() === '') {
+    if (typeof nombre !== 'string' || nombre.trim() === '') {
       return res.status(400).json({ success: false, message: 'El nombre del campamento es obligatorio.' });
     }
 
     const cleanNombre = nombre.trim().toUpperCase();
-    const [existing] = await db.query('SELECT id FROM inv_campamentos WHERE nombre = ?', [cleanNombre]);
+
+    conn = await pool.getConnection();
+    if (!conn) {
+      return res.status(503).json({ success: false, message: 'Servicio de base de datos no disponible temporalmente.' });
+    }
+    await conn.beginTransaction();
+    inTransaction = true;
+
+    const [existing] = await conn.query('SELECT id FROM inv_campamentos WHERE nombre = ? FOR UPDATE', [cleanNombre]);
     if (existing.length > 0) {
+      inTransaction = false;
+      await safeRollback(conn);
       return res.status(400).json({ success: false, message: `Ya existe un campamento registrado como "${cleanNombre}".` });
     }
 
-    const [resCamp] = await db.query(
+    const [resCamp] = await conn.query(
       `INSERT INTO inv_campamentos (nombre, codigo, provincia, direccion, responsable, telefono, activo)
        VALUES (?, ?, ?, ?, ?, ?, 1)`,
       [cleanNombre, codigo || null, provincia || null, direccion || null, responsable || null, telefono || null]
@@ -2752,8 +5223,14 @@ router.post('/campamentos', requireAuth, requireRole(['admin', 'almacen', 'super
       : [{ nombre: `Almacén Principal ${cleanNombre}`, tipo: 'General', encargado: responsable || null }];
 
     for (const alm of almacenesToCreate) {
-      if (alm.nombre && alm.nombre.trim() !== '') {
-        await db.query(
+      if (typeof alm === 'string' && alm.trim() !== '') {
+        await conn.query(
+          `INSERT INTO inv_almacenes (campamento_id, nombre, tipo, encargado, descripcion, activo)
+           VALUES (?, ?, 'General', ?, NULL, 1)`,
+          [campamentoId, alm.trim(), responsable || null]
+        );
+      } else if (alm && typeof alm.nombre === 'string' && alm.nombre.trim() !== '') {
+        await conn.query(
           `INSERT INTO inv_almacenes (campamento_id, nombre, tipo, encargado, descripcion, activo)
            VALUES (?, ?, ?, ?, ?, 1)`,
           [campamentoId, alm.nombre.trim(), alm.tipo || 'General', alm.encargado || responsable || null, alm.descripcion || null]
@@ -2761,7 +5238,7 @@ router.post('/campamentos', requireAuth, requireRole(['admin', 'almacen', 'super
       }
     }
 
-    await logAudit(db, {
+    await logAudit(conn, {
       usuario_id: req.user.id,
       usuario_nombre: req.user.nombre,
       accion: 'CREACION_CAMPAMENTO',
@@ -2771,28 +5248,990 @@ router.post('/campamentos', requireAuth, requireRole(['admin', 'almacen', 'super
       req
     });
 
+    await conn.commit();
+    inTransaction = false;
+
     res.status(201).json({
       success: true,
       message: `Campamento "${cleanNombre}" y sus almacenes creados exitosamente.`,
       id: campamentoId
     });
   } catch (error) {
+    if (conn && inTransaction) {
+      await safeRollback(conn);
+    }
     console.error('Create campamento error:', error);
-    res.status(500).json({ success: false, message: 'Error creando campamento.' });
+    const status = isDbUnavailableError(error, conn) ? 503 : 500;
+    res.status(status).json({
+      success: false,
+      message: status === 503
+        ? 'Base de datos temporalmente no disponible. Intente nuevamente.'
+        : 'Error creando campamento.'
+    });
+  } finally {
+    safeRelease(conn);
   }
 });
 
-router.post('/campamentos/:id/almacenes', requireAuth, requireRole(['admin', 'almacen', 'supervisor']), async (req, res) => {
+// ==========================================
+// 8.0.1 ALIAS CANÓNICOS Y REASIGNACIÓN TRANSACCIONAL SEGURA (RUTAS ESTÁTICAS ANTES DE /:id)
+// ==========================================
+
+router.get('/campamentos/alias', requireAuth, requirePermission('camp:ver'), async (req, res) => {
   try {
     const db = getPool();
-    const campamentoId = parseInt(req.params.id);
-    const { nombre, tipo = 'General', encargado, descripcion } = req.body;
+    const schemaCaps = await getSchemaCapabilities(db);
+    if (!schemaCaps.campamentoAlias?.exists) {
+      return res.json({ success: true, aliases: [] });
+    }
 
-    if (!nombre || nombre.trim() === '') {
+    const scope = await getUserAllowedCampamentos(db, req.user);
+    const includeSynthetic = req.query.incluir_sinteticos === 'true';
+    const campamentoIdParam = asNonEmptyString(req.query.campamento_id);
+    let filterCid = null;
+
+    if (campamentoIdParam && campamentoIdParam.toUpperCase() !== 'TODOS') {
+      filterCid = parsePositiveInt(campamentoIdParam);
+      if (!filterCid) {
+        return res.status(400).json({ success: false, message: 'Parámetro campamento_id inválido.' });
+      }
+      if (!scope.isGlobal && !scope.campamentoIds.includes(filterCid)) {
+        return res.status(403).json({ success: false, message: 'Acceso denegado a la sede solicitada.' });
+      }
+    }
+
+    if (!scope.isGlobal && scope.campamentoIds.length === 0) {
+      return res.json({ success: true, aliases: [] });
+    }
+
+    const conds = ['c.activo = 1'];
+    const params = [];
+    if (!includeSynthetic && schemaCaps.campamentos.hasEsSintetico) {
+      conds.push('c.es_sintetico = 0');
+    }
+    if (!scope.isGlobal) {
+      conds.push('ca.campamento_id IN (?)');
+      params.push(scope.campamentoIds);
+    }
+    if (filterCid) {
+      conds.push('ca.campamento_id = ?');
+      params.push(filterCid);
+    }
+
+    const [aliasRows] = await db.query(
+      `SELECT ca.*,
+              c.nombre AS campamento_nombre,
+              c.codigo AS campamento_codigo,
+              ${schemaCaps.campamentos.hasClasificacionSede ? 'c.clasificacion_sede' : "'CONFIRMADO'"} AS campamento_clasificacion
+       FROM inv_campamento_alias ca
+       JOIN inv_campamentos c ON c.id = ca.campamento_id
+       WHERE ${conds.join(' AND ')}
+       ORDER BY ca.campamento_id ASC, ca.requiere_revision_historica ASC, ca.id ASC`,
+      params
+    );
+
+    const [pendingUbicRows] = await db.query(
+      `SELECT ubicacion_nombre, COUNT(*) AS total
+       FROM inv_articulos
+       WHERE activo = 1 AND campamento_id IS NULL ${includeSynthetic ? '' : 'AND es_sintetico = 0'}
+       GROUP BY ubicacion_nombre`
+    );
+
+    const pendingByNorm = new Map();
+    for (const r of pendingUbicRows) {
+      if (!scope.isGlobal && !hasExactLocationMatch(scope, r.ubicacion_nombre)) {
+        continue;
+      }
+      const norm = normalizeAliasKey(r.ubicacion_nombre);
+      if (!norm) continue;
+      pendingByNorm.set(norm, (pendingByNorm.get(norm) || 0) + parseInt(r.total || 0));
+    }
+
+    const aliases = aliasRows.map((al) => {
+      const normKey = normalizeAliasKey(al.alias_normalizado || al.alias_original);
+      return {
+        ...al,
+        articulos_pendientes: pendingByNorm.get(normKey) || 0
+      };
+    });
+
+    res.json({ success: true, aliases });
+  } catch (error) {
+    console.error('List campamentos alias error:', error);
+    const status = isDbUnavailableError(error) ? 503 : 500;
+    res.status(status).json({ success: false, message: 'Error consultando alias de campamentos.' });
+  }
+});
+
+router.post('/campamentos/alias', requireAuth, requirePermission('camp:operar'), async (req, res) => {
+  try {
+    const db = getPool();
+    const schemaCaps = await getSchemaCapabilities(db);
+    if (!schemaCaps.campamentoAlias?.exists) {
+      return res.status(503).json({
+        success: false,
+        message: 'La tabla inv_campamento_alias no está disponible en el esquema actual.'
+      });
+    }
+
+    const {
+      campamento_id,
+      alias_original,
+      tipo_alias,
+      estado_validacion,
+      requiere_revision_historica = false,
+      notas
+    } = req.body || {};
+
+    const campId = parsePositiveInt(campamento_id);
+    if (!campId) {
+      return res.status(400).json({ success: false, message: 'ID de campamento inválido.' });
+    }
+
+    const cleanAliasOriginal = asNonEmptyString(alias_original);
+    if (!cleanAliasOriginal) {
+      return res.status(400).json({ success: false, message: 'El campo alias_original es obligatorio.' });
+    }
+    const aliasNormalizado = normalizeAliasKey(cleanAliasOriginal);
+    if (!aliasNormalizado) {
+      return res.status(400).json({ success: false, message: 'El alias proporcionado no es válido.' });
+    }
+
+    const scope = await getUserAllowedCampamentos(db, req.user);
+    if (!scope.isGlobal && !scope.campamentoIds.includes(campId)) {
+      return res.status(403).json({
+        success: false,
+        message: 'Acceso denegado: No tiene autorización para registrar alias en este campamento.'
+      });
+    }
+
+    const [campRows] = await db.query(
+      'SELECT id, nombre, codigo FROM inv_campamentos WHERE id = ? AND activo = 1 LIMIT 1',
+      [campId]
+    );
+    if (campRows.length === 0) {
+      return res.status(404).json({ success: false, message: 'Campamento no encontrado o inactivo.' });
+    }
+
+    const [dupRows] = await db.query(
+      'SELECT id, campamento_id, alias_original FROM inv_campamento_alias WHERE alias_normalizado = ? LIMIT 1',
+      [aliasNormalizado]
+    );
+    if (dupRows.length > 0) {
+      return res.status(409).json({
+        success: false,
+        message: `El alias normalizado "${aliasNormalizado}" ya se encuentra registrado en el catálogo (ID #${dupRows[0].id}).`
+      });
+    }
+
+    const aliasCols = schemaCaps.campamentoAlias.cols;
+    const insertCols = ['campamento_id', 'alias_original', 'alias_normalizado'];
+    const insertVals = [campId, cleanAliasOriginal, aliasNormalizado];
+
+    if (aliasCols.has('codigo_campamento')) {
+      insertCols.push('codigo_campamento');
+      insertVals.push(campRows[0].codigo || `SEDE-${campId}`);
+    }
+
+    let finalEstadoValidacion = 'CONFIRMADO';
+    if (aliasCols.has('estado_validacion')) {
+      const enumEstados = schemaCaps.campamentoAlias.estadoValidacionValues;
+      if (estado_validacion !== undefined && estado_validacion !== null && String(estado_validacion).trim() !== '') {
+        const cleanEst = String(estado_validacion).trim().toUpperCase();
+        if (enumEstados.length > 0 && !enumEstados.includes(cleanEst)) {
+          return res.status(400).json({
+            success: false,
+            message: `estado_validacion inválido. Valores permitidos: ${enumEstados.join(', ')}.`
+          });
+        }
+        finalEstadoValidacion = cleanEst;
+      } else if (enumEstados.length > 0 && !enumEstados.includes('CONFIRMADO')) {
+        finalEstadoValidacion = enumEstados[0];
+      }
+      insertCols.push('estado_validacion');
+      insertVals.push(finalEstadoValidacion);
+    }
+
+    const reqRevHist = (requiere_revision_historica === true || requiere_revision_historica === 1 || requiere_revision_historica === '1') ? 1 : 0;
+    if (aliasCols.has('requiere_revision_historica')) {
+      insertCols.push('requiere_revision_historica');
+      insertVals.push(reqRevHist);
+    }
+
+    let finalTipoAlias = null;
+    if (aliasCols.has('tipo_alias')) {
+      const enumTipos = schemaCaps.campamentoAlias.tipoAliasValues;
+      if (tipo_alias !== undefined && tipo_alias !== null && String(tipo_alias).trim() !== '') {
+        const cleanTipo = String(tipo_alias).trim().toUpperCase();
+        if (enumTipos.length > 0 && !enumTipos.includes(cleanTipo)) {
+          return res.status(400).json({
+            success: false,
+            message: `tipo_alias inválido. Valores permitidos: ${enumTipos.join(', ')}.`
+          });
+        }
+        finalTipoAlias = cleanTipo;
+      } else if (enumTipos.length > 0) {
+        finalTipoAlias = enumTipos.find((v) => ['ALIAS_HISTORICO', 'MANUAL', 'EQUIVALENTE', 'HISTORICO'].includes(v)) || enumTipos[0];
+      } else {
+        finalTipoAlias = 'MANUAL';
+      }
+      insertCols.push('tipo_alias');
+      insertVals.push(finalTipoAlias);
+    }
+
+    const cleanNotas = asNonEmptyString(notas);
+    if (cleanNotas) {
+      if (aliasCols.has('notas')) {
+        insertCols.push('notas');
+        insertVals.push(cleanNotas);
+      } else if (aliasCols.has('observaciones')) {
+        insertCols.push('observaciones');
+        insertVals.push(cleanNotas);
+      }
+    }
+
+    if (aliasCols.has('creado_por')) {
+      insertCols.push('creado_por');
+      insertVals.push(req.user.id);
+    }
+
+    const placeholders = insertCols.map(() => '?').join(', ');
+    const [resInsert] = await db.query(
+      `INSERT INTO inv_campamento_alias (${insertCols.join(', ')}) VALUES (${placeholders})`,
+      insertVals
+    );
+
+    await logAudit(db, {
+      usuario_id: req.user.id,
+      usuario_nombre: req.user.nombre,
+      accion: 'CREACION_ALIAS_CAMPAMENTO',
+      entidad: 'inv_campamento_alias',
+      entidad_id: resInsert.insertId,
+      detalles_nuevos: {
+        campamento_id: campId,
+        campamento_nombre: campRows[0].nombre,
+        alias_original: cleanAliasOriginal,
+        alias_normalizado: aliasNormalizado,
+        estado_validacion: finalEstadoValidacion,
+        requiere_revision_historica: reqRevHist,
+        tipo_alias: finalTipoAlias
+      },
+      req
+    });
+
+    const [createdRows] = await db.query('SELECT * FROM inv_campamento_alias WHERE id = ?', [resInsert.insertId]);
+
+    res.status(201).json({
+      success: true,
+      message: `Alias "${cleanAliasOriginal}" registrado para "${campRows[0].nombre}".`,
+      id: resInsert.insertId,
+      alias: createdRows[0] || {
+        id: resInsert.insertId,
+        campamento_id: campId,
+        alias_original: cleanAliasOriginal,
+        alias_normalizado: aliasNormalizado,
+        estado_validacion: finalEstadoValidacion,
+        requiere_revision_historica: reqRevHist
+      }
+    });
+  } catch (error) {
+    if (error?.code === 'ER_DUP_ENTRY') {
+      return res.status(409).json({
+        success: false,
+        message: 'El alias ya se encuentra registrado en el catálogo.'
+      });
+    }
+    console.error('Create campamento alias error:', error);
+    const status = isDbUnavailableError(error) ? 503 : 500;
+    res.status(status).json({ success: false, message: 'Error registrando alias de campamento.' });
+  }
+});
+
+router.post('/campamentos/resolver-alias', requireAuth, requirePermission('camp:ver'), async (req, res) => {
+  try {
+    const db = getPool();
+    const scope = await getUserAllowedCampamentos(db, req.user);
+    const { texto, ubicacion_nombre, campamento_id, permitir_revision_historica } = req.body || {};
+
+    const hasCampId = campamento_id !== undefined && campamento_id !== null && String(campamento_id).trim() !== '';
+    if (hasCampId) {
+      const reqCid = parsePositiveInt(campamento_id);
+      if (!reqCid) {
+        return res.status(400).json({ success: false, message: 'ID de campamento inválido.' });
+      }
+      if (!scope.isGlobal && !scope.campamentoIds.includes(reqCid)) {
+        return res.status(403).json({ success: false, message: 'Acceso denegado a la sede solicitada.' });
+      }
+    }
+
+    const textInput = asNonEmptyString(ubicacion_nombre) ?? asNonEmptyString(texto);
+    if (!hasCampId && !textInput) {
+      return res.status(400).json({
+        success: false,
+        message: 'Debe proporcionar texto, ubicacion_nombre o campamento_id para resolver.'
+      });
+    }
+
+    const resolucion = await resolveCampamentoVinculacion(
+      db,
+      hasCampId ? campamento_id : null,
+      textInput,
+      { permitirAliasRevisionHistorica: permitir_revision_historica === true }
+    );
+
+    if (!scope.isGlobal) {
+      if (resolucion.campamento_id && !scope.campamentoIds.includes(Number(resolucion.campamento_id))) {
+        return res.status(403).json({
+          success: false,
+          message: 'Acceso denegado: La ubicación o alias pertenece a una sede no autorizada.'
+        });
+      }
+      if (resolucion.suggested_campamento_id && !scope.campamentoIds.includes(Number(resolucion.suggested_campamento_id))) {
+        return res.status(403).json({
+          success: false,
+          message: 'Acceso denegado: La ubicación o alias sugerido pertenece a una sede no autorizada.'
+        });
+      }
+    }
+
+    res.json({ success: true, resolucion });
+  } catch (error) {
+    console.error('Resolve alias error:', error);
+    const status = isDbUnavailableError(error) ? 503 : 500;
+    res.status(status).json({ success: false, message: 'Error resolviendo alias de campamento.' });
+  }
+});
+
+router.post('/campamentos/reasignaciones/preview', requireAuth, requirePermission('camp:operar'), async (req, res) => {
+  try {
+    const db = getPool();
+    const scope = await getUserAllowedCampamentos(db, req.user);
+    if (!scope.isGlobal) {
+      return res.status(403).json({
+        success: false,
+        message: 'Acceso denegado: Solo perfiles globales pueden previsualizar reasignaciones de artículos sin sede verificada.'
+      });
+    }
+
+    const schemaCaps = await getSchemaCapabilities(db);
+    if (!schemaCaps.campamentoAlias?.exists) {
+      return res.status(503).json({
+        success: false,
+        message: 'La tabla inv_campamento_alias no está disponible en el esquema actual.'
+      });
+    }
+
+    const {
+      campamento_destino_id,
+      campamento_destino_codigo,
+      almacen_destino_id,
+      aliases,
+      incluir_solo_sin_sede = true,
+      incluir_ambiguos_relacionados = true,
+      incluir_sinteticos = false
+    } = req.body || {};
+
+    const includeSynthetic = incluir_sinteticos === true;
+    const onlySinSede = incluir_solo_sin_sede !== false;
+    const includeRelatedAmbiguous = incluir_ambiguos_relacionados !== false;
+
+    const destResult = await resolveDestinoCampamentoYAlmacen(db, {
+      campamento_destino_id,
+      campamento_destino_codigo,
+      almacen_destino_id
+    });
+    if (destResult.errorStatus) {
+      return res.status(destResult.errorStatus).json({ success: false, message: destResult.errorMessage });
+    }
+    const { destCamp, destAlm } = destResult;
+
+    const [destAliases] = await db.query(
+      `SELECT * FROM inv_campamento_alias
+       WHERE campamento_id = ? AND estado_validacion = 'CONFIRMADO'
+       ORDER BY requiere_revision_historica ASC, id ASC`,
+      [destCamp.id]
+    );
+
+    const destAliasNormSet = new Set(
+      destAliases.map((a) => normalizeAliasKey(a.alias_normalizado || a.alias_original)).filter(Boolean)
+    );
+    const requestedAliasesNorm = Array.isArray(aliases)
+      ? Array.from(new Set(aliases.map((a) => normalizeAliasKey(a)).filter(Boolean)))
+      : [];
+    const targetNormSet = requestedAliasesNorm.length > 0
+      ? new Set(requestedAliasesNorm)
+      : destAliasNormSet;
+
+    const syntFilter = includeSynthetic ? '' : 'AND es_sintetico = 0';
+    const poolConds = ['activo = 1'];
+    const poolParams = [];
+    if (!includeSynthetic) {
+      poolConds.push('es_sintetico = 0');
+    }
+    if (onlySinSede) {
+      poolConds.push('campamento_id IS NULL');
+    } else {
+      poolConds.push('(campamento_id IS NULL OR campamento_id <> ?)');
+      poolParams.push(destCamp.id);
+    }
+
+    const [poolRows] = await db.query(
+      `SELECT * FROM inv_articulos WHERE ${poolConds.join(' AND ')} ORDER BY id ASC`,
+      poolParams
+    );
+
+    const candidateRows = poolRows.filter((row) => {
+      const normUbic = normalizeAliasKey(row.ubicacion_nombre);
+      const exactAliasHit = Boolean(normUbic && targetNormSet.has(normUbic));
+      const relatedHit = includeRelatedAmbiguous && isAmbiguousRelatedToDestino(normUbic, destCamp, destAliases);
+      return exactAliasHit || relatedHit;
+    });
+
+    const candidatos = await evaluateReasignacionCandidatos(db, candidateRows, destCamp, destAliases, includeSynthetic);
+
+    const [[globalSnap]] = await db.query(
+      `SELECT COUNT(*) AS total_arts, COALESCE(SUM(COALESCE(cantidad_num, 0)), 0) AS total_unids
+       FROM inv_articulos WHERE activo = 1 ${syntFilter}`
+    );
+    const [[sinSedeSnap]] = await db.query(
+      `SELECT COUNT(*) AS total_arts, COALESCE(SUM(COALESCE(cantidad_num, 0)), 0) AS total_unids
+       FROM inv_articulos WHERE activo = 1 AND campamento_id IS NULL ${syntFilter}`
+    );
+    const [[destSnap]] = await db.query(
+      `SELECT COUNT(*) AS total_arts, COALESCE(SUM(COALESCE(cantidad_num, 0)), 0) AS total_unids
+       FROM inv_articulos WHERE activo = 1 AND campamento_id = ? ${syntFilter}`,
+      [destCamp.id]
+    );
+
+    const elegibles = candidatos.filter((c) => !c.requiere_confirmacion_individual);
+    const bloqueados = candidatos.filter((c) => c.requiere_confirmacion_individual);
+    const duplicadosCodigo = candidatos.filter((c) => c.duplicado_codigo_detectado).length;
+    const duplicadosSerie = candidatos.filter((c) => c.duplicado_serie_detectado).length;
+    const ambiguosNoHomologados = candidatos.filter((c) => c.es_ubicacion_no_homologada).length;
+
+    const sumUnits = (arr) => Number(
+      arr.reduce((acc, r) => acc + (r.cantidad_num !== null && r.cantidad_num !== undefined ? Number(r.cantidad_num) : 0), 0).toFixed(2)
+    );
+    const elegiblesSinSede = elegibles.filter((c) => c.campamento_id === null || c.campamento_id === undefined);
+    const unidadesElegibles = sumUnits(elegibles);
+    const unidadesElegiblesSinSede = sumUnits(elegiblesSinSede);
+
+    const unvalidatedReqAliases = requestedAliasesNorm.filter((k) => !destAliasNormSet.has(k));
+    const alertas = [];
+    if (unvalidatedReqAliases.length > 0) {
+      alertas.push(`Alias solicitados sin homologación confirmada para ${destCamp.codigo || destCamp.nombre}: ${unvalidatedReqAliases.join(', ')}.`);
+    }
+    if (duplicadosCodigo > 0) {
+      alertas.push(`Se detectaron ${duplicadosCodigo} artículo(s) con código de referencia duplicado en inventario activo; requieren confirmación individual.`);
+    }
+    if (duplicadosSerie > 0) {
+      alertas.push(`Se detectaron ${duplicadosSerie} artículo(s) con serial/IMEI duplicado en inventario activo; requieren confirmación individual.`);
+    }
+    if (ambiguosNoHomologados > 0) {
+      alertas.push(`Se detectaron ${ambiguosNoHomologados} artículo(s) con ubicación histórica no homologada; requieren confirmación individual.`);
+    }
+    alertas.push('La reasignación conserva intactas las cantidades físicas, códigos originales y ubicaciones históricas; no fusiona ni elimina artículos.');
+
+    const antes = {
+      total_articulos_global: Number(globalSnap?.total_arts || 0),
+      total_unidades_global: Number(globalSnap?.total_unids || 0),
+      sin_sede_articulos: Number(sinSedeSnap?.total_arts || 0),
+      sin_sede_unidades: Number(sinSedeSnap?.total_unids || 0),
+      campamento_destino_articulos: Number(destSnap?.total_arts || 0),
+      campamento_destino_unidades: Number(destSnap?.total_unids || 0)
+    };
+
+    const despuesSimulado = {
+      total_articulos_global: antes.total_articulos_global,
+      total_unidades_global: antes.total_unidades_global,
+      sin_sede_articulos: antes.sin_sede_articulos - elegiblesSinSede.length,
+      sin_sede_unidades: Number((antes.sin_sede_unidades - unidadesElegiblesSinSede).toFixed(2)),
+      campamento_destino_articulos: antes.campamento_destino_articulos + elegibles.length,
+      campamento_destino_unidades: Number((antes.campamento_destino_unidades + unidadesElegibles).toFixed(2)),
+      pendientes_revision_individual: bloqueados.length
+    };
+
+    res.json({
+      success: true,
+      campamento_destino: {
+        id: destCamp.id,
+        codigo: destCamp.codigo || null,
+        nombre: destCamp.nombre
+      },
+      almacen_destino: destAlm ? { id: destAlm.id, nombre: destAlm.nombre } : null,
+      aliases_evaluados: destAliases,
+      antes,
+      despues_simulado: despuesSimulado,
+      resumen: {
+        total_candidatos: candidatos.length,
+        elegibles: elegibles.length,
+        bloqueados_revision_individual: bloqueados.length,
+        duplicados_codigo: duplicadosCodigo,
+        duplicados_serie: duplicadosSerie,
+        ambiguos_no_homologados: ambiguosNoHomologados,
+        cantidad_unidades_a_reasignar: unidadesElegibles,
+        impacto_cantidades_alteradas: 0,
+        impacto_fusiones_articulos: 0
+      },
+      alertas,
+      candidatos
+    });
+  } catch (error) {
+    console.error('Reasignaciones preview error:', error);
+    const status = isDbUnavailableError(error) ? 503 : 500;
+    res.status(status).json({ success: false, message: 'Error generando vista previa de reasignación.' });
+  }
+});
+
+router.post('/campamentos/reasignaciones/aplicar', requireAuth, requirePermission('camp:operar'), async (req, res) => {
+  const pool = getPool();
+  let conn = null;
+  let inTransaction = false;
+  try {
+    const scope = await getUserAllowedCampamentos(pool, req.user);
+    if (!scope.isGlobal) {
+      return res.status(403).json({
+        success: false,
+        message: 'Acceso denegado: Solo perfiles globales pueden aplicar reasignaciones de artículos sin sede verificada.'
+      });
+    }
+
+    const schemaCaps = await getSchemaCapabilities(pool);
+    if (!schemaCaps.campamentoAlias?.exists) {
+      return res.status(503).json({
+        success: false,
+        message: 'La tabla inv_campamento_alias no está disponible en el esquema actual.'
+      });
+    }
+
+    const {
+      campamento_destino_id,
+      campamento_destino_codigo,
+      almacen_destino_id,
+      articulo_ids,
+      confirmar_revision_individual_ids = [],
+      motivo,
+      incluir_sinteticos = false
+    } = req.body || {};
+
+    if (!Array.isArray(articulo_ids) || articulo_ids.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'Debe proporcionar una lista no vacía de articulo_ids.'
+      });
+    }
+
+    const parsedIds = [];
+    for (const rawId of articulo_ids) {
+      const pid = parsePositiveInt(rawId);
+      if (!pid) {
+        return res.status(400).json({
+          success: false,
+          message: 'Todos los elementos de articulo_ids deben ser enteros positivos válidos.'
+        });
+      }
+      parsedIds.push(pid);
+    }
+    const uniqueIds = Array.from(new Set(parsedIds));
+
+    if (confirmar_revision_individual_ids !== undefined && confirmar_revision_individual_ids !== null && !Array.isArray(confirmar_revision_individual_ids)) {
+      return res.status(400).json({
+        success: false,
+        message: 'El campo confirmar_revision_individual_ids debe ser un arreglo de IDs.'
+      });
+    }
+    const confirmedSet = new Set();
+    if (Array.isArray(confirmar_revision_individual_ids)) {
+      for (const rawConfId of confirmar_revision_individual_ids) {
+        const cid = parsePositiveInt(rawConfId);
+        if (!cid) {
+          return res.status(400).json({
+            success: false,
+            message: 'Todos los elementos de confirmar_revision_individual_ids deben ser enteros positivos válidos.'
+          });
+        }
+        confirmedSet.add(cid);
+      }
+    }
+
+    const includeSynthetic = incluir_sinteticos === true;
+    const motivoText = asNonEmptyString(motivo) || 'Homologación controlada de sede por alias histórico';
+
+    const destResult = await resolveDestinoCampamentoYAlmacen(pool, {
+      campamento_destino_id,
+      campamento_destino_codigo,
+      almacen_destino_id
+    });
+    if (destResult.errorStatus) {
+      return res.status(destResult.errorStatus).json({ success: false, message: destResult.errorMessage });
+    }
+    const { destCamp, destAlm } = destResult;
+
+    conn = await pool.getConnection();
+    await conn.beginTransaction();
+    inTransaction = true;
+
+    const [snapBeforeRows] = await conn.query(
+      'SELECT COUNT(*) AS total_arts, COALESCE(SUM(COALESCE(cantidad_num, 0)), 0) AS total_unids FROM inv_articulos'
+    );
+    const prevTotalArts = Number(snapBeforeRows[0]?.total_arts || 0);
+    const prevTotalUnids = Number(snapBeforeRows[0]?.total_unids || 0);
+
+    const [selectedRows] = await conn.query(
+      'SELECT * FROM inv_articulos WHERE id IN (?) AND activo = 1 FOR UPDATE',
+      [uniqueIds]
+    );
+
+    if (selectedRows.length !== uniqueIds.length) {
+      const foundSet = new Set(selectedRows.map((r) => r.id));
+      const missingIds = uniqueIds.filter((id) => !foundSet.has(id));
+      inTransaction = false;
+      await safeRollback(conn);
+      return res.status(404).json({
+        success: false,
+        message: 'Uno o más artículos seleccionados no existen o están inactivos.',
+        missing_ids: missingIds
+      });
+    }
+
+    if (!includeSynthetic && selectedRows.some((r) => Number(r.es_sintetico) === 1)) {
+      inTransaction = false;
+      await safeRollback(conn);
+      return res.status(400).json({
+        success: false,
+        message: 'La selección incluye registros sintéticos de prueba. Active incluir_sinteticos únicamente en pruebas controladas.'
+      });
+    }
+
+    const [destAliases] = await conn.query(
+      `SELECT * FROM inv_campamento_alias
+       WHERE campamento_id = ? AND estado_validacion = 'CONFIRMADO'
+       ORDER BY requiere_revision_historica ASC, id ASC`,
+      [destCamp.id]
+    );
+
+    const evaluated = await evaluateReasignacionCandidatos(conn, selectedRows, destCamp, destAliases, includeSynthetic);
+    const bloqueados = evaluated.filter((ev) => ev.requiere_confirmacion_individual && !confirmedSet.has(ev.id));
+
+    if (bloqueados.length > 0) {
+      inTransaction = false;
+      await safeRollback(conn);
+      return res.status(409).json({
+        success: false,
+        code: 'REVISION_INDIVIDUAL_REQUERIDA',
+        message: `Se detectaron ${bloqueados.length} artículo(s) que requieren confirmación individual explícita antes de reasignar.`,
+        bloqueados: bloqueados.map((b) => ({
+          id: b.id,
+          codigo_original: b.codigo_original,
+          articulo_nombre: b.articulo_nombre,
+          serie_imei: b.serie_imei,
+          ubicacion_nombre: b.ubicacion_nombre,
+          campamento_id_actual: b.campamento_id,
+          duplicado_codigo_detectado: b.duplicado_codigo_detectado,
+          duplicado_serie_detectado: b.duplicado_serie_detectado,
+          es_ubicacion_no_homologada: b.es_ubicacion_no_homologada,
+          ya_asignado_sede: b.ya_asignado_sede,
+          conflictos_codigo: b.conflictos_codigo,
+          conflictos_serie: b.conflictos_serie,
+          motivos_bloqueo: b.motivos_bloqueo
+        }))
+      });
+    }
+
+    const timestampIso = new Date().toISOString().slice(0, 10);
+    const destTag = destCamp.codigo ? `${destCamp.codigo} (${destCamp.nombre})` : destCamp.nombre;
+    const destAlmId = destAlm ? destAlm.id : null;
+    const updatedIds = [];
+
+    for (const art of evaluated) {
+      const traceNote = `[Reasignación sede ${timestampIso}: "${art.ubicacion_nombre || 'SIN_UBICACION'}" -> ${destTag} | Motivo: ${motivoText} | Usuario: ${req.user.nombre}]`;
+      const newObs = art.observaciones && String(art.observaciones).trim() !== ''
+        ? `${String(art.observaciones).trim()}\n${traceNote}`
+        : traceNote;
+
+      await conn.query(
+        `UPDATE inv_articulos
+         SET campamento_id = ?,
+             almacen_id = ?,
+             estado_vinculacion_sede = 'CONFIRMADO',
+             observaciones = ?
+         WHERE id = ?`,
+        [destCamp.id, destAlmId, newObs, art.id]
+      );
+      updatedIds.push(art.id);
+    }
+
+    await logAudit(conn, {
+      usuario_id: req.user.id,
+      usuario_nombre: req.user.nombre,
+      accion: 'REASIGNACION_CAMPAMENTO_ALIAS',
+      entidad: 'inv_campamentos',
+      entidad_id: destCamp.id,
+      detalles_previos: {
+        total_articulos_previo: prevTotalArts,
+        total_unidades_previo: prevTotalUnids,
+        articulos: evaluated.map((ev) => ({
+          id: ev.id,
+          codigo_original: ev.codigo_original,
+          ubicacion_nombre: ev.ubicacion_nombre,
+          campamento_id: ev.campamento_id,
+          almacen_id: ev.almacen_id,
+          estado_vinculacion_sede: ev.estado_vinculacion_sede,
+          cantidad_num: ev.cantidad_num
+        }))
+      },
+      detalles_nuevos: {
+        campamento_destino_id: destCamp.id,
+        campamento_destino_codigo: destCamp.codigo || null,
+        campamento_destino_nombre: destCamp.nombre,
+        almacen_destino_id: destAlmId,
+        motivo: motivoText,
+        reasignados: updatedIds.length,
+        articulo_ids: updatedIds,
+        confirmar_revision_individual_ids: Array.from(confirmedSet),
+        aliases_coincidentes: Array.from(new Set(evaluated.map((ev) => ev.ubicacion_normalizada).filter(Boolean)))
+      },
+      req
+    });
+
+    const [snapAfterRows] = await conn.query(
+      'SELECT COUNT(*) AS total_arts, COALESCE(SUM(COALESCE(cantidad_num, 0)), 0) AS total_unids FROM inv_articulos'
+    );
+    const afterTotalArts = Number(snapAfterRows[0]?.total_arts || 0);
+    const afterTotalUnids = Number(snapAfterRows[0]?.total_unids || 0);
+
+    if (afterTotalArts !== prevTotalArts || Math.abs(afterTotalUnids - prevTotalUnids) >= 0.001) {
+      inTransaction = false;
+      await safeRollback(conn);
+      return res.status(500).json({
+        success: false,
+        message: 'Fallo de verificación de integridad de inventario tras reasignación. Operación revertida.'
+      });
+    }
+
+    await conn.commit();
+    inTransaction = false;
+
+    res.json({
+      success: true,
+      message: `${updatedIds.length} artículo(s) reasignado(s) de forma segura a "${destCamp.nombre}".`,
+      reasignados: updatedIds.length,
+      articulo_ids: updatedIds,
+      campamento_destino: {
+        id: destCamp.id,
+        codigo: destCamp.codigo || null,
+        nombre: destCamp.nombre
+      },
+      almacen_destino: destAlm ? { id: destAlm.id, nombre: destAlm.nombre } : null,
+      integridad_cantidades: {
+        intacto: true,
+        total_articulos_antes: prevTotalArts,
+        total_articulos_despues: afterTotalArts,
+        total_unidades_antes: prevTotalUnids,
+        total_unidades_despues: afterTotalUnids
+      }
+    });
+  } catch (error) {
+    if (conn && inTransaction) {
+      await safeRollback(conn);
+    }
+    console.error('Reasignaciones aplicar error:', error);
+    const status = isDbUnavailableError(error, conn) ? 503 : 500;
+    res.status(status).json({
+      success: false,
+      message: status === 503
+        ? 'Base de datos temporalmente no disponible. Intente nuevamente.'
+        : 'Error aplicando reasignación transaccional de campamento.'
+    });
+  } finally {
+    safeRelease(conn);
+  }
+});
+
+router.put('/campamentos/:id', requireAuth, requirePermission('camp:operar'), async (req, res) => {
+  try {
+    const db = getPool();
+    const campamentoId = parsePositiveInt(req.params.id);
+    if (!campamentoId) {
+      return res.status(400).json({ success: false, message: 'ID de campamento inválido.' });
+    }
+
+    const scope = await getUserAllowedCampamentos(db, req.user);
+    if (!scope.isGlobal && !scope.campamentoIds.includes(campamentoId)) {
+      return res.status(403).json({
+        success: false,
+        message: 'Acceso denegado: No tiene autorización para modificar este campamento.'
+      });
+    }
+
+    const [prevRows] = await db.query(
+      'SELECT * FROM inv_campamentos WHERE id = ? AND activo = 1 LIMIT 1',
+      [campamentoId]
+    );
+    if (prevRows.length === 0) {
+      return res.status(404).json({ success: false, message: 'Campamento no encontrado.' });
+    }
+    const prev = prevRows[0];
+    const schemaCaps = await getSchemaCapabilities(db);
+
+    const {
+      nombre,
+      codigo,
+      provincia,
+      direccion,
+      responsable,
+      telefono,
+      ubicacion_historica_equivalente,
+      clasificacion_sede
+    } = req.body || {};
+
+    const updateClauses = [];
+    const updateParams = [];
+
+    if (nombre !== undefined) {
+      if (typeof nombre !== 'string' || !nombre.trim()) {
+        return res.status(400).json({ success: false, message: 'El nombre del campamento no puede estar vacío.' });
+      }
+      const cleanNombre = nombre.trim().toUpperCase();
+      const [dupNombre] = await db.query(
+        'SELECT id FROM inv_campamentos WHERE UPPER(TRIM(nombre)) = ? AND id <> ? LIMIT 1',
+        [cleanNombre, campamentoId]
+      );
+      if (dupNombre.length > 0) {
+        return res.status(409).json({
+          success: false,
+          message: `Ya existe otro campamento registrado con el nombre "${cleanNombre}".`
+        });
+      }
+      updateClauses.push('nombre = ?');
+      updateParams.push(cleanNombre);
+    }
+
+    if (codigo !== undefined) {
+      if (codigo !== null && typeof codigo !== 'string') {
+        return res.status(400).json({ success: false, message: 'El código del campamento es inválido.' });
+      }
+      const cleanCodigo = (typeof codigo === 'string' && codigo.trim() !== '')
+        ? codigo.trim().toUpperCase()
+        : null;
+      if (cleanCodigo) {
+        const [dupCodigo] = await db.query(
+          'SELECT id FROM inv_campamentos WHERE UPPER(TRIM(codigo)) = ? AND id <> ? LIMIT 1',
+          [cleanCodigo, campamentoId]
+        );
+        if (dupCodigo.length > 0) {
+          return res.status(409).json({
+            success: false,
+            message: `Ya existe otro campamento registrado con el código "${cleanCodigo}".`
+          });
+        }
+      }
+      updateClauses.push('codigo = ?');
+      updateParams.push(cleanCodigo);
+    }
+
+    const optionalFields = [
+      ['provincia', provincia],
+      ['direccion', direccion],
+      ['responsable', responsable],
+      ['telefono', telefono],
+      ['ubicacion_historica_equivalente', ubicacion_historica_equivalente]
+    ];
+    for (const [colName, rawVal] of optionalFields) {
+      if (rawVal !== undefined) {
+        if (rawVal !== null && typeof rawVal !== 'string') {
+          return res.status(400).json({ success: false, message: `El campo ${colName} es inválido.` });
+        }
+        updateClauses.push(`${colName} = ?`);
+        updateParams.push(asNonEmptyString(rawVal));
+      }
+    }
+
+    if (clasificacion_sede !== undefined) {
+      if (!scope.isGlobal) {
+        return res.status(403).json({
+          success: false,
+          message: 'Acceso denegado: Solo perfiles globales pueden cambiar la clasificación de sede.'
+        });
+      }
+      if (schemaCaps.campamentos.hasClasificacionSede) {
+        const cleanClasif = String(clasificacion_sede || '').trim().toUpperCase();
+        const validClasifs = schemaCaps.campamentos.clasificacionValues;
+        if (validClasifs.length > 0 && !validClasifs.includes(cleanClasif)) {
+          return res.status(400).json({
+            success: false,
+            message: `clasificacion_sede inválida. Valores permitidos: ${validClasifs.join(', ')}.`
+          });
+        }
+        updateClauses.push('clasificacion_sede = ?');
+        updateParams.push(cleanClasif);
+      }
+    }
+
+    if (updateClauses.length === 0) {
+      return res.status(400).json({ success: false, message: 'No se enviaron campos válidos para actualizar.' });
+    }
+
+    updateParams.push(campamentoId);
+    await db.query(
+      `UPDATE inv_campamentos SET ${updateClauses.join(', ')} WHERE id = ?`,
+      updateParams
+    );
+
+    const [updatedRows] = await db.query('SELECT * FROM inv_campamentos WHERE id = ? LIMIT 1', [campamentoId]);
+
+    await logAudit(db, {
+      usuario_id: req.user.id,
+      usuario_nombre: req.user.nombre,
+      accion: 'ACTUALIZACION_CAMPAMENTO',
+      entidad: 'inv_campamentos',
+      entidad_id: campamentoId,
+      detalles_previos: prev,
+      detalles_nuevos: updatedRows[0] || req.body,
+      req
+    });
+
+    res.json({
+      success: true,
+      message: 'Campamento actualizado exitosamente.',
+      campamento: updatedRows[0]
+    });
+  } catch (error) {
+    if (error?.code === 'ER_DUP_ENTRY') {
+      return res.status(409).json({
+        success: false,
+        message: 'Ya existe un campamento con el mismo nombre o código.'
+      });
+    }
+    console.error('Update campamento error:', error);
+    const status = isDbUnavailableError(error) ? 503 : 500;
+    res.status(status).json({ success: false, message: 'Error actualizando campamento.' });
+  }
+});
+
+router.post('/campamentos/:id/almacenes', requireAuth, requirePermission('camp:operar'), async (req, res) => {
+  try {
+    const db = getPool();
+    const campamentoId = parsePositiveInt(req.params.id);
+    if (!campamentoId) {
+      return res.status(400).json({ success: false, message: 'ID de campamento inválido.' });
+    }
+
+    const scope = await getUserAllowedCampamentos(db, req.user);
+    if (!scope.isGlobal && !scope.campamentoIds.includes(campamentoId)) {
+      return res.status(403).json({
+        success: false,
+        message: 'Acceso denegado: No tiene autorización para crear almacenes en este campamento.'
+      });
+    }
+
+    const { nombre, tipo = 'General', encargado, descripcion } = req.body || {};
+
+    if (typeof nombre !== 'string' || nombre.trim() === '') {
       return res.status(400).json({ success: false, message: 'El nombre del almacén es obligatorio.' });
     }
 
-    const [camp] = await db.query('SELECT id, nombre FROM inv_campamentos WHERE id = ?', [campamentoId]);
+    const [camp] = await db.query('SELECT id, nombre FROM inv_campamentos WHERE id = ? AND activo = 1', [campamentoId]);
     if (camp.length === 0) {
       return res.status(404).json({ success: false, message: 'Campamento no encontrado.' });
     }
@@ -2803,13 +6242,25 @@ router.post('/campamentos/:id/almacenes', requireAuth, requireRole(['admin', 'al
       [campamentoId, nombre.trim(), tipo, encargado || null, descripcion || null]
     );
 
+    await logAudit(db, {
+      usuario_id: req.user.id,
+      usuario_nombre: req.user.nombre,
+      accion: 'CREACION_ALMACEN',
+      entidad: 'inv_almacenes',
+      entidad_id: resAlm.insertId,
+      detalles_nuevos: { campamento_id: campamentoId, nombre: nombre.trim(), tipo },
+      req
+    });
+
     res.status(201).json({
       success: true,
-      message: `Almacén "${nombre}" agregado al campamento "${camp[0].nombre}".`,
+      message: `Almacén "${nombre.trim()}" agregado al campamento "${camp[0].nombre}".`,
       id: resAlm.insertId
     });
   } catch (error) {
-    res.status(500).json({ success: false, message: 'Error agregando almacén.' });
+    console.error('Create almacen error:', error);
+    const status = isDbUnavailableError(error) ? 503 : 500;
+    res.status(status).json({ success: false, message: 'Error agregando almacén.' });
   }
 });
 
@@ -2817,34 +6268,46 @@ router.post('/campamentos/:id/almacenes', requireAuth, requireRole(['admin', 'al
 // 8.1 CATÁLOGOS DINÁMICOS: CATEGORÍAS Y CUSTODIOS
 // ==========================================
 
-router.get('/catalogos/categorias', requireAuth, async (req, res) => {
+router.get('/catalogos/categorias', requireAuth, requireAnyPermission(['inv:ver', 'inv:crear', 'lev:ver', 'lev:capturar', 'rep:ver']), async (req, res) => {
   try {
     const db = getPool();
+    const schemaCaps = await getSchemaCapabilities(db);
+    const scope = await getUserAllowedCampamentos(db, req.user);
     const { area, incluir_sinteticos } = req.query;
     const includeSynthetic = incluir_sinteticos === 'true';
-    const normArea = area ? area.toUpperCase().trim() : null;
+    const areaParam = asNonEmptyString(area);
+    const normArea = areaParam ? areaParam.toUpperCase() : null;
 
     let catRows = [];
-    try {
-      if (normArea && normArea !== 'TODAS') {
-        const [rows] = await db.query(
-          `SELECT nombre FROM inv_categorias WHERE activo = 1 ${includeSynthetic ? '' : 'AND es_sintetico = 0'} AND area = ? ORDER BY nombre ASC`,
-          [normArea]
-        );
-        catRows = rows.map(r => r.nombre);
-      } else {
-        const [rows] = await db.query(
-          `SELECT nombre FROM inv_categorias WHERE activo = 1 ${includeSynthetic ? '' : 'AND es_sintetico = 0'} ORDER BY nombre ASC`
-        );
-        catRows = rows.map(r => r.nombre);
+    if (schemaCaps.categorias.exists) {
+      const syntCond = (!includeSynthetic && schemaCaps.categorias.hasEsSintetico) ? 'AND es_sintetico = 0' : '';
+      try {
+        if (normArea && normArea !== 'TODAS') {
+          const [rows] = await db.query(
+            `SELECT nombre FROM inv_categorias WHERE activo = 1 ${syntCond} AND area = ? ORDER BY nombre ASC`,
+            [normArea]
+          );
+          catRows = rows.map(r => r.nombre);
+        } else {
+          const [rows] = await db.query(
+            `SELECT nombre FROM inv_categorias WHERE activo = 1 ${syntCond} ORDER BY nombre ASC`
+          );
+          catRows = rows.map(r => r.nombre);
+        }
+      } catch (catErr) {
+        console.error('Error consultando inv_categorias:', catErr?.message || catErr);
+        catRows = [];
       }
-    } catch (e) {
-      catRows = [];
     }
 
-    // Unificar con valores existentes en inv_articulos
+    // Unificar con valores existentes en inv_articulos acotado al scope del usuario
     let artCatQuery = `SELECT DISTINCT categoria FROM inv_articulos WHERE activo = 1 ${includeSynthetic ? '' : 'AND es_sintetico = 0'} AND categoria IS NOT NULL AND categoria != ""`;
     const artCatParams = [];
+    if (!scope.isGlobal) {
+      const artScope = buildArticleScopeFilter(scope, '');
+      artCatQuery += ` AND ${artScope.sql}`;
+      artCatParams.push(...artScope.params);
+    }
     if (normArea && normArea !== 'TODAS') {
       artCatQuery += ' AND area = ?';
       artCatParams.push(normArea);
@@ -2869,45 +6332,33 @@ router.get('/catalogos/categorias', requireAuth, async (req, res) => {
     res.json({ success: true, categorias: finalCategorias });
   } catch (error) {
     console.error('List categorias error:', error);
-    res.status(500).json({ success: false, message: 'Error consultando catálogo de categorías.' });
+    const status = isDbUnavailableError(error) ? 503 : 500;
+    res.status(status).json({ success: false, message: 'Error consultando catálogo de categorías.' });
   }
 });
 
-router.post('/catalogos/categorias', requireAuth, requireRole(['admin', 'almacen', 'supervisor']), async (req, res) => {
+router.post('/catalogos/categorias', requireAuth, requirePermission('inv:crear'), async (req, res) => {
   try {
     const db = getPool();
-    const { area, nombre } = req.body;
-    if (!area || !nombre || !nombre.trim()) {
+    const { area, nombre } = req.body || {};
+    if (typeof area !== 'string' || !area.trim() || typeof nombre !== 'string' || !nombre.trim()) {
       return res.status(400).json({ success: false, message: 'Área y nombre de categoría son obligatorios.' });
     }
 
     const normArea = area.toUpperCase().trim();
     const cleanNombre = nombre.trim();
 
-    // Comprobar duplicado en la base de datos
-    try {
-      const [existing] = await db.query(
-        'SELECT id, nombre FROM inv_categorias WHERE area = ? AND LOWER(nombre) = LOWER(?)',
-        [normArea, cleanNombre]
-      );
-      if (existing.length > 0) {
-        return res.status(409).json({
-          success: false,
-          message: `La categoría "${existing[0].nombre}" ya existe para el área ${normArea}.`,
-          categoria: existing[0].nombre
-        });
-      }
-    } catch (e) {
-      await db.query(`
-        CREATE TABLE IF NOT EXISTS inv_categorias (
-          id INT AUTO_INCREMENT PRIMARY KEY,
-          area VARCHAR(50) NOT NULL,
-          nombre VARCHAR(100) NOT NULL,
-          activo TINYINT DEFAULT 1,
-          creado_en TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-          UNIQUE KEY uq_area_nombre (area, nombre)
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-      `);
+    // Comprobar duplicado en la base de datos (cero DDL en tiempo de petición HTTP)
+    const [existing] = await db.query(
+      'SELECT id, nombre FROM inv_categorias WHERE area = ? AND LOWER(nombre) = LOWER(?)',
+      [normArea, cleanNombre]
+    );
+    if (existing.length > 0) {
+      return res.status(409).json({
+        success: false,
+        message: `La categoría "${existing[0].nombre}" ya existe para el área ${normArea}.`,
+        categoria: existing[0].nombre
+      });
     }
 
     const [resInsert] = await db.query(
@@ -2926,42 +6377,76 @@ router.post('/catalogos/categorias', requireAuth, requireRole(['admin', 'almacen
     });
   } catch (error) {
     console.error('Create categoria error:', error);
-    if (error.code === 'ER_DUP_ENTRY') {
+    if (error?.code === 'ER_DUP_ENTRY') {
       return res.status(409).json({ success: false, message: 'La categoría ya existe.' });
     }
-    res.status(500).json({ success: false, message: 'Error registrando categoría.' });
+    const status = isDbUnavailableError(error) ? 503 : 500;
+    res.status(status).json({ success: false, message: 'Error registrando categoría.' });
   }
 });
 
-router.get('/catalogos/custodios', requireAuth, async (req, res) => {
+router.get('/catalogos/custodios', requireAuth, requireAnyPermission(['inv:ver', 'inv:crear', 'lev:ver', 'lev:capturar', 'rep:ver']), async (req, res) => {
   try {
     const db = getPool();
+    const schemaCaps = await getSchemaCapabilities(db);
+    const scope = await getUserAllowedCampamentos(db, req.user);
     const { q, incluir_sinteticos } = req.query;
     const includeSynthetic = incluir_sinteticos === 'true';
+    const searchQuery = asNonEmptyString(q);
 
     let custRows = [];
-    try {
-      const [rows] = await db.query(
-        `SELECT id, nombre, cargo, departamento, telefono FROM inv_custodios WHERE activo = 1 ${includeSynthetic ? '' : 'AND es_sintetico = 0'} ORDER BY nombre ASC`
-      );
-      custRows = rows;
-    } catch (e) {
-      custRows = [];
+    if (scope.isGlobal && schemaCaps.custodios.exists) {
+      try {
+        const custCols = ['id', 'nombre', 'cargo'];
+        if (schemaCaps.custodios.hasDepartamento) custCols.push('departamento');
+        if (schemaCaps.custodios.hasTelefono) custCols.push('telefono');
+        const syntCond = (!includeSynthetic && schemaCaps.custodios.hasEsSintetico) ? 'AND es_sintetico = 0' : '';
+        const [rows] = await db.query(
+          `SELECT ${custCols.join(', ')} FROM inv_custodios WHERE activo = 1 ${syntCond} ORDER BY nombre ASC`
+        );
+        custRows = rows;
+      } catch (custErr) {
+        console.error('Error consultando inv_custodios:', custErr?.message || custErr);
+        custRows = [];
+      }
     }
 
-    // Unificar con asignados de inv_articulos
-    const [artCusts] = await db.query(
-      `SELECT DISTINCT asignado_a as nombre FROM inv_articulos WHERE activo = 1 ${includeSynthetic ? '' : 'AND es_sintetico = 0'} AND asignado_a IS NOT NULL AND asignado_a != ""`
-    );
+    // Unificar con asignados de inv_articulos (acotado al scope cuando !scope.isGlobal)
+    let artCustQuery = `SELECT DISTINCT asignado_a as nombre FROM inv_articulos WHERE activo = 1 ${includeSynthetic ? '' : 'AND es_sintetico = 0'} AND asignado_a IS NOT NULL AND asignado_a != ""`;
+    const artCustParams = [];
+    if (!scope.isGlobal) {
+      const artScope = buildArticleScopeFilter(scope, '');
+      artCustQuery += ` AND ${artScope.sql}`;
+      artCustParams.push(...artScope.params);
+    }
+    const [artCusts] = await db.query(artCustQuery, artCustParams);
 
-    // Unificar con responsables de inv_levantamiento_items
+    // Unificar con responsables de inv_levantamiento_items (acotado al scope cuando !scope.isGlobal)
     let levCusts = [];
-    try {
-      const [rows] = await db.query(
-        `SELECT DISTINCT responsable_custodio as nombre FROM inv_levantamiento_items WHERE responsable_custodio IS NOT NULL AND responsable_custodio != "" ${includeSynthetic ? '' : 'AND es_sintetico = 0'}`
-      );
-      levCusts = rows;
-    } catch (e) {}
+    if (schemaCaps.levantamientos.exists) {
+      try {
+        if (scope.isGlobal) {
+          const [rows] = await db.query(
+            `SELECT DISTINCT responsable_custodio as nombre FROM inv_levantamiento_items WHERE responsable_custodio IS NOT NULL AND responsable_custodio != "" ${includeSynthetic ? '' : 'AND es_sintetico = 0'}`
+          );
+          levCusts = rows;
+        } else if (scope.campamentoIds.length > 0) {
+          const [rows] = await db.query(
+            `SELECT DISTINCT li.responsable_custodio as nombre
+             FROM inv_levantamiento_items li
+             JOIN inv_levantamientos l ON li.levantamiento_id = l.id
+             WHERE li.responsable_custodio IS NOT NULL AND li.responsable_custodio != ""
+               ${includeSynthetic ? '' : 'AND li.es_sintetico = 0 AND l.es_sintetico = 0'}
+               AND l.campamento_id IN (?)`,
+            [scope.campamentoIds]
+          );
+          levCusts = rows;
+        }
+      } catch (levCustErr) {
+        console.error('Error consultando custodios de levantamientos:', levCustErr?.message || levCustErr);
+        levCusts = [];
+      }
+    }
 
     const map = new Map();
     const addCust = (item) => {
@@ -2973,8 +6458,8 @@ router.get('/catalogos/custodios', requireAuth, async (req, res) => {
           id: item.id || null,
           nombre: name,
           cargo: item.cargo || 'Personal de Campo',
-          departamento: item.departamento || null,
-          telefono: item.telefono || null
+          departamento: scope.isGlobal ? (item.departamento || null) : null,
+          telefono: scope.isGlobal ? (item.telefono || null) : null
         });
       }
     };
@@ -2984,8 +6469,8 @@ router.get('/catalogos/custodios', requireAuth, async (req, res) => {
     levCusts.forEach(addCust);
 
     let list = Array.from(map.values());
-    if (q && q.trim()) {
-      const searchLower = q.trim().toLowerCase();
+    if (searchQuery) {
+      const searchLower = searchQuery.toLowerCase();
       list = list.filter(c => c.nombre.toLowerCase().includes(searchLower) || (c.cargo && c.cargo.toLowerCase().includes(searchLower)));
     }
 
@@ -2994,51 +6479,53 @@ router.get('/catalogos/custodios', requireAuth, async (req, res) => {
     res.json({ success: true, custodios: list });
   } catch (error) {
     console.error('List custodios error:', error);
-    res.status(500).json({ success: false, message: 'Error consultando catálogo de custodios.' });
+    const status = isDbUnavailableError(error) ? 503 : 500;
+    res.status(status).json({ success: false, message: 'Error consultando catálogo de custodios.' });
   }
 });
 
-router.post('/catalogos/custodios', requireAuth, requireRole(['admin', 'almacen', 'supervisor']), async (req, res) => {
+router.post('/catalogos/custodios', requireAuth, requirePermission('inv:crear'), async (req, res) => {
   try {
     const db = getPool();
-    const { nombre, cargo, departamento, telefono } = req.body;
-    if (!nombre || !nombre.trim()) {
+    const schemaCaps = await getSchemaCapabilities(db);
+    const { nombre, cargo, departamento, telefono } = req.body || {};
+    if (typeof nombre !== 'string' || !nombre.trim()) {
       return res.status(400).json({ success: false, message: 'El nombre del custodio o responsable es obligatorio.' });
     }
 
     const cleanNombre = nombre.trim();
+    const cleanCargo = typeof cargo === 'string' && cargo.trim() ? cargo.trim() : 'Personal de Campo';
+    const cleanDepto = typeof departamento === 'string' && departamento.trim() ? departamento.trim() : null;
+    const cleanTel = typeof telefono === 'string' && telefono.trim() ? telefono.trim() : null;
 
-    // Comprobar duplicado en la base de datos
-    try {
-      const [existing] = await db.query(
-        'SELECT id, nombre FROM inv_custodios WHERE LOWER(nombre) = LOWER(?)',
-        [cleanNombre]
-      );
-      if (existing.length > 0) {
-        return res.status(409).json({
-          success: false,
-          message: `El responsable "${existing[0].nombre}" ya existe en el catálogo.`,
-          custodio: existing[0]
-        });
-      }
-    } catch (e) {
-      await db.query(`
-        CREATE TABLE IF NOT EXISTS inv_custodios (
-          id INT AUTO_INCREMENT PRIMARY KEY,
-          nombre VARCHAR(150) NOT NULL,
-          cargo VARCHAR(100) NULL,
-          departamento VARCHAR(100) NULL,
-          telefono VARCHAR(50) NULL,
-          activo TINYINT DEFAULT 1,
-          creado_en TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-          UNIQUE KEY uq_custodio_nombre (nombre)
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-      `);
+    // Comprobar duplicado en la base de datos (cero DDL en tiempo de petición HTTP)
+    const [existing] = await db.query(
+      'SELECT id, nombre FROM inv_custodios WHERE LOWER(nombre) = LOWER(?)',
+      [cleanNombre]
+    );
+    if (existing.length > 0) {
+      return res.status(409).json({
+        success: false,
+        message: `El responsable "${existing[0].nombre}" ya existe en el catálogo.`,
+        custodio: existing[0]
+      });
     }
 
+    const insertCols = ['nombre', 'cargo', 'activo'];
+    const insertVals = [cleanNombre, cleanCargo, 1];
+    if (schemaCaps.custodios.hasDepartamento) {
+      insertCols.push('departamento');
+      insertVals.push(cleanDepto);
+    }
+    if (schemaCaps.custodios.hasTelefono) {
+      insertCols.push('telefono');
+      insertVals.push(cleanTel);
+    }
+
+    const placeholders = insertCols.map(() => '?').join(', ');
     const [resInsert] = await db.query(
-      'INSERT INTO inv_custodios (nombre, cargo, departamento, telefono, activo) VALUES (?, ?, ?, ?, 1)',
-      [cleanNombre, cargo ? cargo.trim() : 'Personal de Campo', departamento ? departamento.trim() : null, telefono ? telefono.trim() : null]
+      `INSERT INTO inv_custodios (${insertCols.join(', ')}) VALUES (${placeholders})`,
+      insertVals
     );
 
     res.status(201).json({
@@ -3047,45 +6534,65 @@ router.post('/catalogos/custodios', requireAuth, requireRole(['admin', 'almacen'
       custodio: {
         id: resInsert.insertId,
         nombre: cleanNombre,
-        cargo: cargo ? cargo.trim() : 'Personal de Campo'
+        cargo: cleanCargo
       }
     });
   } catch (error) {
     console.error('Create custodio error:', error);
-    if (error.code === 'ER_DUP_ENTRY') {
+    if (error?.code === 'ER_DUP_ENTRY') {
       return res.status(409).json({ success: false, message: 'El responsable ya existe.' });
     }
-    res.status(500).json({ success: false, message: 'Error registrando responsable.' });
+    const status = isDbUnavailableError(error) ? 503 : 500;
+    res.status(status).json({ success: false, message: 'Error registrando responsable.' });
   }
 });
 
-router.get('/catalogos/ubicaciones', requireAuth, async (req, res) => {
+router.get('/catalogos/ubicaciones', requireAuth, requireAnyPermission(['inv:ver', 'inv:crear', 'lev:ver', 'lev:capturar', 'rep:ver']), async (req, res) => {
   try {
     const db = getPool();
+    const scope = await getUserAllowedCampamentos(db, req.user);
     const includeSynthetic = req.query.incluir_sinteticos === 'true';
 
-    // 1. Campamentos de inv_campamentos (excluyendo sintéticos por defecto)
+    // 1. Campamentos de inv_campamentos (acotados al scope cuando !scope.isGlobal)
     let campRows = [];
     try {
-      const [rows] = await db.query(
-        `SELECT id, nombre, codigo, provincia, responsable, clasificacion_sede
-         FROM inv_campamentos
-         WHERE activo = 1 ${includeSynthetic ? '' : 'AND es_sintetico = 0'}
-         ORDER BY CASE WHEN clasificacion_sede = 'CONFIRMADO' THEN 0 ELSE 1 END ASC, id ASC`
-      );
-      campRows = rows;
-    } catch (e) {
+      if (scope.isGlobal) {
+        const [rows] = await db.query(
+          `SELECT id, nombre, codigo, provincia, responsable, clasificacion_sede
+           FROM inv_campamentos
+           WHERE activo = 1 ${includeSynthetic ? '' : 'AND es_sintetico = 0'}
+           ORDER BY CASE WHEN clasificacion_sede = 'CONFIRMADO' THEN 0 ELSE 1 END ASC, id ASC`
+        );
+        campRows = rows;
+      } else if (scope.campamentoIds.length > 0) {
+        const [rows] = await db.query(
+          `SELECT id, nombre, codigo, provincia, responsable, clasificacion_sede
+           FROM inv_campamentos
+           WHERE activo = 1 ${includeSynthetic ? '' : 'AND es_sintetico = 0'} AND id IN (?)
+           ORDER BY CASE WHEN clasificacion_sede = 'CONFIRMADO' THEN 0 ELSE 1 END ASC, id ASC`,
+          [scope.campamentoIds]
+        );
+        campRows = rows;
+      }
+    } catch (campErr) {
+      console.error('Error consultando campamentos en catálogo ubicaciones:', campErr?.message || campErr);
       campRows = [];
     }
 
-    // 2. Ubicaciones históricas en inv_articulos
+    // 2. Ubicaciones históricas en inv_articulos (acotadas al scope cuando !scope.isGlobal)
     let artUbicRows = [];
     try {
-      const [rows] = await db.query(
-        `SELECT DISTINCT ubicacion_nombre FROM inv_articulos WHERE activo = 1 ${includeSynthetic ? '' : 'AND es_sintetico = 0'} AND ubicacion_nombre IS NOT NULL AND ubicacion_nombre != ""`
-      );
+      let artUbicQuery = `SELECT DISTINCT ubicacion_nombre FROM inv_articulos WHERE activo = 1 ${includeSynthetic ? '' : 'AND es_sintetico = 0'} AND ubicacion_nombre IS NOT NULL AND ubicacion_nombre != ""`;
+      const artUbicParams = [];
+      if (!scope.isGlobal) {
+        const artScope = buildArticleScopeFilter(scope, '');
+        artUbicQuery += ` AND ${artScope.sql}`;
+        artUbicParams.push(...artScope.params);
+      }
+      const [rows] = await db.query(artUbicQuery, artUbicParams);
       artUbicRows = rows.map(r => r.ubicacion_nombre);
-    } catch (e) {
+    } catch (ubicErr) {
+      console.error('Error consultando ubicaciones de artículos:', ubicErr?.message || ubicErr);
       artUbicRows = [];
     }
 
@@ -3109,13 +6616,16 @@ router.get('/catalogos/ubicaciones', requireAuth, async (req, res) => {
       if (!clean) continue;
       const lower = clean.toLowerCase();
       if (!map.has(lower)) {
-        const vinc = resolveCampamentoVinculacion(null, clean);
+        const vinc = await resolveCampamentoVinculacion(db, null, clean, { skipAlmacenLookup: true });
+        const visibleCampId = (scope.isGlobal || !vinc.campamento_id || scope.campamentoIds.includes(vinc.campamento_id))
+          ? vinc.campamento_id
+          : null;
         map.set(lower, {
           nombre: clean,
           tipo: vinc.estado_vinculacion_sede === 'SEDE_AMBIGUA' ? 'Ubicación Histórica (Sede Ambigua)' : 'Ubicación Histórica Excel',
           clasificacion_sede: vinc.estado_vinculacion_sede,
           provincia: null,
-          campamento_id: vinc.campamento_id
+          campamento_id: visibleCampId
         });
       }
     }
@@ -3155,15 +6665,20 @@ router.get('/levantamientos', requireAuth, requirePermission('lev:ver'), async (
       }
     }
 
-    if (estado && estado !== 'TODOS') {
+    const estadoParam = asNonEmptyString(estado);
+    if (estadoParam && estadoParam.toUpperCase() !== 'TODOS') {
       conditions.push('l.estado = ?');
-      params.push(estado);
+      params.push(estadoParam);
     }
 
-    if (campamento_id) {
-      const cId = parseInt(campamento_id);
-      if (!scope.isGlobal && !scope.campamentoIds.includes(cId)) {
+    const campamentoParam = asNonEmptyString(campamento_id);
+    if (campamento_id !== undefined && campamento_id !== '' && campamentoParam !== 'TODOS') {
+      const cId = parsePositiveInt(campamento_id);
+      if (!scope.isGlobal && (!cId || !scope.campamentoIds.includes(cId))) {
         return res.status(403).json({ success: false, message: 'Acceso denegado al campamento solicitado.' });
+      }
+      if (!cId) {
+        return res.status(400).json({ success: false, message: 'Parámetro campamento_id inválido.' });
       }
       conditions.push('l.campamento_id = ?');
       params.push(cId);
@@ -3194,9 +6709,10 @@ router.get('/levantamientos', requireAuth, requirePermission('lev:ver'), async (
 });
 
 router.post('/levantamientos', requireAuth, requirePermission('lev:crear'), async (req, res) => {
+  const pool = getPool();
+  let conn = null;
+  let inTransaction = false;
   try {
-    const db = getPool();
-    const scope = await getUserAllowedCampamentos(db, req.user);
     const {
       titulo,
       campamento_id,
@@ -3204,78 +6720,162 @@ router.post('/levantamientos', requireAuth, requirePermission('lev:crear'), asyn
       fecha_inicio,
       responsable_levantamiento,
       equipo_auditor,
-      notas
-    } = req.body;
+      notas,
+      es_sintetico
+    } = req.body || {};
 
     const actualFechaInicio = fecha_inicio || new Date().toISOString().split('T')[0];
 
-    if (!titulo || !campamento_id || !responsable_levantamiento) {
+    if (typeof titulo !== 'string' || !titulo.trim() || !campamento_id || typeof responsable_levantamiento !== 'string' || !responsable_levantamiento.trim()) {
       return res.status(400).json({
         success: false,
         message: 'Título, campamento y responsable son obligatorios.'
       });
     }
 
-    const cId = parseInt(campamento_id);
+    const cId = parsePositiveInt(campamento_id);
+    if (!cId) {
+      return res.status(400).json({ success: false, message: 'ID de campamento inválido.' });
+    }
+
+    let almIdParsed = null;
+    if (almacen_id !== undefined && almacen_id !== null && String(almacen_id).trim() !== '') {
+      almIdParsed = parsePositiveInt(almacen_id);
+      if (!almIdParsed) {
+        return res.status(400).json({ success: false, message: 'ID de almacén inválido.' });
+      }
+    }
+
+    conn = await pool.getConnection();
+    if (!conn) {
+      return res.status(503).json({ success: false, message: 'Servicio de base de datos no disponible temporalmente.' });
+    }
+    await conn.beginTransaction();
+    inTransaction = true;
+
+    const scope = await getUserAllowedCampamentos(conn, req.user);
     if (!scope.isGlobal && !scope.campamentoIds.includes(cId)) {
+      inTransaction = false;
+      await safeRollback(conn);
       return res.status(403).json({
         success: false,
         message: 'Acceso denegado: No tiene autorización para crear levantamientos en este campamento.'
       });
     }
 
-    // Auto-generate code e.g. LEV-2026-SC-001
-    const [cRows] = await db.query('SELECT codigo, nombre FROM inv_campamentos WHERE id = ?', [campamento_id]);
-    const campCode = cRows.length > 0 && cRows[0].codigo ? cRows[0].codigo : 'CAMP';
-    const year = new Date(actualFechaInicio).getFullYear() || 2026;
-    const [countRows] = await db.query('SELECT COUNT(*) as cnt FROM inv_levantamientos');
-    const nextSeq = String(countRows[0].cnt + 1).padStart(3, '0');
-    const codigoLev = `LEV-${year}-${campCode}-${nextSeq}`;
+    const [cRows] = await conn.query('SELECT id, codigo, nombre, es_sintetico FROM inv_campamentos WHERE id = ? AND activo = 1 FOR UPDATE', [cId]);
+    if (cRows.length === 0) {
+      inTransaction = false;
+      await safeRollback(conn);
+      return res.status(400).json({ success: false, message: 'El campamento seleccionado no existe o está inactivo.' });
+    }
 
-    const [insertRes] = await db.query(
+    if (almIdParsed) {
+      const [almRows] = await conn.query(
+        'SELECT id FROM inv_almacenes WHERE id = ? AND campamento_id = ? AND activo = 1 LIMIT 1',
+        [almIdParsed, cId]
+      );
+      if (almRows.length === 0) {
+        inTransaction = false;
+        await safeRollback(conn);
+        return res.status(400).json({ success: false, message: 'El almacén seleccionado no pertenece al campamento o está inactivo.' });
+      }
+    }
+
+    // Auto-generate code thread-safe via MAX suffix + FOR UPDATE (M07)
+    const campCode = cRows[0].codigo || 'CAMP';
+    const yearMatch = String(actualFechaInicio).match(/^(\d{4})/);
+    const year = yearMatch ? Number(yearMatch[1]) : (new Date().getFullYear() || 2026);
+    const codePrefix = `LEV-${year}-${campCode}-`;
+    const [existingLevCodes] = await conn.query(
+      'SELECT codigo_levantamiento FROM inv_levantamientos WHERE codigo_levantamiento LIKE ? FOR UPDATE',
+      [`${codePrefix}%`]
+    );
+    let maxSeq = 0;
+    for (const r of existingLevCodes) {
+      const m = String(r.codigo_levantamiento || '').match(/(\d+)$/);
+      if (m) {
+        const n = parseInt(m[1], 10);
+        if (!Number.isNaN(n) && n > maxSeq) maxSeq = n;
+      }
+    }
+    let seqNum = maxSeq + 1;
+    let codigoLev = `${codePrefix}${String(seqNum).padStart(3, '0')}`;
+    while (true) {
+      const [checkCode] = await conn.query(
+        'SELECT id FROM inv_levantamientos WHERE codigo_levantamiento = ? LIMIT 1 FOR UPDATE',
+        [codigoLev]
+      );
+      if (checkCode.length === 0) break;
+      seqNum++;
+      codigoLev = `${codePrefix}${String(seqNum).padStart(3, '0')}`;
+    }
+
+    const isSyntLev = (isTruthyFlag(es_sintetico) || Number(cRows[0].es_sintetico) === 1) ? 1 : 0;
+
+    const [insertRes] = await conn.query(
       `INSERT INTO inv_levantamientos (
         codigo_levantamiento, titulo, campamento_id, almacen_id, fecha_inicio,
-        responsable_levantamiento, equipo_auditor, estado, notas, creado_por
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, 'En proceso', ?, ?)`,
+        responsable_levantamiento, equipo_auditor, estado, notas, creado_por, es_sintetico
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, 'En proceso', ?, ?, ?)`,
       [
         codigoLev,
         titulo.trim(),
-        campamento_id,
-        almacen_id || null,
+        cId,
+        almIdParsed,
         actualFechaInicio,
         responsable_levantamiento.trim(),
-        equipo_auditor || null,
-        notas || null,
-        req.user.id
+        asNonEmptyString(equipo_auditor),
+        asNonEmptyString(notas),
+        req.user.id,
+        isSyntLev
       ]
     );
 
-    await logAudit(db, {
+    await logAudit(conn, {
       usuario_id: req.user.id,
       usuario_nombre: req.user.nombre,
       accion: 'CREACION_LEVANTAMIENTO',
       entidad: 'inv_levantamientos',
       entidad_id: insertRes.insertId,
-      detalles_nuevos: { codigoLev, titulo, campamento_id },
+      detalles_nuevos: { codigoLev, titulo: titulo.trim(), campamento_id: cId, es_sintetico: isSyntLev },
       req
     });
+
+    await conn.commit();
+    inTransaction = false;
 
     res.status(201).json({
       success: true,
       message: `Sesión de levantamiento "${codigoLev}" iniciada con éxito.`,
       id: insertRes.insertId,
-      codigo: codigoLev
+      codigo: codigoLev,
+      codigo_levantamiento: codigoLev
     });
   } catch (error) {
+    if (conn && inTransaction) {
+      await safeRollback(conn);
+    }
     console.error('Create levantamiento error:', error);
-    res.status(500).json({ success: false, message: 'Error creando sesión de levantamiento.' });
+    const status = isDbUnavailableError(error, conn) ? 503 : 500;
+    res.status(status).json({
+      success: false,
+      message: status === 503
+        ? 'Base de datos temporalmente no disponible. Intente nuevamente.'
+        : 'Error creando sesión de levantamiento.'
+    });
+  } finally {
+    safeRelease(conn);
   }
 });
 
 router.get('/levantamientos/:id', requireAuth, requirePermission('lev:ver'), async (req, res) => {
   try {
     const db = getPool();
-    const id = parseInt(req.params.id);
+    const id = parsePositiveInt(req.params.id);
+    if (!id) {
+      return res.status(400).json({ success: false, message: 'ID de levantamiento inválido.' });
+    }
 
     const [levs] = await db.query(`
       SELECT l.*,
@@ -3328,7 +6928,205 @@ router.get('/levantamientos/:id', requireAuth, requirePermission('lev:ver'), asy
       }
     });
   } catch (error) {
-    res.status(500).json({ success: false, message: 'Error consultando levantamiento.' });
+    console.error('Get levantamiento detail error:', error);
+    const status = isDbUnavailableError(error) ? 503 : 500;
+    res.status(status).json({ success: false, message: 'Error consultando levantamiento.' });
+  }
+});
+
+// Conciliación read-only Físico vs Teórico del campamento (Etapa 6)
+router.get('/levantamientos/:id/conciliacion', requireAuth, requirePermission('lev:ver'), async (req, res) => {
+  try {
+    const db = getPool();
+    const levId = parsePositiveInt(req.params.id);
+    if (!levId) {
+      return res.status(400).json({ success: false, message: 'ID de levantamiento inválido.' });
+    }
+
+    const [levRows] = await db.query(
+      `SELECT l.id, l.codigo_levantamiento, l.titulo, l.campamento_id, l.almacen_id,
+              l.estado, l.es_sintetico, c.nombre AS campamento_nombre
+       FROM inv_levantamientos l
+       JOIN inv_campamentos c ON l.campamento_id = c.id
+       WHERE l.id = ?`,
+      [levId]
+    );
+    if (levRows.length === 0) {
+      return res.status(404).json({ success: false, message: 'Levantamiento no encontrado.' });
+    }
+    const lev = levRows[0];
+
+    const scope = await getUserAllowedCampamentos(db, req.user);
+    if (!scope.isGlobal && !scope.campamentoIds.includes(lev.campamento_id)) {
+      return res.status(403).json({
+        success: false,
+        message: 'Acceso denegado: El levantamiento pertenece a una sede o campamento no autorizado.'
+      });
+    }
+
+    const isSyntLev = Number(lev.es_sintetico) === 1 ? 1 : 0;
+
+    // 1. Universo físico capturado en la sesión (excluyendo los marcados explícitamente consolidado = 2 omitidos)
+    const [fisicos] = await db.query(
+      `SELECT id, codigo_original, area, categoria, articulo_nombre, serie_imei,
+              cantidad, unidad_medida, estado_fisico, responsable_custodio,
+              ubicacion_exacta, consolidado, articulo_maestro_id
+       FROM inv_levantamiento_items
+       WHERE levantamiento_id = ? AND consolidado <> 2
+       ORDER BY id ASC`,
+      [levId]
+    );
+
+    // 2. Inventario teórico actual del mismo campamento (activos y mismo nivel es_sintetico)
+    const [teoricos] = await db.query(
+      `SELECT id, codigo_original, area, categoria, articulo_nombre, serie_imei,
+              cantidad_num, cantidad_verificada, unidad_medida, estado_fisico,
+              ubicacion_nombre, asignado_a, campamento_id, almacen_id
+       FROM inv_articulos
+       WHERE activo = 1 AND es_sintetico = ? AND campamento_id = ?
+       ORDER BY id ASC`,
+      [isSyntLev, lev.campamento_id]
+    );
+
+    const masterById = new Map();
+    const masterBySerial = new Map();
+    const masterByCode = new Map();
+    for (const m of teoricos) {
+      masterById.set(Number(m.id), m);
+      const serKey = normalizeSerialKey(m.serie_imei);
+      if (serKey && !masterBySerial.has(serKey)) {
+        masterBySerial.set(serKey, m);
+      }
+      const codeKey = m.codigo_original ? String(m.codigo_original).trim().toUpperCase() : null;
+      if (codeKey && !masterByCode.has(codeKey)) {
+        masterByCode.set(codeKey, m);
+      }
+    }
+
+    const matchedPhysicalByMasterId = new Map();
+    const sobrantesEnCampo = [];
+
+    for (const it of fisicos) {
+      let masterMatch = null;
+      if (it.articulo_maestro_id && masterById.has(Number(it.articulo_maestro_id))) {
+        masterMatch = masterById.get(Number(it.articulo_maestro_id));
+      } else {
+        const serKey = normalizeSerialKey(it.serie_imei);
+        if (serKey && masterBySerial.has(serKey)) {
+          masterMatch = masterBySerial.get(serKey);
+        } else {
+          const codeKey = it.codigo_original ? String(it.codigo_original).trim().toUpperCase() : null;
+          if (codeKey && masterByCode.has(codeKey)) {
+            masterMatch = masterByCode.get(codeKey);
+          }
+        }
+      }
+
+      if (!masterMatch) {
+        sobrantesEnCampo.push({
+          item_id: it.id,
+          codigo_original: it.codigo_original || null,
+          articulo_nombre: it.articulo_nombre,
+          serie_imei: it.serie_imei || null,
+          area: it.area,
+          cantidad_fisica: Number(Number(it.cantidad || 0).toFixed(2)),
+          estado_fisico: it.estado_fisico,
+          ubicacion_exacta: it.ubicacion_exacta || null,
+          motivo: 'Sin coincidencia en el inventario teórico actual del campamento'
+        });
+      } else {
+        const mid = Number(masterMatch.id);
+        const prevAgg = matchedPhysicalByMasterId.get(mid) || {
+          master: masterMatch,
+          cantidad_fisica: 0,
+          item_ids: []
+        };
+        prevAgg.cantidad_fisica = Number((prevAgg.cantidad_fisica + Number(it.cantidad || 0)).toFixed(2));
+        prevAgg.item_ids.push(it.id);
+        matchedPhysicalByMasterId.set(mid, prevAgg);
+      }
+    }
+
+    const coincidencias = [];
+    const diferenciasCantidad = [];
+    const faltantesNoLocalizados = [];
+
+    for (const m of teoricos) {
+      const mid = Number(m.id);
+      const agg = matchedPhysicalByMasterId.get(mid);
+      const teorica = m.cantidad_num !== null ? Number(Number(m.cantidad_num).toFixed(2)) : null;
+
+      if (!agg) {
+        faltantesNoLocalizados.push({
+          articulo_maestro_id: mid,
+          codigo_original: m.codigo_original || null,
+          articulo_nombre: m.articulo_nombre,
+          serie_imei: m.serie_imei || null,
+          area: m.area,
+          cantidad_teorica: teorica,
+          ubicacion_nombre: m.ubicacion_nombre,
+          asignado_a: m.asignado_a || null
+        });
+        continue;
+      }
+
+      const fisica = agg.cantidad_fisica;
+      if (teorica === null || Math.abs(fisica - teorica) > 0.001) {
+        diferenciasCantidad.push({
+          articulo_maestro_id: mid,
+          item_ids: agg.item_ids,
+          codigo_original: m.codigo_original || null,
+          articulo_nombre: m.articulo_nombre,
+          serie_imei: m.serie_imei || null,
+          cantidad_teorica: teorica,
+          cantidad_fisica: fisica,
+          diferencia: teorica === null ? fisica : Number((fisica - teorica).toFixed(2)),
+          estado_cantidad: teorica === null ? 'PENDIENTE_VERIFICACION' : 'DIFERENCIA_CONTEO'
+        });
+      } else {
+        coincidencias.push({
+          articulo_maestro_id: mid,
+          item_ids: agg.item_ids,
+          codigo_original: m.codigo_original || null,
+          articulo_nombre: m.articulo_nombre,
+          serie_imei: m.serie_imei || null,
+          cantidad_teorica: teorica,
+          cantidad_fisica: fisica,
+          diferencia: 0
+        });
+      }
+    }
+
+    const totalTeoricoUnidades = Number(
+      teoricos.reduce((acc, m) => acc + (m.cantidad_num !== null ? Number(m.cantidad_num) : 0), 0).toFixed(2)
+    );
+    const totalFisicoUnidades = Number(
+      fisicos.reduce((acc, f) => acc + Number(f.cantidad || 0), 0).toFixed(2)
+    );
+
+    res.json({
+      success: true,
+      levantamiento: lev,
+      solo_lectura: true,
+      resumen: {
+        total_teorico_registros: teoricos.length,
+        total_teorico_unidades: totalTeoricoUnidades,
+        total_fisico_registros: fisicos.length,
+        total_fisico_unidades: totalFisicoUnidades,
+        coincidencias_exactas: coincidencias.length,
+        diferencias_cantidad_count: diferenciasCantidad.length,
+        sobrantes_count: sobrantesEnCampo.length,
+        faltantes_count: faltantesNoLocalizados.length
+      },
+      coincidencias,
+      diferencias_cantidad: diferenciasCantidad,
+      sobrantes_en_campo: sobrantesEnCampo,
+      faltantes_no_localizados: faltantesNoLocalizados
+    });
+  } catch (error) {
+    console.error('Conciliacion levantamiento error:', error);
+    const status = isDbUnavailableError(error) ? 503 : 500;
+    res.status(status).json({ success: false, message: 'Error calculando conciliación físico vs teórico.' });
   }
 });
 
@@ -3344,24 +7142,32 @@ const TRANSICIONES_LEVANTAMIENTO = {
 
 router.put('/levantamientos/:id', requireAuth, requirePermission('lev:editar'), async (req, res) => {
   const pool = getPool();
-  const conn = await pool.getConnection();
+  let conn = null;
+  let inTransaction = false;
   try {
-    const id = parseInt(req.params.id);
-    const { titulo, responsable_levantamiento, equipo_auditor, estado, notas, fecha_fin } = req.body;
+    const id = parsePositiveInt(req.params.id);
+    if (!id) {
+      return res.status(400).json({ success: false, message: 'ID de levantamiento inválido.' });
+    }
+    const { titulo, responsable_levantamiento, equipo_auditor, estado, notas, fecha_fin } = req.body || {};
 
+    conn = await pool.getConnection();
     await conn.beginTransaction();
+    inTransaction = true;
 
     // Bloqueo exclusivo FOR UPDATE para evitar colisiones con consolidaciones concurrentes
     const [existingRows] = await conn.query('SELECT * FROM inv_levantamientos WHERE id = ? FOR UPDATE', [id]);
     if (existingRows.length === 0) {
-      await conn.rollback();
+      inTransaction = false;
+      await safeRollback(conn);
       return res.status(404).json({ success: false, message: 'Levantamiento no encontrado.' });
     }
     const currentLev = existingRows[0];
 
     const scope = await getUserAllowedCampamentos(conn, req.user);
     if (!scope.isGlobal && !scope.campamentoIds.includes(currentLev.campamento_id)) {
-      await conn.rollback();
+      inTransaction = false;
+      await safeRollback(conn);
       return res.status(403).json({
         success: false,
         message: 'Acceso denegado: No tiene autorización para modificar levantamientos de este campamento.'
@@ -3370,7 +7176,8 @@ router.put('/levantamientos/:id', requireAuth, requirePermission('lev:editar'), 
 
     // SEC-10 / QA-02: Bloqueo estricto de edición para levantamientos finalizados
     if (currentLev.estado === 'Finalizado') {
-      await conn.rollback();
+      inTransaction = false;
+      await safeRollback(conn);
       return res.status(409).json({
         success: false,
         message: 'No se puede modificar una auditoría en estado Finalizado. Los registros se encuentran protegidos contra escritura.'
@@ -3378,7 +7185,8 @@ router.put('/levantamientos/:id', requireAuth, requirePermission('lev:editar'), 
     }
 
     if (currentLev.estado === 'Cancelado') {
-      await conn.rollback();
+      inTransaction = false;
+      await safeRollback(conn);
       return res.status(409).json({
         success: false,
         message: 'No se puede modificar una auditoría cancelada.'
@@ -3387,7 +7195,8 @@ router.put('/levantamientos/:id', requireAuth, requirePermission('lev:editar'), 
 
     // Regla de transición: Finalizado sólo es alcanzable mediante /consolidar
     if (estado === 'Finalizado') {
-      await conn.rollback();
+      inTransaction = false;
+      await safeRollback(conn);
       return res.status(400).json({
         success: false,
         message: 'El estado Finalizado únicamente puede alcanzarse mediante la consolidación de la auditoría (/consolidar).'
@@ -3396,7 +7205,8 @@ router.put('/levantamientos/:id', requireAuth, requirePermission('lev:editar'), 
 
     if (estado !== undefined && estado !== null) {
       if (!ESTADOS_LEVANTAMIENTO_VALIDOS.includes(estado)) {
-        await conn.rollback();
+        inTransaction = false;
+        await safeRollback(conn);
         return res.status(400).json({
           success: false,
           message: `Estado no válido. Valores permitidos: ${ESTADOS_LEVANTAMIENTO_VALIDOS.join(', ')}.`
@@ -3405,7 +7215,8 @@ router.put('/levantamientos/:id', requireAuth, requirePermission('lev:editar'), 
 
       const permitidos = TRANSICIONES_LEVANTAMIENTO[currentLev.estado] || [];
       if (!permitidos.includes(estado)) {
-        await conn.rollback();
+        inTransaction = false;
+        await safeRollback(conn);
         return res.status(400).json({
           success: false,
           message: `Transición de estado no permitida: no se puede cambiar de "${currentLev.estado}" a "${estado}".`
@@ -3422,7 +7233,15 @@ router.put('/levantamientos/:id', requireAuth, requirePermission('lev:editar'), 
         notas = COALESCE(?, notas),
         fecha_fin = COALESCE(?, fecha_fin)
       WHERE id = ?
-    `, [titulo, responsable_levantamiento, equipo_auditor, estado, notas, fecha_fin, id]);
+    `, [
+      asNonEmptyString(titulo),
+      asNonEmptyString(responsable_levantamiento),
+      equipo_auditor !== undefined ? (equipo_auditor ?? null) : null,
+      estado !== undefined ? (estado ?? null) : null,
+      notas !== undefined ? (notas ?? null) : null,
+      fecha_fin !== undefined ? (fecha_fin || null) : null,
+      id
+    ]);
 
     await logAudit(conn, {
       usuario_id: req.user.id,
@@ -3444,13 +7263,23 @@ router.put('/levantamientos/:id', requireAuth, requirePermission('lev:editar'), 
     });
 
     await conn.commit();
+    inTransaction = false;
 
     res.json({ success: true, message: 'Levantamiento actualizado con éxito.' });
   } catch (error) {
-    await conn.rollback();
-    res.status(500).json({ success: false, message: 'Error actualizando sesión de levantamiento.' });
+    if (conn && inTransaction) {
+      await safeRollback(conn);
+    }
+    console.error('Update levantamiento error:', error);
+    const status = isDbUnavailableError(error, conn) ? 503 : 500;
+    res.status(status).json({
+      success: false,
+      message: status === 503
+        ? 'Base de datos temporalmente no disponible. Intente nuevamente.'
+        : 'Error actualizando sesión de levantamiento.'
+    });
   } finally {
-    conn.release();
+    safeRelease(conn);
   }
 });
 
@@ -3461,7 +7290,10 @@ router.put('/levantamientos/:id', requireAuth, requirePermission('lev:editar'), 
 router.get('/levantamientos/:id/items', requireAuth, requirePermission('lev:ver'), async (req, res) => {
   try {
     const db = getPool();
-    const levId = parseInt(req.params.id);
+    const levId = parsePositiveInt(req.params.id);
+    if (!levId) {
+      return res.status(400).json({ success: false, message: 'ID de levantamiento inválido.' });
+    }
     const { area, search, estado_fisico } = req.query;
 
     const [levRows] = await db.query('SELECT id, campamento_id FROM inv_levantamientos WHERE id = ?', [levId]);
@@ -3479,25 +7311,34 @@ router.get('/levantamientos/:id/items', requireAuth, requirePermission('lev:ver'
     const conditions = ['levantamiento_id = ?'];
     const params = [levId];
 
-    if (area && area !== 'TODAS') {
+    const areaParam = asNonEmptyString(area);
+    if (areaParam && areaParam.toUpperCase() !== 'TODAS') {
       conditions.push('area = ?');
-      params.push(area.toUpperCase());
+      params.push(areaParam.toUpperCase());
     }
 
-    if (estado_fisico && estado_fisico !== 'TODOS') {
-      const norm = normalizeEstadoParam(estado_fisico);
+    const estadoParam = asNonEmptyString(estado_fisico);
+    if (estadoParam && estadoParam.toUpperCase() !== 'TODOS') {
+      const norm = normalizeEstadoParam(estadoParam);
       conditions.push('estado_fisico = ?');
       params.push(norm);
     }
 
-    if (search && search.trim() !== '') {
-      const q = `%${search.trim()}%`;
+    const searchParam = asNonEmptyString(search);
+    if (searchParam) {
+      const q = `%${searchParam}%`;
       conditions.push('(articulo_nombre LIKE ? OR codigo_original LIKE ? OR serie_imei LIKE ? OR marca LIKE ? OR responsable_custodio LIKE ?)');
       params.push(q, q, q, q, q);
     }
 
     const [rows] = await db.query(
-      `SELECT * FROM inv_levantamiento_items
+      `SELECT id, levantamiento_id, codigo_original, area, categoria, articulo_nombre,
+              marca, modelo_caracteristicas, serie_imei, cantidad, unidad_medida,
+              estado_fisico, propietario, responsable_custodio, ubicacion_exacta,
+              fecha_revision, observaciones, consolidado, articulo_maestro_id,
+              estado_verificacion, es_sintetico, creado_por, fecha_captura, fecha_actualizacion,
+              CASE WHEN evidencia_foto IS NOT NULL AND evidencia_foto <> '' THEN 1 ELSE 0 END AS tiene_foto
+       FROM inv_levantamiento_items
        WHERE ${conditions.join(' AND ')}
        ORDER BY id DESC`,
       params
@@ -3513,9 +7354,13 @@ router.get('/levantamientos/:id/items', requireAuth, requirePermission('lev:ver'
 // Fast Capture Add Item to Levantamiento (Con bloqueo concurrente FOR UPDATE)
 router.post('/levantamientos/:id/items', requireAuth, requirePermission('lev:capturar'), async (req, res) => {
   const pool = getPool();
-  const conn = await pool.getConnection();
+  let conn = null;
+  let inTransaction = false;
   try {
-    const levId = parseInt(req.params.id);
+    const levId = parsePositiveInt(req.params.id);
+    if (!levId) {
+      return res.status(400).json({ success: false, message: 'ID de levantamiento inválido.' });
+    }
     const {
       codigo_original,
       area = 'ALMACEN',
@@ -3533,96 +7378,123 @@ router.post('/levantamientos/:id/items', requireAuth, requirePermission('lev:cap
       fecha_revision,
       observaciones,
       evidencia_foto
-    } = req.body;
+    } = req.body || {};
 
-    if (!articulo_nombre || articulo_nombre.trim() === '') {
+    if (typeof articulo_nombre !== 'string' || articulo_nombre.trim() === '') {
       return res.status(400).json({ success: false, message: 'La descripción del artículo es obligatoria.' });
     }
 
-    await conn.beginTransaction();
-
-    // Bloqueo FOR UPDATE sobre el levantamiento para prevenir condición de carrera con consolidación
-    const [levRows] = await conn.query('SELECT id, estado, campamento_id FROM inv_levantamientos WHERE id = ? FOR UPDATE', [levId]);
-    if (levRows.length === 0) {
-      await conn.rollback();
-      return res.status(404).json({ success: false, message: 'Levantamiento no encontrado.' });
-    }
-    if (levRows[0].estado === 'Finalizado') {
-      await conn.rollback();
-      return res.status(409).json({
+    const normArea = typeof area === 'string' && area.trim() !== '' ? area.trim().toUpperCase() : 'ALMACEN';
+    if (!VALID_INVENTARIO_AREAS.includes(normArea)) {
+      return res.status(400).json({
         success: false,
-        message: 'No se pueden registrar artículos en un levantamiento Finalizado.'
+        message: `Área inválida. Valores permitidos: ${VALID_INVENTARIO_AREAS.join(', ')}.`
       });
     }
 
+    conn = await pool.getConnection();
+    if (!conn) {
+      return res.status(503).json({ success: false, message: 'Servicio de base de datos no disponible temporalmente.' });
+    }
+    await conn.beginTransaction();
+    inTransaction = true;
+
+    // Bloqueo FOR UPDATE sobre el levantamiento para prevenir condición de carrera con consolidación
+    const [levRows] = await conn.query('SELECT id, estado, campamento_id, es_sintetico FROM inv_levantamientos WHERE id = ? FOR UPDATE', [levId]);
+    if (levRows.length === 0) {
+      inTransaction = false;
+      await safeRollback(conn);
+      return res.status(404).json({ success: false, message: 'Levantamiento no encontrado.' });
+    }
+
+    // Orden seguridad (R-E2-01): validar ámbito de campamento (403) ANTES de comprobar estado (409)
     const scope = await getUserAllowedCampamentos(conn, req.user);
     if (!scope.isGlobal && !scope.campamentoIds.includes(levRows[0].campamento_id)) {
-      await conn.rollback();
+      inTransaction = false;
+      await safeRollback(conn);
       return res.status(403).json({
         success: false,
         message: 'Acceso denegado: No tiene autorización para agregar artículos en este campamento.'
       });
     }
 
+    if (levRows[0].estado === 'Finalizado' || levRows[0].estado === 'Cancelado') {
+      inTransaction = false;
+      await safeRollback(conn);
+      return res.status(409).json({
+        success: false,
+        message: levRows[0].estado === 'Cancelado'
+          ? 'No se pueden registrar artículos en un levantamiento Cancelado.'
+          : 'No se pueden registrar artículos en un levantamiento Finalizado.'
+      });
+    }
+
     // Quantity validation
     const cantNum = Number(cantidad);
-    if (isNaN(cantNum) || cantNum <= 0) {
-      await conn.rollback();
+    if (!Number.isFinite(cantNum) || cantNum <= 0) {
+      inTransaction = false;
+      await safeRollback(conn);
       return res.status(400).json({ success: false, message: 'La cantidad debe ser un número estrictamente mayor a cero.' });
     }
     if (Number(cantNum.toFixed(2)) !== cantNum) {
-      await conn.rollback();
+      inTransaction = false;
+      await safeRollback(conn);
       return res.status(400).json({ success: false, message: 'La cantidad no puede tener más de 2 cifras decimales.' });
     }
 
     // Physical status normalization
     const estadoFisicoNormalizado = normalizeEstadoFisico(estado_fisico);
+    const cleanSerie = typeof serie_imei === 'string' && serie_imei.trim() !== '' ? serie_imei.trim() : null;
+    const serialKey = normalizeSerialKey(cleanSerie);
 
-    // Check potential duplicate within session or master inventory
+    // Check potential duplicate within session or master inventory (M07 / placeholder-safe)
     let advertenciaDuplicado = null;
-    if (serie_imei && serie_imei.trim() !== '' && serie_imei.trim() !== 'N/A') {
+    if (serialKey) {
       const [dupSession] = await conn.query(
-        'SELECT id, articulo_nombre FROM inv_levantamiento_items WHERE levantamiento_id = ? AND serie_imei = ?',
-        [levId, serie_imei.trim()]
+        'SELECT id, articulo_nombre FROM inv_levantamiento_items WHERE levantamiento_id = ? AND UPPER(TRIM(serie_imei)) = ? LIMIT 1',
+        [levId, serialKey]
       );
       if (dupSession.length > 0) {
-        advertenciaDuplicado = `Aviso: El serial/IMEI "${serie_imei}" ya fue registrado en esta auditoría (#${dupSession[0].id} - ${dupSession[0].articulo_nombre}).`;
+        advertenciaDuplicado = `Aviso: El serial/IMEI "${cleanSerie}" ya fue registrado en esta auditoría (#${dupSession[0].id} - ${dupSession[0].articulo_nombre}).`;
       } else {
         const [dupMaster] = await conn.query(
-          'SELECT id, articulo_nombre, ubicacion_nombre FROM inv_articulos WHERE activo = 1 AND serie_imei = ?',
-          [serie_imei.trim()]
+          'SELECT id, articulo_nombre, ubicacion_nombre FROM inv_articulos WHERE activo = 1 AND UPPER(TRIM(serie_imei)) = ? LIMIT 1',
+          [serialKey]
         );
         if (dupMaster.length > 0) {
-          advertenciaDuplicado = `Aviso: El serial/IMEI "${serie_imei}" ya existe en el inventario maestro (${dupMaster[0].ubicacion_nombre}).`;
+          advertenciaDuplicado = `Aviso: El serial/IMEI "${cleanSerie}" ya existe en el inventario maestro (${dupMaster[0].ubicacion_nombre}).`;
         }
       }
     }
+
+    const isSyntItem = Number(levRows[0].es_sintetico) === 1 ? 1 : 0;
 
     const [insertRes] = await conn.query(
       `INSERT INTO inv_levantamiento_items (
         levantamiento_id, codigo_original, area, categoria, articulo_nombre,
         marca, modelo_caracteristicas, serie_imei, cantidad, unidad_medida,
         estado_fisico, propietario, responsable_custodio, ubicacion_exacta,
-        fecha_revision, observaciones, evidencia_foto, creado_por
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        fecha_revision, observaciones, evidencia_foto, es_sintetico, creado_por
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         levId,
-        codigo_original || null,
-        area.toUpperCase(),
-        categoria,
+        asNonEmptyString(codigo_original),
+        normArea,
+        asNonEmptyString(categoria) || 'General',
         articulo_nombre.trim(),
-        marca || null,
-        modelo_caracteristicas || null,
-        serie_imei || null,
+        asNonEmptyString(marca),
+        asNonEmptyString(modelo_caracteristicas),
+        cleanSerie,
         cantNum,
-        unidad_medida || 'Unidad',
+        asNonEmptyString(unidad_medida) || 'Unidad',
         estadoFisicoNormalizado,
-        propietario || 'INGMELEC',
-        responsable_custodio || null,
-        ubicacion_exacta || null,
+        asNonEmptyString(propietario) || 'INGMELEC',
+        asNonEmptyString(responsable_custodio),
+        asNonEmptyString(ubicacion_exacta),
         fecha_revision || null,
-        observaciones || null,
+        asNonEmptyString(observaciones),
         evidencia_foto || null,
+        isSyntItem,
         req.user.id
       ]
     );
@@ -3644,34 +7516,49 @@ router.post('/levantamientos/:id/items', requireAuth, requirePermission('lev:cap
         levantamiento_id: levId,
         articulo_nombre: articulo_nombre.trim(),
         cantidad: cantNum,
-        serie_imei: serie_imei || null,
+        serie_imei: cleanSerie,
         estado_fisico: estadoFisicoNormalizado
       },
       req
     });
 
     await conn.commit();
+    inTransaction = false;
 
     res.status(201).json({
       success: true,
       message: 'Artículo guardado en la auditoría.',
       id: insertRes.insertId,
-      advertencia: advertenciaDuplicado
+      advertencia: advertenciaDuplicado,
+      warning_duplicado: advertenciaDuplicado
     });
   } catch (error) {
-    await conn.rollback();
+    if (conn && inTransaction) {
+      await safeRollback(conn);
+    }
     console.error('Insert levantamiento item error:', error);
-    res.status(500).json({ success: false, message: 'Error guardando artículo en el levantamiento.' });
+    const status = isDbUnavailableError(error, conn) ? 503 : 500;
+    res.status(status).json({
+      success: false,
+      message: status === 503
+        ? 'Base de datos temporalmente no disponible. Intente nuevamente.'
+        : 'Error guardando artículo en el levantamiento.'
+    });
   } finally {
-    conn.release();
+    safeRelease(conn);
   }
 });
 
 router.put('/levantamientos/:id/items/:itemId', requireAuth, requirePermission('lev:editar'), async (req, res) => {
   const pool = getPool();
-  const conn = await pool.getConnection();
+  let conn = null;
+  let inTransaction = false;
   try {
-    const { id: levId, itemId } = req.params;
+    const levId = parsePositiveInt(req.params.id);
+    const itemId = parsePositiveInt(req.params.itemId);
+    if (!levId || !itemId) {
+      return res.status(400).json({ success: false, message: 'ID de levantamiento o artículo inválido.' });
+    }
     const {
       codigo_original,
       area,
@@ -3687,9 +7574,11 @@ router.put('/levantamientos/:id/items/:itemId', requireAuth, requirePermission('
       responsable_custodio,
       ubicacion_exacta,
       observaciones
-    } = req.body;
+    } = req.body || {};
 
+    conn = await pool.getConnection();
     await conn.beginTransaction();
+    inTransaction = true;
 
     // Bloqueo exclusivo FOR UPDATE sobre el ítem y levantamiento para proteger contra concurrencia
     const [itemRows] = await conn.query(
@@ -3701,31 +7590,37 @@ router.put('/levantamientos/:id/items/:itemId', requireAuth, requirePermission('
     );
 
     if (itemRows.length === 0) {
-      await conn.rollback();
+      inTransaction = false;
+      await safeRollback(conn);
       return res.status(404).json({ success: false, message: 'Artículo no encontrado en este levantamiento.' });
     }
     const currentItem = itemRows[0];
 
     const scope = await getUserAllowedCampamentos(conn, req.user);
     if (!scope.isGlobal && !scope.campamentoIds.includes(currentItem.campamento_id)) {
-      await conn.rollback();
+      inTransaction = false;
+      await safeRollback(conn);
       return res.status(403).json({
         success: false,
         message: 'Acceso denegado: El levantamiento pertenece a una sede o campamento no autorizado.'
       });
     }
 
-    // SEC-08 / SEC-10: Bloqueo de edición si el levantamiento está finalizado o el ítem ya fue consolidado
-    if (currentItem.lev_estado === 'Finalizado') {
-      await conn.rollback();
+    // SEC-08 / SEC-10: Bloqueo de edición si el levantamiento está finalizado/cancelado o el ítem ya fue consolidado
+    if (currentItem.lev_estado === 'Finalizado' || currentItem.lev_estado === 'Cancelado') {
+      inTransaction = false;
+      await safeRollback(conn);
       return res.status(409).json({
         success: false,
-        message: 'No se pueden editar artículos de una auditoría Finalizada.'
+        message: currentItem.lev_estado === 'Cancelado'
+          ? 'No se pueden editar artículos de una auditoría Cancelada.'
+          : 'No se pueden editar artículos de una auditoría Finalizada.'
       });
     }
 
     if (currentItem.consolidado === 1) {
-      await conn.rollback();
+      inTransaction = false;
+      await safeRollback(conn);
       return res.status(409).json({
         success: false,
         message: 'No se puede modificar un artículo que ya ha sido consolidado en el inventario maestro.'
@@ -3736,13 +7631,34 @@ router.put('/levantamientos/:id/items/:itemId', requireAuth, requirePermission('
     if (cantidad !== undefined && cantidad !== null) {
       cantNum = Number(cantidad);
       if (isNaN(cantNum) || cantNum <= 0) {
-        await conn.rollback();
+        inTransaction = false;
+        await safeRollback(conn);
         return res.status(400).json({ success: false, message: 'La cantidad debe ser mayor a cero.' });
       }
       if (Number(cantNum.toFixed(2)) !== cantNum) {
-        await conn.rollback();
+        inTransaction = false;
+        await safeRollback(conn);
         return res.status(400).json({ success: false, message: 'La cantidad no puede tener más de 2 cifras decimales.' });
       }
+    }
+
+    let areaNorm = null;
+    if (area !== undefined && area !== null && String(area).trim() !== '') {
+      areaNorm = String(area).trim().toUpperCase();
+      if (!VALID_INVENTARIO_AREAS.includes(areaNorm)) {
+        inTransaction = false;
+        await safeRollback(conn);
+        return res.status(400).json({
+          success: false,
+          message: `Área inválida. Valores permitidos: ${VALID_INVENTARIO_AREAS.join(', ')}.`
+        });
+      }
+    }
+
+    if (articulo_nombre !== undefined && (typeof articulo_nombre !== 'string' || !articulo_nombre.trim())) {
+      inTransaction = false;
+      await safeRollback(conn);
+      return res.status(400).json({ success: false, message: 'La descripción del artículo no puede estar vacía.' });
     }
 
     const estadoNorm = estado_fisico ? normalizeEstadoFisico(estado_fisico) : null;
@@ -3765,20 +7681,20 @@ router.put('/levantamientos/:id/items/:itemId', requireAuth, requirePermission('
         observaciones = COALESCE(?, observaciones)
       WHERE id = ? AND levantamiento_id = ?`,
       [
-        codigo_original,
-        area ? area.toUpperCase() : null,
-        categoria,
-        articulo_nombre,
-        marca,
-        modelo_caracteristicas,
-        serie_imei,
+        codigo_original !== undefined ? asNonEmptyString(codigo_original) : null,
+        areaNorm,
+        categoria !== undefined ? asNonEmptyString(categoria) : null,
+        articulo_nombre !== undefined ? articulo_nombre.trim() : null,
+        marca !== undefined ? asNonEmptyString(marca) : null,
+        modelo_caracteristicas !== undefined ? asNonEmptyString(modelo_caracteristicas) : null,
+        serie_imei !== undefined ? asNonEmptyString(serie_imei) : null,
         cantNum,
-        unidad_medida,
+        unidad_medida !== undefined ? asNonEmptyString(unidad_medida) : null,
         estadoNorm,
-        propietario,
-        responsable_custodio,
-        ubicacion_exacta,
-        observaciones,
+        propietario !== undefined ? asNonEmptyString(propietario) : null,
+        responsable_custodio !== undefined ? asNonEmptyString(responsable_custodio) : null,
+        ubicacion_exacta !== undefined ? asNonEmptyString(ubicacion_exacta) : null,
+        observaciones !== undefined ? asNonEmptyString(observaciones) : null,
         itemId,
         levId
       ]
@@ -3801,23 +7717,40 @@ router.put('/levantamientos/:id/items/:itemId', requireAuth, requirePermission('
     });
 
     await conn.commit();
+    inTransaction = false;
 
     res.json({ success: true, message: 'Artículo actualizado correctamente.' });
   } catch (error) {
-    await conn.rollback();
-    res.status(500).json({ success: false, message: 'Error actualizando artículo.' });
+    if (conn && inTransaction) {
+      await safeRollback(conn);
+    }
+    console.error('Update levantamiento item error:', error);
+    const status = isDbUnavailableError(error, conn) ? 503 : 500;
+    res.status(status).json({
+      success: false,
+      message: status === 503
+        ? 'Base de datos temporalmente no disponible. Intente nuevamente.'
+        : 'Error actualizando artículo.'
+    });
   } finally {
-    conn.release();
+    safeRelease(conn);
   }
 });
 
 router.delete('/levantamientos/:id/items/:itemId', requireAuth, requirePermission('lev:editar'), async (req, res) => {
   const pool = getPool();
-  const conn = await pool.getConnection();
+  let conn = null;
+  let inTransaction = false;
   try {
-    const { id: levId, itemId } = req.params;
+    const levId = parsePositiveInt(req.params.id);
+    const itemId = parsePositiveInt(req.params.itemId);
+    if (!levId || !itemId) {
+      return res.status(400).json({ success: false, message: 'ID de levantamiento o artículo inválido.' });
+    }
 
+    conn = await pool.getConnection();
     await conn.beginTransaction();
+    inTransaction = true;
 
     // Bloqueo exclusivo FOR UPDATE sobre el ítem y levantamiento
     const [itemRows] = await conn.query(
@@ -3829,30 +7762,36 @@ router.delete('/levantamientos/:id/items/:itemId', requireAuth, requirePermissio
     );
 
     if (itemRows.length === 0) {
-      await conn.rollback();
+      inTransaction = false;
+      await safeRollback(conn);
       return res.status(404).json({ success: false, message: 'Artículo no encontrado en este levantamiento.' });
     }
     const currentItem = itemRows[0];
 
     const scope = await getUserAllowedCampamentos(conn, req.user);
     if (!scope.isGlobal && !scope.campamentoIds.includes(currentItem.campamento_id)) {
-      await conn.rollback();
+      inTransaction = false;
+      await safeRollback(conn);
       return res.status(403).json({
         success: false,
         message: 'Acceso denegado: El levantamiento pertenece a una sede o campamento no autorizado.'
       });
     }
 
-    if (currentItem.lev_estado === 'Finalizado') {
-      await conn.rollback();
+    if (currentItem.lev_estado === 'Finalizado' || currentItem.lev_estado === 'Cancelado') {
+      inTransaction = false;
+      await safeRollback(conn);
       return res.status(409).json({
         success: false,
-        message: 'No se pueden eliminar artículos de una auditoría Finalizada.'
+        message: currentItem.lev_estado === 'Cancelado'
+          ? 'No se pueden eliminar artículos de una auditoría Cancelada.'
+          : 'No se pueden eliminar artículos de una auditoría Finalizada.'
       });
     }
 
     if (currentItem.consolidado === 1) {
-      await conn.rollback();
+      inTransaction = false;
+      await safeRollback(conn);
       return res.status(409).json({
         success: false,
         message: 'No se puede eliminar un artículo que ya ha sido consolidado en el inventario maestro.'
@@ -3883,23 +7822,37 @@ router.delete('/levantamientos/:id/items/:itemId', requireAuth, requirePermissio
     });
 
     await conn.commit();
+    inTransaction = false;
 
     res.json({ success: true, message: 'Artículo eliminado de la sesión de levantamiento.' });
   } catch (error) {
-    await conn.rollback();
-    res.status(500).json({ success: false, message: 'Error eliminando artículo.' });
+    if (conn && inTransaction) {
+      await safeRollback(conn);
+    }
+    console.error('Delete levantamiento item error:', error);
+    const status = isDbUnavailableError(error, conn) ? 503 : 500;
+    res.status(status).json({
+      success: false,
+      message: status === 503
+        ? 'Base de datos temporalmente no disponible. Intente nuevamente.'
+        : 'Error eliminando artículo.'
+    });
   } finally {
-    conn.release();
+    safeRelease(conn);
   }
 });
 
 // Import Items via Excel into Levantamiento
 router.post('/levantamientos/:id/import-items', requireAuth, requirePermission('lev:importar'), async (req, res) => {
   const pool = getPool();
-  const conn = await pool.getConnection();
+  let conn = null;
+  let inTransaction = false;
   try {
-    const levId = parseInt(req.params.id);
-    const { items = [] } = req.body;
+    const levId = parsePositiveInt(req.params.id);
+    if (!levId) {
+      return res.status(400).json({ success: false, message: 'ID de levantamiento inválido.' });
+    }
+    const { items = [] } = req.body || {};
 
     if (!Array.isArray(items) || items.length === 0) {
       return res.status(400).json({ success: false, message: 'No se recibieron artículos para importar.' });
@@ -3911,68 +7864,158 @@ router.post('/levantamientos/:id/import-items', requireAuth, requirePermission('
       });
     }
 
-    const [levRows] = await conn.query('SELECT id, estado, campamento_id FROM inv_levantamientos WHERE id = ?', [levId]);
+    conn = await pool.getConnection();
+    await conn.beginTransaction();
+    inTransaction = true;
+
+    const [levRows] = await conn.query('SELECT id, estado, campamento_id, es_sintetico FROM inv_levantamientos WHERE id = ? FOR UPDATE', [levId]);
     if (levRows.length === 0) {
+      inTransaction = false;
+      await safeRollback(conn);
       return res.status(404).json({ success: false, message: 'Levantamiento no encontrado.' });
     }
 
     const scope = await getUserAllowedCampamentos(conn, req.user);
     if (!scope.isGlobal && !scope.campamentoIds.includes(levRows[0].campamento_id)) {
+      inTransaction = false;
+      await safeRollback(conn);
       return res.status(403).json({
         success: false,
         message: 'Acceso denegado: No tiene autorización para importar artículos a este campamento.'
       });
     }
 
-    if (levRows[0].estado === 'Finalizado') {
+    if (levRows[0].estado === 'Finalizado' || levRows[0].estado === 'Cancelado') {
+      inTransaction = false;
+      await safeRollback(conn);
       return res.status(409).json({
         success: false,
-        message: 'No se pueden importar artículos a una auditoría Finalizada.'
+        message: levRows[0].estado === 'Cancelado'
+          ? 'No se pueden importar artículos a una auditoría Cancelada.'
+          : 'No se pueden importar artículos a una auditoría Finalizada.'
       });
     }
 
-    await conn.beginTransaction();
-
-    let insertados = 0;
+    const isSyntLev = Number(levRows[0].es_sintetico) === 1 ? 1 : 0;
+    const validRows = [];
+    const validationErrors = [];
     const warnings = [];
+    const seenBatchSerials = new Map();
 
-    for (const item of items) {
-      if (!item.articulo_nombre || String(item.articulo_nombre).trim() === '') continue;
+    items.forEach((rawItem, idx) => {
+      const rowNum = idx + 1;
+      if (!rawItem || typeof rawItem !== 'object') {
+        validationErrors.push(`Fila #${rowNum}: formato inválido.`);
+        return;
+      }
+      const nombre = typeof rawItem.articulo_nombre === 'string' ? rawItem.articulo_nombre.trim() : '';
+      if (!nombre) return; // Ignorar filas vacías sin descripción
 
-      let cant = Number(item.cantidad) || 1;
-      if (isNaN(cant) || cant <= 0) cant = 1;
-      cant = Number(cant.toFixed(2));
+      let cant;
+      if (rawItem.cantidad === undefined || rawItem.cantidad === null || String(rawItem.cantidad).trim() === '') {
+        cant = 1;
+      } else {
+        const num = Number(String(rawItem.cantidad).replace(',', '.').trim());
+        if (!Number.isFinite(num) || num <= 0) {
+          validationErrors.push(`Fila #${rowNum} ("${nombre}"): la cantidad "${rawItem.cantidad}" no es válida o es menor/igual a cero.`);
+          return;
+        }
+        if (Number(num.toFixed(2)) !== num) {
+          validationErrors.push(`Fila #${rowNum} ("${nombre}"): la cantidad supera los 2 decimales permitidos.`);
+          return;
+        }
+        cant = num;
+      }
 
-      const estadoFis = normalizeEstadoFisico(item.estado_fisico);
+      const rawArea = typeof rawItem.area === 'string' && rawItem.area.trim() !== ''
+        ? rawItem.area.trim().toUpperCase()
+        : 'ALMACEN';
+      if (!VALID_INVENTARIO_AREAS.includes(rawArea)) {
+        validationErrors.push(`Fila #${rowNum} ("${nombre}"): área "${rawItem.area}" no reconocida.`);
+        return;
+      }
 
+      const cleanSerie = rawItem.serie_imei ? String(rawItem.serie_imei).trim() : null;
+      const serKey = normalizeSerialKey(cleanSerie);
+      if (serKey) {
+        if (seenBatchSerials.has(serKey)) {
+          warnings.push(`Serial repetido en el lote Excel (${cleanSerie}) en fila #${rowNum} (visto previamente en fila #${seenBatchSerials.get(serKey)}).`);
+        } else {
+          seenBatchSerials.set(serKey, rowNum);
+        }
+      }
+
+      validRows.push([
+        levId,
+        asNonEmptyString(rawItem.codigo_original),
+        rawArea,
+        asNonEmptyString(rawItem.categoria) || 'General',
+        nombre,
+        asNonEmptyString(rawItem.marca),
+        asNonEmptyString(rawItem.modelo_caracteristicas),
+        cleanSerie,
+        cant,
+        asNonEmptyString(rawItem.unidad_medida) || 'Unidad',
+        normalizeEstadoFisico(rawItem.estado_fisico),
+        asNonEmptyString(rawItem.propietario) || 'INGMELEC',
+        asNonEmptyString(rawItem.responsable_custodio),
+        asNonEmptyString(rawItem.ubicacion_exacta),
+        asNonEmptyString(rawItem.observaciones),
+        isSyntLev,
+        req.user.id
+      ]);
+    });
+
+    if (validationErrors.length > 0) {
+      inTransaction = false;
+      await safeRollback(conn);
+      return res.status(400).json({
+        success: false,
+        message: `Se detectaron ${validationErrors.length} fila(s) con datos inválidos durante la importación. Corrija el archivo antes de continuar.`,
+        errores: validationErrors.slice(0, 20)
+      });
+    }
+
+    if (validRows.length === 0) {
+      inTransaction = false;
+      await safeRollback(conn);
+      return res.status(400).json({ success: false, message: 'No se encontraron filas válidas con descripción de artículo para importar.' });
+    }
+
+    // Detectar colisiones de serial contra la sesión actual y el maestro activo (solo alerta informativa)
+    const batchSerialKeys = Array.from(seenBatchSerials.keys());
+    if (batchSerialKeys.length > 0) {
+      const [existingSessionRows] = await conn.query(
+        'SELECT serie_imei FROM inv_levantamiento_items WHERE levantamiento_id = ? AND UPPER(TRIM(serie_imei)) IN (?)',
+        [levId, batchSerialKeys]
+      );
+      existingSessionRows.forEach(r => warnings.push(`Serial "${r.serie_imei}" ya estaba registrado en esta sesión de levantamiento.`));
+
+      const [existingMasterRows] = await conn.query(
+        'SELECT serie_imei, ubicacion_nombre FROM inv_articulos WHERE activo = 1 AND UPPER(TRIM(serie_imei)) IN (?)',
+        [batchSerialKeys]
+      );
+      existingMasterRows.forEach(r => warnings.push(`Serial "${r.serie_imei}" ya existe en el maestro activo (${r.ubicacion_nombre}).`));
+    }
+
+    // Bulk INSERT por lotes (sin N+1 consultas individuales)
+    const CHUNK_SIZE = 500;
+    for (let i = 0; i < validRows.length; i += CHUNK_SIZE) {
+      const chunk = validRows.slice(i, i + CHUNK_SIZE);
+      const placeholders = chunk.map(() => '(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').join(', ');
+      const flatParams = chunk.flat();
       await conn.query(
         `INSERT INTO inv_levantamiento_items (
           levantamiento_id, codigo_original, area, categoria, articulo_nombre,
           marca, modelo_caracteristicas, serie_imei, cantidad, unidad_medida,
           estado_fisico, propietario, responsable_custodio, ubicacion_exacta,
-          observaciones, creado_por
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [
-          levId,
-          item.codigo_original || null,
-          (item.area || 'ALMACEN').toUpperCase(),
-          item.categoria || 'General',
-          String(item.articulo_nombre).trim(),
-          item.marca || null,
-          item.modelo_caracteristicas || null,
-          item.serie_imei ? String(item.serie_imei).trim() : null,
-          cant,
-          item.unidad_medida || 'Unidad',
-          estadoFis,
-          item.propietario || 'INGMELEC',
-          item.responsable_custodio || null,
-          item.ubicacion_exacta || null,
-          item.observaciones || null,
-          req.user.id
-        ]
+          observaciones, es_sintetico, creado_por
+        ) VALUES ${placeholders}`,
+        flatParams
       );
-      insertados++;
     }
+
+    const insertados = validRows.length;
 
     // Update counter
     await conn.query(
@@ -3988,12 +8031,14 @@ router.post('/levantamientos/:id/import-items', requireAuth, requirePermission('
       entidad: 'inv_levantamientos',
       entidad_id: levId,
       detalles_nuevos: {
-        total_importados: insertados
+        total_importados: insertados,
+        warnings_count: warnings.length
       },
       req
     });
 
     await conn.commit();
+    inTransaction = false;
 
     res.json({
       success: true,
@@ -4002,11 +8047,19 @@ router.post('/levantamientos/:id/import-items', requireAuth, requirePermission('
       warnings
     });
   } catch (error) {
-    await conn.rollback();
+    if (conn && inTransaction) {
+      await safeRollback(conn);
+    }
     console.error('Import items error:', error);
-    res.status(500).json({ success: false, message: 'Error importando artículos desde Excel.' });
+    const status = isDbUnavailableError(error, conn) ? 503 : 500;
+    res.status(status).json({
+      success: false,
+      message: status === 503
+        ? 'Base de datos temporalmente no disponible. Intente nuevamente.'
+        : 'Error importando artículos desde Excel.'
+    });
   } finally {
-    conn.release();
+    safeRelease(conn);
   }
 });
 
@@ -4016,9 +8069,13 @@ router.post('/levantamientos/:id/import-items', requireAuth, requirePermission('
 
 router.post('/levantamientos/:id/consolidar', requireAuth, requirePermission('lev:consolidar'), async (req, res) => {
   const pool = getPool();
-  const conn = await pool.getConnection();
+  let conn = null;
+  let inTransaction = false;
   try {
-    const levId = parseInt(req.params.id);
+    const levId = parsePositiveInt(req.params.id);
+    if (!levId) {
+      return res.status(400).json({ success: false, message: 'ID de levantamiento inválido.' });
+    }
     const {
       resolucion_duplicados,
       autorizar_reubicacion = false,
@@ -4026,7 +8083,9 @@ router.post('/levantamientos/:id/consolidar', requireAuth, requirePermission('le
       autorizar_cambio_estado = false
     } = req.body || {};
 
+    conn = await pool.getConnection();
     await conn.beginTransaction();
+    inTransaction = true;
 
     // 1. Get Levantamiento Info
     const [levRows] = await conn.query(`
@@ -4037,23 +8096,31 @@ router.post('/levantamientos/:id/consolidar', requireAuth, requirePermission('le
     `, [levId]);
 
     if (levRows.length === 0) {
-      await conn.rollback();
+      inTransaction = false;
+      await safeRollback(conn);
       return res.status(404).json({ success: false, message: 'Levantamiento no encontrado.' });
     }
     const lev = levRows[0];
 
     const scope = await getUserAllowedCampamentos(conn, req.user);
     if (!scope.isGlobal && !scope.campamentoIds.includes(lev.campamento_id)) {
-      await conn.rollback();
+      inTransaction = false;
+      await safeRollback(conn);
       return res.status(403).json({
         success: false,
         message: 'Acceso denegado: No tiene autorización para consolidar levantamientos de este campamento.'
       });
     }
 
-    if (lev.estado === 'Finalizado') {
-      await conn.rollback();
-      return res.status(409).json({ success: false, message: 'Este levantamiento ya fue consolidado y finalizado previamente.' });
+    if (lev.estado === 'Finalizado' || lev.estado === 'Cancelado') {
+      inTransaction = false;
+      await safeRollback(conn);
+      return res.status(409).json({
+        success: false,
+        message: lev.estado === 'Cancelado'
+          ? 'No se puede consolidar un levantamiento Cancelado.'
+          : 'Este levantamiento ya fue consolidado y finalizado previamente.'
+      });
     }
 
     // 2. Get all non-consolidated items in this session
@@ -4063,48 +8130,99 @@ router.post('/levantamientos/:id/consolidar', requireAuth, requirePermission('le
     );
 
     if (items.length === 0) {
-      await conn.rollback();
+      inTransaction = false;
+      await safeRollback(conn);
       return res.status(400).json({ success: false, message: 'No hay artículos pendientes de consolidar en esta sesión.' });
     }
 
-    // SEC-09 / QA-03 / RECONCILIACIÓN SEGURA DE DUPLICADOS
-    const serialsToCheck = items
-      .map(it => it.serie_imei ? String(it.serie_imei).trim() : null)
-      .filter(s => s && s !== '' && s.toUpperCase() !== 'N/A');
+    // SEC-09 / QA-03 / C04: RECONCILIACIÓN SEGURA DE DUPLICADOS (MAESTRO + INTRA-LOTE)
+    const sessionSerialGroups = new Map();
+    for (const it of items) {
+      const sk = normalizeSerialKey(it.serie_imei);
+      if (!sk) continue;
+      if (!sessionSerialGroups.has(sk)) {
+        sessionSerialGroups.set(sk, []);
+      }
+      sessionSerialGroups.get(sk).push(it);
+    }
 
-    const dupMap = new Map();
-
-    if (serialsToCheck.length > 0) {
-      const [duplicadosExistentes] = await conn.query(
-        `SELECT id, codigo_original, articulo_nombre, serie_imei, ubicacion_nombre, asignado_a, estado_fisico, cantidad_num, unidad_medida
-         FROM inv_articulos
-         WHERE activo = 1 AND serie_imei IN (?)`,
-        [serialsToCheck]
-      );
-
-      duplicadosExistentes.forEach(d => {
-        dupMap.set(String(d.serie_imei).trim().toUpperCase(), d);
-      });
-
-      if (dupMap.size > 0 && resolucion_duplicados !== 'VINCULAR_EXISTENTE' && resolucion_duplicados !== 'OMITIR_DUPLICADOS') {
-        await conn.rollback();
-        return res.status(409).json({
-          success: false,
-          bloqueado_por_duplicados: true,
-          message: `Se detectaron ${dupMap.size} artículo(s) cuyos seriales/IMEI ya existen en el inventario maestro. Debe seleccionar una estrategia de conciliación segura ('VINCULAR_EXISTENTE' u 'OMITIR_DUPLICADOS'). No se permite insertar activos maestros duplicados.`,
-          duplicados: duplicadosExistentes.map(d => ({
-            id: d.id,
-            codigo_original: d.codigo_original,
-            articulo_nombre: d.articulo_nombre,
-            serie_imei: d.serie_imei,
-            ubicacion_actual: d.ubicacion_nombre,
-            custodio_actual: d.asignado_a,
-            estado_actual: d.estado_fisico
-          }))
+    const serialKeys = Array.from(sessionSerialGroups.keys());
+    const duplicadosLote = [];
+    for (const [sk, group] of sessionSerialGroups.entries()) {
+      if (group.length > 1) {
+        duplicadosLote.push({
+          serie_imei: group[0].serie_imei,
+          serie_normalizada: sk,
+          cantidad_en_lote: group.length,
+          items_ids: group.map(g => g.id),
+          articulos: group.map(g => g.articulo_nombre)
         });
       }
     }
 
+    const dupMap = new Map();
+    let duplicadosExistentes = [];
+
+    if (serialKeys.length > 0) {
+      const [rowsMasterDup] = await conn.query(
+        `SELECT id, codigo_original, articulo_nombre, serie_imei, campamento_id, almacen_id,
+                ubicacion_nombre, zona_estante, asignado_a, estado_fisico,
+                cantidad_num, cantidad_verificada, unidad_medida, es_sintetico
+         FROM inv_articulos
+         WHERE activo = 1 AND UPPER(TRIM(serie_imei)) IN (?) FOR UPDATE`,
+        [serialKeys]
+      );
+      duplicadosExistentes = rowsMasterDup;
+
+      duplicadosExistentes.forEach(d => {
+        const sk = normalizeSerialKey(d.serie_imei);
+        if (sk) dupMap.set(sk, d);
+      });
+    }
+
+    if ((dupMap.size > 0 || duplicadosLote.length > 0) &&
+        resolucion_duplicados !== 'VINCULAR_EXISTENTE' &&
+        resolucion_duplicados !== 'OMITIR_DUPLICADOS') {
+      inTransaction = false;
+      await safeRollback(conn);
+
+      const combinedDuplicados = [
+        ...duplicadosExistentes.map(d => ({
+          origen: 'MAESTRO',
+          id: d.id,
+          codigo_original: d.codigo_original,
+          articulo_nombre: d.articulo_nombre,
+          serie_imei: d.serie_imei,
+          ubicacion_actual: d.ubicacion_nombre,
+          custodio_actual: d.asignado_a,
+          estado_actual: d.estado_fisico
+        })),
+        ...duplicadosLote
+          .filter(dl => !dupMap.has(dl.serie_normalizada))
+          .map(dl => ({
+            origen: 'LOTE_SESION',
+            id: dl.items_ids[0],
+            codigo_original: null,
+            articulo_nombre: `${dl.articulos[0]} (repetido ${dl.cantidad_en_lote} veces en sesión)`,
+            serie_imei: dl.serie_imei,
+            ubicacion_actual: lev.campamento_nombre,
+            custodio_actual: null,
+            estado_actual: 'Duplicado en sesión'
+          }))
+      ];
+
+      return res.status(409).json({
+        success: false,
+        bloqueado_por_duplicados: true,
+        message: `Se detectaron ${combinedDuplicados.length} conflicto(s) de serial/IMEI (en inventario maestro y/o duplicados dentro del mismo lote). Debe seleccionar 'VINCULAR_EXISTENTE' u 'OMITIR_DUPLICADOS'.`,
+        duplicados: combinedDuplicados,
+        duplicados_lote: duplicadosLote
+      });
+    }
+
+    const schemaCaps = await getSchemaCapabilities(conn);
+    const isSyntLev = Number(lev.es_sintetico) === 1 ? 1 : 0;
+    const estadoVincNuevo = lev.campamento_id ? 'CONFIRMADO' : 'SIN_SEDE';
     let nuevosMaestro = 0;
     let vinculadosConciliados = 0;
     let omitidosDuplicados = 0;
@@ -4112,25 +8230,27 @@ router.post('/levantamientos/:id/consolidar', requireAuth, requirePermission('le
 
     for (const it of items) {
       const estadoFisicoNormalizado = normalizeEstadoFisico(it.estado_fisico);
-      const serialKey = it.serie_imei ? String(it.serie_imei).trim().toUpperCase() : null;
+      const serialKey = normalizeSerialKey(it.serie_imei);
       const masterExistente = serialKey && dupMap.has(serialKey) ? dupMap.get(serialKey) : null;
 
       if (masterExistente) {
         if (resolucion_duplicados === 'VINCULAR_EXISTENTE') {
           // REGLA FUNDAMENTAL DE INTEGRIDAD: NUNCA INSERTAR UN SEGUNDO ACTIVO CON EL MISMO SERIAL
-          // Conciliación segura: vincular ítem de levantamiento al activo maestro preexistente
-          // PROTECCIÓN DE INTEGRIDAD (FASE 3): No alterar automáticamente sede, custodio o estado físico sin decisión explícita y autorizada
           const masterId = masterExistente.id;
 
-          const nuevoCampamentoId = autorizar_reubicacion ? lev.campamento_id : masterExistente.campamento_id;
-          const nuevaUbicacion = autorizar_reubicacion ? campUbicacion : masterExistente.ubicacion_nombre;
-          const nuevaZona = autorizar_reubicacion ? (it.ubicacion_exacta || masterExistente.zona_estante) : masterExistente.zona_estante;
-          const nuevoCustodio = autorizar_cambio_custodio ? (it.responsable_custodio || masterExistente.asignado_a) : masterExistente.asignado_a;
-          const nuevoEstado = autorizar_cambio_estado ? estadoFisicoNormalizado : masterExistente.estado_fisico;
+          const nuevoCampamentoId = autorizar_reubicacion ? lev.campamento_id : (masterExistente.campamento_id ?? null);
+          const nuevoAlmacenId = autorizar_reubicacion ? (lev.almacen_id ?? masterExistente.almacen_id ?? null) : (masterExistente.almacen_id ?? null);
+          const nuevaUbicacion = autorizar_reubicacion ? campUbicacion : (masterExistente.ubicacion_nombre ?? campUbicacion);
+          const nuevaZona = autorizar_reubicacion ? (it.ubicacion_exacta || masterExistente.zona_estante || null) : (masterExistente.zona_estante ?? null);
+          const nuevoEstadoVinc = nuevoCampamentoId ? 'CONFIRMADO' : 'SIN_SEDE';
+          const nuevoCustodio = autorizar_cambio_custodio ? (it.responsable_custodio || masterExistente.asignado_a || null) : (masterExistente.asignado_a ?? null);
+          const nuevoEstado = autorizar_cambio_estado ? estadoFisicoNormalizado : (masterExistente.estado_fisico || 'Bueno');
 
           await conn.query(`
             UPDATE inv_articulos SET
               campamento_id = ?,
+              almacen_id = ?,
+              estado_vinculacion_sede = ?,
               ubicacion_nombre = ?,
               zona_estante = ?,
               asignado_a = ?,
@@ -4140,6 +8260,8 @@ router.post('/levantamientos/:id/consolidar', requireAuth, requirePermission('le
             WHERE id = ?
           `, [
             nuevoCampamentoId,
+            nuevoAlmacenId,
+            nuevoEstadoVinc,
             nuevaUbicacion,
             nuevaZona,
             nuevoCustodio,
@@ -4149,14 +8271,12 @@ router.post('/levantamientos/:id/consolidar', requireAuth, requirePermission('le
             masterId
           ]);
 
-          // Vincular el ítem de levantamiento al activo maestro preexistente
           await conn.query(
             'UPDATE inv_levantamiento_items SET consolidado = 1, articulo_maestro_id = ? WHERE id = ?',
             [masterId, it.id]
           );
 
-          // Registrar movimiento en historial indicando tipo preciso según cambios autorizados
-          const tipoMov = (autorizar_reubicacion && masterExistente.ubicacion_nombre !== campUbicacion)
+          const tipoMov = (autorizar_reubicacion && masterExistente.ubicacion_nombre !== nuevaUbicacion)
             ? 'TRASLADO'
             : ((autorizar_cambio_custodio && it.responsable_custodio && it.responsable_custodio !== masterExistente.asignado_a)
               ? 'ASIGNACION'
@@ -4174,28 +8294,36 @@ router.post('/levantamientos/:id/consolidar', requireAuth, requirePermission('le
               ubicacion_origen, ubicacion_destino,
               custodio_origen, custodio_destino,
               estado_previo, estado_nuevo,
-              motivo, observaciones, usuario_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              motivo, observaciones, usuario_id, es_sintetico
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
           `, [
             masterId,
             tipoMov,
-            it.cantidad,
-            it.unidad_medida || masterExistente.unidad_medida,
-            masterExistente.ubicacion_nombre,
+            Number(it.cantidad || 1),
+            it.unidad_medida || masterExistente.unidad_medida || 'Unidad',
+            masterExistente.ubicacion_nombre ?? null,
             nuevaUbicacion,
-            masterExistente.asignado_a,
+            masterExistente.asignado_a ?? null,
             nuevoCustodio,
-            masterExistente.estado_fisico,
+            masterExistente.estado_fisico || 'Bueno',
             nuevoEstado,
             motivoTexto,
             `Sesión de auditoría: ${lev.codigo_levantamiento} (${lev.titulo}) - Serial conciliado: ${it.serie_imei}`,
-            req.user.id
+            req.user.id,
+            Number(masterExistente.es_sintetico ?? isSyntLev) === 1 ? 1 : 0
           ]);
+
+          // Actualizar snapshot en dupMap en caso de otra aparición en el mismo lote
+          masterExistente.campamento_id = nuevoCampamentoId;
+          masterExistente.almacen_id = nuevoAlmacenId;
+          masterExistente.ubicacion_nombre = nuevaUbicacion;
+          masterExistente.zona_estante = nuevaZona;
+          masterExistente.asignado_a = nuevoCustodio;
+          masterExistente.estado_fisico = nuevoEstado;
 
           vinculadosConciliados++;
           continue;
         } else if (resolucion_duplicados === 'OMITIR_DUPLICADOS') {
-          // Excepción autorizada: marcar como omitido para no alterar ni duplicar el maestro
           await conn.query(`
             UPDATE inv_levantamiento_items SET
               consolidado = 2,
@@ -4208,28 +8336,58 @@ router.post('/levantamientos/:id/consolidar', requireAuth, requirePermission('le
         }
       }
 
-      // ÍTEM NUEVO (SIN COLISIÓN DE SERIAL): Se incorpora como nuevo activo maestro
+      // ÍTEM NUEVO (SIN COLISIÓN DE SERIAL): Verificar/generar código único y crear activo maestro
+      let finalItemCode = typeof it.codigo_original === 'string' && it.codigo_original.trim() !== ''
+        ? it.codigo_original.trim()
+        : null;
+
+      if (finalItemCode) {
+        const [dupCodeMaster] = await conn.query(
+          'SELECT id, articulo_nombre FROM inv_articulos WHERE activo = 1 AND UPPER(TRIM(codigo_original)) = ? LIMIT 1 FOR UPDATE',
+          [finalItemCode.toUpperCase()]
+        );
+        if (dupCodeMaster.length > 0) {
+          inTransaction = false;
+          await safeRollback(conn);
+          return res.status(409).json({
+            success: false,
+            message: `No se pudo consolidar "${it.articulo_nombre}": el código "${finalItemCode}" ya pertenece a "${dupCodeMaster[0].articulo_nombre}" (#${dupCodeMaster[0].id}).`
+          });
+        }
+      } else {
+        const autoGen = await generateNextCodeForArea(conn, it.area, { forUpdate: true });
+        finalItemCode = autoGen.nextCode;
+      }
+
+      const normArea = VALID_INVENTARIO_AREAS.includes(String(it.area || '').toUpperCase())
+        ? String(it.area).toUpperCase()
+        : 'ALMACEN';
+      const brandVal = it.marca
+        ? (it.modelo_caracteristicas ? `${it.marca} ${it.modelo_caracteristicas}` : it.marca)
+        : (it.modelo_caracteristicas || null);
+      const itemCant = Number(it.cantidad || 1);
+
       const [insMaster] = await conn.query(
         `INSERT INTO inv_articulos (
-          codigo_original, area, categoria, articulo_nombre, marca_modelo,
-          tipo_caracteristicas, serie_imei, propietario, asignado_a,
-          cantidad_num, cantidad_texto, cantidad_verificada, unidad_medida,
+          codigo_original, area, categoria, articulo_nombre, ${schemaCaps.articulos.brandCol},
+          ${schemaCaps.articulos.specCol}, serie_imei, propietario, asignado_a,
+          cantidad_num, cantidad_texto, cantidad_verificada, estado_cantidad, unidad_medida,
           estado_fisico, ubicacion_nombre, zona_estante, fecha_revision,
           observaciones, evidencia_foto, activo, hoja_origen, fila_origen, creado_por,
-          campamento_id, almacen_id
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, 1, ?, 0, ?, ?, ?)`,
+          campamento_id, almacen_id, es_sintetico, origen_datos, estado_vinculacion_sede
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'VERIFICADO', ?, ?, ?, ?, ?, ?, ?, 1, ?, 0, ?, ?, ?, ?, ?, ?)`,
         [
-          it.codigo_original || null,
-          it.area,
+          finalItemCode,
+          normArea,
           it.categoria || 'General',
           it.articulo_nombre,
-          it.marca ? (it.modelo_caracteristicas ? `${it.marca} ${it.modelo_caracteristicas}` : it.marca) : (it.modelo_caracteristicas || null),
+          brandVal,
           it.modelo_caracteristicas || null,
-          it.serie_imei || null,
+          it.serie_imei ? String(it.serie_imei).trim() : null,
           it.propietario || 'INGMELEC',
           it.responsable_custodio || null,
-          it.cantidad,
-          String(it.cantidad),
+          itemCant,
+          String(itemCant),
           it.unidad_medida || 'Unidad',
           estadoFisicoNormalizado,
           campUbicacion,
@@ -4240,11 +8398,34 @@ router.post('/levantamientos/:id/consolidar', requireAuth, requirePermission('le
           `LEVANTAMIENTO_${lev.codigo_levantamiento}`,
           req.user.id,
           lev.campamento_id || null,
-          lev.almacen_id || null
+          lev.almacen_id || null,
+          isSyntLev,
+          isSyntLev ? 'SINTETICO_PRUEBA' : 'OPERATIVO_REAL',
+          estadoVincNuevo
         ]
       );
 
       const masterId = insMaster.insertId;
+
+      // Registrar en dupMap inmediatamente para deduplicar intra-lote (C04)
+      if (serialKey) {
+        dupMap.set(serialKey, {
+          id: masterId,
+          codigo_original: finalItemCode,
+          articulo_nombre: it.articulo_nombre,
+          serie_imei: it.serie_imei,
+          campamento_id: lev.campamento_id || null,
+          almacen_id: lev.almacen_id || null,
+          ubicacion_nombre: campUbicacion,
+          zona_estante: it.ubicacion_exacta || null,
+          asignado_a: it.responsable_custodio || null,
+          estado_fisico: estadoFisicoNormalizado,
+          cantidad_num: itemCant,
+          cantidad_verificada: 1,
+          unidad_medida: it.unidad_medida || 'Unidad',
+          es_sintetico: isSyntLev
+        });
+      }
 
       await conn.query(
         'UPDATE inv_levantamiento_items SET consolidado = 1, articulo_maestro_id = ? WHERE id = ?',
@@ -4254,17 +8435,18 @@ router.post('/levantamientos/:id/consolidar', requireAuth, requirePermission('le
       await conn.query(
         `INSERT INTO inv_movimientos (
           articulo_id, tipo_movimiento, cantidad, unidad_medida,
-          ubicacion_destino, custodio_destino, estado_nuevo, motivo, observaciones, usuario_id
-        ) VALUES (?, 'ENTRADA', ?, ?, ?, ?, ?, 'Incorporación por Levantamiento en Campo', ?, ?)`,
+          ubicacion_destino, custodio_destino, estado_nuevo, motivo, observaciones, usuario_id, es_sintetico
+        ) VALUES (?, 'ENTRADA', ?, ?, ?, ?, ?, 'Incorporación por Levantamiento en Campo', ?, ?, ?)`,
         [
           masterId,
-          it.cantidad,
-          it.unidad_medida,
+          itemCant,
+          it.unidad_medida || 'Unidad',
           campUbicacion,
-          it.responsable_custodio,
+          it.responsable_custodio || null,
           estadoFisicoNormalizado,
           `Sesión de auditoría: ${lev.codigo_levantamiento} (${lev.titulo})`,
-          req.user.id
+          req.user.id,
+          isSyntLev
         ]
       );
 
@@ -4300,6 +8482,7 @@ router.post('/levantamientos/:id/consolidar', requireAuth, requirePermission('le
     });
 
     await conn.commit();
+    inTransaction = false;
 
     res.json({
       success: true,
@@ -4309,11 +8492,19 @@ router.post('/levantamientos/:id/consolidar', requireAuth, requirePermission('le
       articulos_omitidos: omitidosDuplicados
     });
   } catch (error) {
-    await conn.rollback();
+    if (conn && inTransaction) {
+      await safeRollback(conn);
+    }
     console.error('Consolidation error:', error);
-    res.status(500).json({ success: false, message: 'Error consolidando levantamiento al inventario maestro.' });
+    const status = isDbUnavailableError(error, conn) ? 503 : 500;
+    res.status(status).json({
+      success: false,
+      message: status === 503
+        ? 'Base de datos temporalmente no disponible. Intente nuevamente.'
+        : 'Error consolidando levantamiento al inventario maestro.'
+    });
   } finally {
-    conn.release();
+    safeRelease(conn);
   }
 });
 

@@ -1,14 +1,71 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import {
   Search, Filter, Eye, Download, Plus, ChevronLeft,
-  ChevronRight, ArrowUpDown, AlertCircle, CheckCircle2,
-  Package, RefreshCw, X, ShieldAlert, ArrowLeft, RotateCcw,
-  Sparkles, Lock, Unlock, AlertTriangle
+  ChevronRight, Package, RefreshCw, X, ArrowLeft, RotateCcw,
+  Sparkles, Lock, Unlock, AlertTriangle, FileSpreadsheet
 } from 'lucide-react';
 import { useApp } from '../../context/AppContext';
 import { mapParamToEstado, mapEstadoToParam } from '../../utils/statusMapper';
+import { toSafeDisplayString } from '../../utils/jsonFormat';
+import { userHasPermission, isDeveloperUser } from '../../utils/permissions';
+import {
+  downloadCsvFile,
+  downloadXlsxWorkbook,
+  INVENTARIO_EXPORT_HEADERS,
+  INVENTARIO_EXPORT_WIDTHS,
+  mapArticulosToExportRows
+} from '../../utils/exportUtils';
 import ItemDetailModal from './ItemDetailModal';
 import SearchableSelect from './SearchableSelect';
+
+function normalizeLookupText(val) {
+  return toSafeDisplayString(val, '').trim().toUpperCase();
+}
+
+function resolveCampamentoIdForUbicacion(ubicName, ubicList = [], campamentosCatalog = [], activeCampamento = null) {
+  const needle = normalizeLookupText(ubicName);
+  if (!needle) return null;
+
+  const matchedOpt = (Array.isArray(ubicList) ? ubicList : []).find(
+    u => normalizeLookupText(u?.value || u?.nombre) === needle
+  );
+  if (matchedOpt?.campamento_id) {
+    return Number(matchedOpt.campamento_id);
+  }
+
+  const catalog = Array.isArray(campamentosCatalog) ? campamentosCatalog : [];
+  const matchedCamp = catalog.find(c => {
+    if (!c || c.es_sintetico) return false;
+    if (
+      normalizeLookupText(c.nombre) === needle ||
+      normalizeLookupText(c.codigo) === needle ||
+      normalizeLookupText(c.ubicacion_historica_equivalente) === needle
+    ) {
+      return true;
+    }
+    if (Array.isArray(c.aliases)) {
+      return c.aliases.some(
+        al =>
+          al?.requiere_revision_historica !== 1 &&
+          (normalizeLookupText(al?.alias_original) === needle || normalizeLookupText(al?.alias_normalizado) === needle)
+      );
+    }
+    return false;
+  });
+  if (matchedCamp?.id) {
+    return Number(matchedCamp.id);
+  }
+
+  if (
+    activeCampamento?.id &&
+    (normalizeLookupText(activeCampamento.nombre) === needle ||
+      normalizeLookupText(activeCampamento.ubicacion_historica_equivalente) === needle)
+  ) {
+    return Number(activeCampamento.id);
+  }
+
+  return null;
+}
 
 export default function InventoryTable({
   fixedArea = null,
@@ -19,36 +76,62 @@ export default function InventoryTable({
   onNavigateBack = null,
   defaultEmptyMessage = 'No se encontraron artículos con los criterios seleccionados.'
 }) {
-  const { fetchArticulos, currentRole } = useApp();
+  const { fetchArticulos, currentRole, currentUser, campamentosCatalog, kpis, activeCampamento, showToast } = useApp();
+
+  const getUrlParam = (key) => {
+    if (typeof window === 'undefined' || !window.location) return null;
+    return new URLSearchParams(window.location.search).get(key);
+  };
 
   const [loading, setLoading] = useState(true);
+  const [exporting, setExporting] = useState(false);
   const [articulos, setArticulos] = useState([]);
   const [resumen, setResumen] = useState({ totalRegistros: 0, totalUnidadesFisicas: 0, articulosSinCantidad: 0 });
-  const [pagination, setPagination] = useState({ total: 0, page: 1, limit: 25, totalPages: 1 });
+  const [pagination, setPagination] = useState(() => ({
+    total: 0,
+    page: Math.max(1, parseInt(getUrlParam('page') || '1', 10) || 1),
+    limit: [25, 50, 100, 500].includes(parseInt(getUrlParam('limit') || '25', 10))
+      ? parseInt(getUrlParam('limit') || '25', 10)
+      : 25,
+    totalPages: 1
+  }));
 
-  // Filters State
-  const [search, setSearch] = useState('');
-  const [areaFilter, setAreaFilter] = useState('TODAS');
+  // Filters State (con persistencia URL M08 y propagación activeCampamento C08)
+  const [search, setSearch] = useState(() => initialFilters?.search || getUrlParam('search') || '');
+  const [areaFilter, setAreaFilter] = useState(() => (initialFilters?.area || getUrlParam('area') || 'TODAS').toUpperCase());
   const [campamentoFilter, setCampamentoFilter] = useState(() => {
     if (initialFilters?.campamento_id) {
       return String(initialFilters.campamento_id);
     }
-    const urlParam = new URLSearchParams(window.location.search).get('campamento_id');
-    return urlParam ? String(urlParam) : 'TODOS';
+    const urlParam = getUrlParam('campamento_id');
+    if (urlParam) return String(urlParam);
+    return activeCampamento?.id ? String(activeCampamento.id) : 'TODOS';
   });
   const [estado, setEstado] = useState(() => {
     if (initialFilters?.estado) {
       return mapParamToEstado(initialFilters.estado);
     }
-    const urlParam = new URLSearchParams(window.location.search).get('estado');
+    const urlParam = getUrlParam('estado');
     return urlParam ? mapParamToEstado(urlParam) : 'TODOS';
   });
-  const [ubicacion, setUbicacion] = useState('TODAS');
-  const [categoria, setCategoria] = useState('TODAS');
-  const [sinSerial, setSinSerial] = useState(false);
-  const [sinCantidad, setSinCantidad] = useState(false);
-  const [sortBy, setSortBy] = useState('id');
-  const [sortOrder, setSortOrder] = useState('ASC');
+  const [ubicacion, setUbicacion] = useState(() => initialFilters?.ubicacion || getUrlParam('ubicacion') || 'TODAS');
+  const [categoria, setCategoria] = useState(() => initialFilters?.categoria || getUrlParam('categoria') || 'TODAS');
+  const [sinSerial, setSinSerial] = useState(() => (initialFilters?.sinSerial || getUrlParam('sinSerial')) === 'true');
+  const [sinCantidad, setSinCantidad] = useState(() => (initialFilters?.sinCantidad || getUrlParam('sinCantidad')) === 'true');
+  const [sortBy, setSortBy] = useState(() => initialFilters?.sortBy || getUrlParam('sortBy') || 'id');
+  const [sortOrder, setSortOrder] = useState(() => (initialFilters?.sortOrder || getUrlParam('sortOrder') || 'ASC').toUpperCase() === 'DESC' ? 'DESC' : 'ASC');
+
+  const prevActiveCampIdRef = useRef(activeCampamento?.id ? String(activeCampamento.id) : 'TODOS');
+
+  // Sincronización cuando cambia el selector global de sede en Topbar (C08)
+  useEffect(() => {
+    const nextGlobalId = activeCampamento?.id ? String(activeCampamento.id) : 'TODOS';
+    if (prevActiveCampIdRef.current !== nextGlobalId) {
+      prevActiveCampIdRef.current = nextGlobalId;
+      setCampamentoFilter(nextGlobalId);
+      setPagination(p => ({ ...p, page: 1 }));
+    }
+  }, [activeCampamento]);
 
   // Modal detail & create
   const [selectedItemId, setSelectedItemId] = useState(null);
@@ -58,22 +141,39 @@ export default function InventoryTable({
   const [availableUbicaciones, setAvailableUbicaciones] = useState([]);
   const [availableCategorias, setAvailableCategorias] = useState([]);
 
-  // Detect and update when initialFilters change
+  // Detect and update when initialFilters / popstate URL params change (M08)
   useEffect(() => {
-    if (initialFilters?.estado) {
-      const mapped = mapParamToEstado(initialFilters.estado);
+    if (initialFilters?.estado !== undefined) {
+      const mapped = initialFilters.estado ? mapParamToEstado(initialFilters.estado) : 'TODOS';
       setEstado(mapped);
-      setPagination(p => ({ ...p, page: 1 }));
     }
-    if (initialFilters?.campamento_id) {
-      setCampamentoFilter(String(initialFilters.campamento_id));
-      setPagination(p => ({ ...p, page: 1 }));
+    if (initialFilters?.campamento_id !== undefined) {
+      setCampamentoFilter(initialFilters.campamento_id ? String(initialFilters.campamento_id) : 'TODOS');
     }
-  }, [initialFilters?.estado, initialFilters?.campamento_id]);
+    if (initialFilters?.area !== undefined) {
+      setAreaFilter(initialFilters.area ? String(initialFilters.area).toUpperCase() : 'TODAS');
+    }
+    if (initialFilters?.search !== undefined) {
+      setSearch(String(initialFilters.search || ''));
+    }
+    if (initialFilters?.sortBy !== undefined) {
+      setSortBy(initialFilters.sortBy || 'id');
+    }
+    if (initialFilters?.sortOrder !== undefined) {
+      setSortOrder(String(initialFilters.sortOrder || 'ASC').toUpperCase() === 'DESC' ? 'DESC' : 'ASC');
+    }
+  }, [
+    initialFilters?.estado,
+    initialFilters?.campamento_id,
+    initialFilters?.area,
+    initialFilters?.search,
+    initialFilters?.sortBy,
+    initialFilters?.sortOrder
+  ]);
 
-  // Sync URL in General Inventory
+  // Sync URL in General Inventory (incluye todos los filtros, ordenación y página M08)
   useEffect(() => {
-    if (fixedArea === null) {
+    if (fixedArea === null && typeof window !== 'undefined' && window.history?.replaceState) {
       const params = new URLSearchParams();
       if (estado && estado !== 'TODOS') {
         params.append('estado', mapEstadoToParam(estado));
@@ -84,14 +184,35 @@ export default function InventoryTable({
       if (areaFilter && areaFilter !== 'TODAS') {
         params.append('area', areaFilter);
       }
+      if (ubicacion && ubicacion !== 'TODAS') {
+        params.append('ubicacion', ubicacion);
+      }
+      if (categoria && categoria !== 'TODAS') {
+        params.append('categoria', categoria);
+      }
+      if (sinSerial) {
+        params.append('sinSerial', 'true');
+      }
+      if (sinCantidad) {
+        params.append('sinCantidad', 'true');
+      }
       if (search && search.trim() !== '') {
         params.append('search', search.trim());
       }
+      if (sortBy && sortBy !== 'id') {
+        params.append('sortBy', sortBy);
+      }
+      if (sortOrder && sortOrder !== 'ASC') {
+        params.append('sortOrder', sortOrder);
+      }
+      if (pagination.page > 1) {
+        params.append('page', String(pagination.page));
+      }
       const q = params.toString();
       const newUrl = `/inventario${q ? `?${q}` : ''}`;
-      window.history.replaceState({ estado, search, areaFilter, campamento_id: campamentoFilter }, '', newUrl);
+      window.history.replaceState({ estado, search, areaFilter, campamento_id: campamentoFilter, sortBy, sortOrder }, '', newUrl);
     }
-  }, [estado, campamentoFilter, areaFilter, search, fixedArea]);
+  }, [estado, campamentoFilter, areaFilter, ubicacion, categoria, sinSerial, sinCantidad, search, sortBy, sortOrder, pagination.page, fixedArea]);
 
   const loadData = useCallback(async () => {
     setLoading(true);
@@ -146,46 +267,76 @@ export default function InventoryTable({
     setCategoria('TODAS');
     setSinSerial(false);
     setSinCantidad(false);
+    setSortBy('id');
+    setSortOrder('ASC');
     setPagination(p => ({ ...p, page: 1 }));
-    if (fixedArea === null) {
+    if (fixedArea === null && typeof window !== 'undefined' && window.history?.replaceState) {
       window.history.replaceState({}, '', '/inventario');
     }
   };
 
-  // Export current view to CSV
-  const handleExportCsv = () => {
-    if (articulos.length === 0) return;
-    const headers = [
-      'ID Interno', 'Área', 'Categoría', 'Descripción', 'Marca/Modelo',
-      'Serie/IMEI', 'Cantidad', 'Unidad', 'Estado', 'Ubicación', 'Zona/Estante',
-      'Propietario', 'Custodio', 'Observaciones'
-    ];
-    const rows = articulos.map(a => [
-      `"${a.codigo_original || ''}"`,
-      `"${a.area || ''}"`,
-      `"${a.categoria || ''}"`,
-      `"${(a.articulo_nombre || '').replace(/"/g, '""')}"`,
-      `"${(a.marca_modelo || '').replace(/"/g, '""')}"`,
-      `"${a.serie_imei || ''}"`,
-      a.cantidad_num !== null ? a.cantidad_num : `"${a.cantidad_texto || ''}"`,
-      `"${a.unidad_medida || 'Unidad'}"`,
-      `"${a.estado_fisico || ''}"`,
-      `"${a.ubicacion_nombre || ''}"`,
-      `"${a.zona_estante || ''}"`,
-      `"${a.propietario || ''}"`,
-      `"${a.asignado_a || ''}"`,
-      `"${(a.observaciones || '').replace(/"/g, '""')}"`
-    ]);
+  const handleSortColumn = (colKey) => {
+    if (sortBy === colKey) {
+      setSortOrder(prev => (prev === 'ASC' ? 'DESC' : 'ASC'));
+    } else {
+      setSortBy(colKey);
+      setSortOrder('ASC');
+    }
+    setPagination(p => ({ ...p, page: 1 }));
+  };
 
-    const csvContent = '\uFEFF' + [headers.join(','), ...rows.map(r => r.join(','))].join('\n');
-    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.setAttribute('href', url);
-    link.setAttribute('download', `inventario_${fixedArea || 'general'}_${estado !== 'TODOS' ? estado : 'completo'}_${new Date().toISOString().slice(0,10)}.csv`);
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
+  // Exportar universo filtrado completo (todas las páginas, CSV con neutralización de fórmulas o Excel .xlsx A08/A11)
+  const handleExportFiltered = async (format = 'csv') => {
+    if (pagination.total === 0 && articulos.length === 0) return;
+    try {
+      setExporting(true);
+      const query = new URLSearchParams();
+      const activeArea = fixedArea || (areaFilter !== 'TODAS' ? areaFilter : undefined);
+      if (activeArea) query.append('area', activeArea);
+      if (campamentoFilter !== 'TODOS') query.append('campamento_id', campamentoFilter);
+      if (estado !== 'TODOS') query.append('estado', estado);
+      if (ubicacion !== 'TODAS') query.append('ubicacion', ubicacion);
+      if (categoria !== 'TODAS') query.append('categoria', categoria);
+      if (sinSerial) query.append('sinSerial', 'true');
+      if (sinCantidad) query.append('sinCantidad', 'true');
+      if (search.trim()) query.append('search', search.trim());
+      query.append('sortBy', sortBy);
+      query.append('sortOrder', sortOrder);
+
+      const token = typeof localStorage !== 'undefined' ? localStorage.getItem('ingmelec_token') : null;
+      const res = await fetch(`/api/v2/reportes/exportar?${query.toString()}`, {
+        headers: token ? { Authorization: `Bearer ${token}` } : {}
+      });
+      const json = await res.json();
+      if (!res.ok || !json?.success || !Array.isArray(json.data)) {
+        if (showToast) showToast(json?.message || 'Error al exportar inventario completo.', 'error');
+        return;
+      }
+
+      const rows = mapArticulosToExportRows(json.data);
+      const baseFilename = `inventario_${fixedArea || 'general'}_${estado !== 'TODOS' ? estado : 'completo'}_${new Date().toISOString().slice(0, 10)}`;
+
+      if (format === 'xlsx') {
+        await downloadXlsxWorkbook(`${baseFilename}.xlsx`, [
+          {
+            sheetName: 'Inventario Filtrado',
+            headers: INVENTARIO_EXPORT_HEADERS,
+            rows,
+            columnWidths: INVENTARIO_EXPORT_WIDTHS
+          }
+        ]);
+      } else {
+        downloadCsvFile(`${baseFilename}.csv`, INVENTARIO_EXPORT_HEADERS, rows);
+      }
+      if (showToast) {
+        showToast(`Exportación ${format.toUpperCase()} generada (${json.data.length} registros).`, 'success');
+      }
+    } catch (err) {
+      console.error('Export filtered inventory error:', err);
+      if (showToast) showToast('No se pudo completar la exportación del inventario.', 'error');
+    } finally {
+      setExporting(false);
+    }
   };
 
   const renderBadge = (status) => {
@@ -214,17 +365,98 @@ export default function InventoryTable({
       case 'ALMACEN':
         return <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-amber-50 text-[#F28524] border border-amber-200">Almacén</span>;
       default:
-        return <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-slate-100 text-slate-700">{area}</span>;
+        return <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-slate-100 text-slate-700">{toSafeDisplayString(area, 'Sin área')}</span>;
     }
   };
 
   const hasActiveFilters = estado !== 'TODOS' || campamentoFilter !== 'TODOS' || areaFilter !== 'TODAS' || ubicacion !== 'TODAS' || categoria !== 'TODAS' || search !== '' || sinSerial || sinCantidad;
 
-  const campamentoLabelMap = {
-    '3': 'ALMACÉN 27 DE FEBRERO',
-    '12': 'OPL',
-    '13': 'MANTENIMIENTO 633',
-    'SIN_SEDE': 'SIN SEDE VERIFICADA (PENDIENTE DE CLASIFICACIÓN · KM 19 AUT DUARTE)'
+  const isGlobalRole = isDeveloperUser(currentUser) || currentRole === 'gerencia';
+  const canCreate = userHasPermission(currentUser, 'inv:crear');
+  const canExport = userHasPermission(currentUser, 'rep:exportar');
+
+  const campamentoSelectOptions = useMemo(() => {
+    const kpiPorCamp = Array.isArray(kpis?.porCampamento) ? kpis.porCampamento : [];
+    const kpiById = new Map(kpiPorCamp.map(c => [String(c.id), c]));
+    const catalogList = Array.isArray(campamentosCatalog)
+      ? campamentosCatalog.filter(c => !c?.es_sintetico && c?.activo !== 0)
+      : [];
+
+    const sourceList = catalogList.length > 0 ? catalogList : kpiPorCamp;
+    return sourceList.map(c => {
+      const idStr = String(c.id);
+      const kpiMatch = kpiById.get(idStr);
+      const nombre = toSafeDisplayString(c.nombre || kpiMatch?.nombre, `Sede #${idStr}`);
+      const rawCount = c.total_articulos ?? kpiMatch?.total_articulos;
+      const count = typeof rawCount === 'number'
+        ? rawCount
+        : (rawCount !== undefined && rawCount !== null ? Number(rawCount) : null);
+      return {
+        value: idStr,
+        nombre,
+        count: Number.isFinite(count) ? count : null
+      };
+    });
+  }, [campamentosCatalog, kpis]);
+
+  const sinSedeOption = useMemo(() => {
+    const sinSede = kpis?.sinSedeVerificada || null;
+    if (!sinSede && !isGlobalRole && campamentoFilter !== 'SIN_SEDE') {
+      return null;
+    }
+    const nombre = toSafeDisplayString(sinSede?.nombre, 'SIN SEDE VERIFICADA');
+    const historica = sinSede?.ubicacion_historica
+      ? toSafeDisplayString(sinSede.ubicacion_historica, '')
+      : '';
+    const rawCount = sinSede?.total_articulos;
+    const count = typeof rawCount === 'number'
+      ? rawCount
+      : (rawCount !== undefined && rawCount !== null ? Number(rawCount) : null);
+    return {
+      value: 'SIN_SEDE',
+      nombre,
+      historica,
+      count: Number.isFinite(count) ? count : null
+    };
+  }, [kpis, isGlobalRole, campamentoFilter]);
+
+  const campamentoLabelMap = useMemo(() => {
+    const map = {};
+    campamentoSelectOptions.forEach(opt => {
+      map[opt.value] = opt.nombre;
+    });
+    if (sinSedeOption) {
+      map.SIN_SEDE = sinSedeOption.historica
+        ? `${sinSedeOption.nombre} (PENDIENTE DE CLASIFICACIÓN · ${sinSedeOption.historica})`
+        : `${sinSedeOption.nombre} (PENDIENTE DE CLASIFICACIÓN)`;
+    }
+    return map;
+  }, [campamentoSelectOptions, sinSedeOption]);
+
+  const ubicacionFilterOptions = useMemo(() => {
+    const set = new Set();
+    if (Array.isArray(kpis?.ubicaciones)) {
+      kpis.ubicaciones.forEach(u => {
+        const name = toSafeDisplayString(u?.ubicacion_nombre, '');
+        if (name && name !== '—') set.add(name);
+      });
+    }
+    availableUbicaciones.forEach(u => {
+      const name = toSafeDisplayString(u, '');
+      if (name && name !== '—') set.add(name);
+    });
+    if (ubicacion && ubicacion !== 'TODAS') {
+      set.add(ubicacion);
+    }
+    return Array.from(set);
+  }, [kpis, availableUbicaciones, ubicacion]);
+
+  const formatAreaOpt = (label, areaKey) => {
+    const porArea = kpis?.porArea;
+    if (porArea && porArea[areaKey] !== undefined && porArea[areaKey] !== null) {
+      return `${label} (${Number(porArea[areaKey])})`;
+    }
+    return label;
   };
 
   return (
@@ -242,7 +474,7 @@ export default function InventoryTable({
                 <ArrowLeft className="w-4 h-4" />
               </button>
             )}
-            <h1 className="text-xl font-black text-slate-900 tracking-tight">{title}</h1>
+            <h1 className="text-xl font-black text-slate-900 tracking-tight">{toSafeDisplayString(title, 'Inventario')}</h1>
             <span className="px-3 py-0.5 bg-[#F28524]/10 text-[#F28524] font-bold text-xs rounded-full border border-[#F28524]/20">
               {pagination.total} {pagination.total === 1 ? 'registro' : 'registros'}
             </span>
@@ -255,7 +487,7 @@ export default function InventoryTable({
               </span>
             )}
           </div>
-          {subtitle && <p className="text-xs text-slate-500 mt-1">{subtitle}</p>}
+          {subtitle && <p className="text-xs text-slate-500 mt-1">{toSafeDisplayString(subtitle, '')}</p>}
         </div>
 
         <div className="flex items-center space-x-2">
@@ -277,16 +509,30 @@ export default function InventoryTable({
             <RefreshCw className={`w-4 h-4 ${loading ? 'animate-spin text-[#F28524]' : ''}`} />
           </button>
 
-          <button
-            onClick={handleExportCsv}
-            disabled={articulos.length === 0}
-            className="px-3.5 py-2 border border-slate-200 rounded-xl text-slate-700 hover:text-slate-900 hover:bg-slate-50 text-xs font-semibold flex items-center space-x-1.5 transition-colors disabled:opacity-50"
-          >
-            <Download className="w-4 h-4" />
-            <span>Exportar CSV</span>
-          </button>
+          {canExport && (
+            <>
+              <button
+                type="button"
+                onClick={() => handleExportFiltered('csv')}
+                disabled={(pagination.total === 0 && articulos.length === 0) || exporting}
+                className="px-3.5 py-2 border border-slate-200 rounded-xl text-slate-700 hover:text-slate-900 hover:bg-slate-50 text-xs font-semibold flex items-center space-x-1.5 transition-colors disabled:opacity-50 no-print"
+              >
+                <Download className="w-4 h-4" />
+                <span>{exporting ? 'Exportando...' : 'Exportar CSV'}</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => handleExportFiltered('xlsx')}
+                disabled={(pagination.total === 0 && articulos.length === 0) || exporting}
+                className="px-3.5 py-2 border border-emerald-200 bg-emerald-50/70 rounded-xl text-emerald-800 hover:bg-emerald-100 text-xs font-semibold flex items-center space-x-1.5 transition-colors disabled:opacity-50 no-print"
+              >
+                <FileSpreadsheet className="w-4 h-4" />
+                <span>Excel (.xlsx)</span>
+              </button>
+            </>
+          )}
 
-          {allowCreate && (currentRole === 'admin' || currentRole === 'almacen' || currentRole === 'supervisor' || currentRole === 'developer') && (
+          {allowCreate && canCreate && (
             <button
               onClick={() => setShowCreateModal(true)}
               className="px-4 py-2 bg-[#F28524] hover:bg-[#d87019] text-white rounded-xl text-xs font-bold shadow-md shadow-[#F28524]/20 flex items-center space-x-1.5 transition-all"
@@ -309,12 +555,12 @@ export default function InventoryTable({
               <div className="font-bold text-amber-900 text-sm flex flex-wrap items-center gap-2">
                 {campamentoFilter !== 'TODOS' && (
                   <span>
-                    Sede / Campamento: <span className="text-[#F28524] font-extrabold underline decoration-2 underline-offset-2">{campamentoLabelMap[campamentoFilter] || campamentoFilter}</span>
+                    Sede / Campamento: <span className="text-[#F28524] font-extrabold underline decoration-2 underline-offset-2">{toSafeDisplayString(campamentoLabelMap[campamentoFilter] || `Sede #${campamentoFilter}`, '—')}</span>
                   </span>
                 )}
                 {estado !== 'TODOS' && (
                   <span>
-                    Condición Física: <span className="text-[#F28524] font-extrabold underline decoration-2 underline-offset-2">{estado}</span>
+                    Condición Física: <span className="text-[#F28524] font-extrabold underline decoration-2 underline-offset-2">{toSafeDisplayString(estado, '—')}</span>
                   </span>
                 )}
               </div>
@@ -376,11 +622,29 @@ export default function InventoryTable({
               className="w-full px-3 py-2 text-xs border border-slate-200 rounded-xl focus:ring-2 focus:ring-[#F28524] focus:outline-none bg-white text-slate-800 font-semibold truncate"
               title="Filtrar por Campamento Confirmado o Sin Sede Verificada"
             >
-              <option value="TODOS">Todos los Campamentos (433)</option>
-              <option value="3">ALMACÉN 27 DE FEBRERO (84)</option>
-              <option value="12">OPL (136)</option>
-              <option value="13">MANTENIMIENTO 633 (109)</option>
-              <option value="SIN_SEDE">SIN SEDE VERIFICADA · KM 19 (104)</option>
+              <option value="TODOS">
+                {typeof kpis?.totalArticulos === 'number'
+                  ? `Todos los Campamentos (${kpis.totalArticulos})`
+                  : 'Todos los Campamentos'}
+              </option>
+              {campamentoSelectOptions.map(opt => (
+                <option key={opt.value} value={opt.value}>
+                  {opt.count !== null ? `${opt.nombre} (${opt.count})` : opt.nombre}
+                </option>
+              ))}
+              {campamentoFilter !== 'TODOS' &&
+                campamentoFilter !== 'SIN_SEDE' &&
+                !campamentoSelectOptions.some(opt => opt.value === campamentoFilter) && (
+                  <option value={campamentoFilter}>Sede #{campamentoFilter}</option>
+                )}
+              {sinSedeOption && (
+                <option value="SIN_SEDE">
+                  {sinSedeOption.historica
+                    ? `${sinSedeOption.nombre} · ${sinSedeOption.historica}`
+                    : sinSedeOption.nombre}
+                  {sinSedeOption.count !== null ? ` (${sinSedeOption.count})` : ''}
+                </option>
+              )}
             </select>
           </div>
 
@@ -393,10 +657,10 @@ export default function InventoryTable({
                 className="w-full px-3 py-2 text-xs border border-slate-200 rounded-xl focus:ring-2 focus:ring-[#F28524] focus:outline-none bg-white text-slate-700"
               >
                 <option value="TODAS">Todas las Áreas</option>
-                <option value="INFORMATICA">Informática (84)</option>
-                <option value="OFICINAS">Oficinas y Mobiliario (69)</option>
-                <option value="COCINA">Cocina y Comedor (0)</option>
-                <option value="ALMACEN">Almacén y Herramientas (280)</option>
+                <option value="INFORMATICA">{formatAreaOpt('Informática', 'INFORMATICA')}</option>
+                <option value="OFICINAS">{formatAreaOpt('Oficinas y Mobiliario', 'OFICINAS')}</option>
+                <option value="COCINA">{formatAreaOpt('Cocina y Comedor', 'COCINA')}</option>
+                <option value="ALMACEN">{formatAreaOpt('Almacén y Herramientas', 'ALMACEN')}</option>
               </select>
             </div>
           ) : (
@@ -408,7 +672,7 @@ export default function InventoryTable({
               >
                 <option value="TODAS">Todas las Categorías</option>
                 {availableCategorias.map((c, i) => (
-                  <option key={i} value={c}>{c}</option>
+                  <option key={i} value={c}>{toSafeDisplayString(c, '')}</option>
                 ))}
               </select>
             </div>
@@ -439,10 +703,9 @@ export default function InventoryTable({
               title="Ubicación histórica literal en Excel"
             >
               <option value="TODAS">Ubicación Excel (Todas)</option>
-              <option value="DISTRITO NACIONAL 27 DE FEBRERO">DISTRITO NACIONAL 27 DE FEBRERO</option>
-              <option value="KM 19 AUTOPISTA DUARTE OPL">KM 19 AUTOPISTA DUARTE OPL</option>
-              <option value="MANTENIMIENTO 633">MANTENIMIENTO 633</option>
-              <option value="KM 19 AUT DUARTE">KM 19 AUT DUARTE</option>
+              {ubicacionFilterOptions.map((ubName) => (
+                <option key={ubName} value={ubName}>{ubName}</option>
+              ))}
             </select>
           </div>
         </div>
@@ -502,18 +765,75 @@ export default function InventoryTable({
         <div className="overflow-x-auto">
           <table className="w-full text-left border-collapse text-xs">
             <thead>
-              <tr className="bg-slate-50/80 border-b border-slate-200 text-slate-600 font-bold uppercase tracking-wider">
-                <th className="py-3 px-4">Código</th>
-                <th className="py-3 px-4">Bien / Descripción</th>
-                <th className="py-3 px-4">Área / Cat.</th>
-                <th className="py-3 px-4">Marca / Modelo</th>
-                <th className="py-3 px-4">Serie / IMEI</th>
-                <th className="py-3 px-4 text-center">Cant. Física</th>
-                <th className="py-3 px-4">Estado</th>
-                <th className="py-3 px-4">Sede / Ubicación Excel</th>
-                <th className="py-3 px-4">Propietario / Custodio</th>
-                <th className="py-3 px-4">Observaciones del Excel</th>
-                <th className="py-3 px-4 text-center">Acciones</th>
+              <tr className="bg-slate-50/80 border-b border-slate-200 text-slate-700 font-bold uppercase tracking-wider">
+                {[
+                  { key: 'codigo_original', label: 'Código' },
+                  { key: 'articulo_nombre', label: 'Bien / Descripción' },
+                  { key: 'area', label: 'Área / Cat.' },
+                  { key: 'marca_modelo', label: 'Marca / Modelo' }
+                ].map(col => (
+                  <th
+                    key={col.key}
+                    scope="col"
+                    aria-sort={sortBy === col.key ? (sortOrder === 'ASC' ? 'ascending' : 'descending') : 'none'}
+                    className="py-3 px-4"
+                  >
+                    <button
+                      type="button"
+                      onClick={() => handleSortColumn(col.key)}
+                      className="inline-flex items-center space-x-1 font-bold uppercase tracking-wider hover:text-[#F28524] transition-colors"
+                    >
+                      <span>{col.label}</span>
+                      <span className="text-[10px] font-mono">{sortBy === col.key ? (sortOrder === 'ASC' ? '↑' : '↓') : '↕'}</span>
+                    </button>
+                  </th>
+                ))}
+                <th scope="col" className="py-3 px-4">Serie / IMEI</th>
+                <th
+                  scope="col"
+                  aria-sort={sortBy === 'cantidad_num' ? (sortOrder === 'ASC' ? 'ascending' : 'descending') : 'none'}
+                  className="py-3 px-4 text-center"
+                >
+                  <button
+                    type="button"
+                    onClick={() => handleSortColumn('cantidad_num')}
+                    className="inline-flex items-center justify-center space-x-1 font-bold uppercase tracking-wider hover:text-[#F28524] transition-colors"
+                  >
+                    <span>Cant. Física</span>
+                    <span className="text-[10px] font-mono">{sortBy === 'cantidad_num' ? (sortOrder === 'ASC' ? '↑' : '↓') : '↕'}</span>
+                  </button>
+                </th>
+                <th
+                  scope="col"
+                  aria-sort={sortBy === 'estado_fisico' ? (sortOrder === 'ASC' ? 'ascending' : 'descending') : 'none'}
+                  className="py-3 px-4"
+                >
+                  <button
+                    type="button"
+                    onClick={() => handleSortColumn('estado_fisico')}
+                    className="inline-flex items-center space-x-1 font-bold uppercase tracking-wider hover:text-[#F28524] transition-colors"
+                  >
+                    <span>Estado</span>
+                    <span className="text-[10px] font-mono">{sortBy === 'estado_fisico' ? (sortOrder === 'ASC' ? '↑' : '↓') : '↕'}</span>
+                  </button>
+                </th>
+                <th
+                  scope="col"
+                  aria-sort={sortBy === 'campamento_id' ? (sortOrder === 'ASC' ? 'ascending' : 'descending') : 'none'}
+                  className="py-3 px-4"
+                >
+                  <button
+                    type="button"
+                    onClick={() => handleSortColumn('campamento_id')}
+                    className="inline-flex items-center space-x-1 font-bold uppercase tracking-wider hover:text-[#F28524] transition-colors"
+                  >
+                    <span>Sede / Ubicación Excel</span>
+                    <span className="text-[10px] font-mono">{sortBy === 'campamento_id' ? (sortOrder === 'ASC' ? '↑' : '↓') : '↕'}</span>
+                  </button>
+                </th>
+                <th scope="col" className="py-3 px-4">Propietario / Custodio</th>
+                <th scope="col" className="py-3 px-4">Observaciones del Excel</th>
+                <th scope="col" className="py-3 px-4 text-center">Acciones</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100">
@@ -528,7 +848,7 @@ export default function InventoryTable({
                 <tr>
                   <td colSpan="11" className="py-16 text-center text-slate-400">
                     <Package className="w-10 h-10 mx-auto text-slate-300 mb-2" />
-                    <p className="font-semibold text-slate-600">{defaultEmptyMessage}</p>
+                    <p className="font-semibold text-slate-600">{toSafeDisplayString(defaultEmptyMessage, 'No se encontraron artículos.')}</p>
                     <p className="text-xs text-slate-400 mt-1">Verifica los filtros seleccionados o limpia la búsqueda.</p>
                     {hasActiveFilters && (
                       <button
@@ -600,7 +920,7 @@ export default function InventoryTable({
                         </>
                       ) : (
                         <span className="inline-flex items-center px-2 py-0.5 rounded text-[10px] font-bold bg-amber-100 text-amber-900 border border-amber-300" title="Cantidad vacía o '--' en Excel original; no convertida a 0 ni 1">
-                          Pend. verificación {art.cantidad_texto ? `(${art.cantidad_texto})` : ''}
+                          Pend. verificación {art.cantidad_texto ? `(${toSafeDisplayString(art.cantidad_texto, '')})` : ''}
                         </span>
                       )}
                     </td>
@@ -615,7 +935,7 @@ export default function InventoryTable({
                       <div>
                         {art.campamento_id ? (
                           <span className="inline-flex items-center px-2 py-0.5 rounded text-[10px] font-bold bg-emerald-50 text-emerald-800 border border-emerald-200">
-                            {art.campamento_nombre || `Sede #${art.campamento_id}`}
+                            {toSafeDisplayString(art.campamento_nombre, `Sede #${art.campamento_id}`)}
                           </span>
                         ) : (
                           <span className="inline-flex items-center px-2 py-0.5 rounded text-[10px] font-bold bg-amber-50 text-amber-900 border border-amber-300">
@@ -623,12 +943,12 @@ export default function InventoryTable({
                           </span>
                         )}
                       </div>
-                      <div className="text-[10px] text-slate-500 mt-0.5 line-clamp-1" title={art.ubicacion_nombre}>
-                        Excel: {art.ubicacion_nombre}
+                      <div className="text-[10px] text-slate-500 mt-0.5 line-clamp-1" title={toSafeDisplayString(art.ubicacion_nombre, '')}>
+                        Excel: {toSafeDisplayString(art.ubicacion_nombre, 'Sin ubicación')}
                       </div>
                       {art.zona_estante && (
                         <div className="text-[10px] text-slate-400 line-clamp-1 font-mono">
-                          Estante: {art.zona_estante}
+                          Estante: {toSafeDisplayString(art.zona_estante, '')}
                         </div>
                       )}
                     </td>
@@ -648,8 +968,8 @@ export default function InventoryTable({
                     {/* Observaciones completas */}
                     <td className="py-3 px-4 max-w-xs">
                       {art.observaciones ? (
-                        <div className="text-slate-600 line-clamp-2 italic text-[11px] bg-slate-50 p-1.5 rounded border border-slate-100" title={art.observaciones}>
-                          "{art.observaciones}"
+                        <div className="text-slate-600 line-clamp-2 italic text-[11px] bg-slate-50 p-1.5 rounded border border-slate-100" title={toSafeDisplayString(art.observaciones, '')}>
+                          "{toSafeDisplayString(art.observaciones, '')}"
                         </div>
                       ) : (
                         <span className="text-slate-300">—</span>
@@ -732,24 +1052,33 @@ function CreateItemModal({ defaultArea, onClose, onCreated }) {
     fetchCustodios,
     createCustodio,
     fetchUbicaciones,
-    createCampamento
+    createCampamento,
+    activeCampamento,
+    campamentosCatalog,
+    currentUser
   } = useApp();
 
-  const [formData, setFormData] = useState({
-    codigo_original: '',
-    area: defaultArea || 'ALMACEN',
-    categoria: '',
-    articulo_nombre: '',
-    marca_modelo: '',
-    serie_imei: '',
-    propietario: 'INGMELEC',
-    asignado_a: '',
-    cantidad_num: 1,
-    unidad_medida: 'Unidad',
-    estado_fisico: 'Bueno',
-    ubicacion_nombre: 'DISTRITO NACIONAL 27 DE FEBRERO',
-    zona_estante: '',
-    observaciones: ''
+  const canOperateCampamentos = userHasPermission(currentUser, 'camp:operar');
+
+  const [formData, setFormData] = useState(() => {
+    const initialUbic = activeCampamento?.ubicacion_historica_equivalente || activeCampamento?.nombre || '';
+    return {
+      codigo_original: '',
+      area: defaultArea || 'ALMACEN',
+      categoria: '',
+      articulo_nombre: '',
+      marca_modelo: '',
+      serie_imei: '',
+      propietario: 'INGMELEC',
+      asignado_a: '',
+      cantidad_num: 1,
+      unidad_medida: 'Unidad',
+      estado_fisico: 'Bueno',
+      ubicacion_nombre: initialUbic,
+      campamento_id: activeCampamento?.id ? Number(activeCampamento.id) : null,
+      zona_estante: '',
+      observaciones: ''
+    };
   });
 
   const [isManualCode, setIsManualCode] = useState(false);
@@ -767,6 +1096,7 @@ function CreateItemModal({ defaultArea, onClose, onCreated }) {
 
   const [saving, setSaving] = useState(false);
   const [errorMessage, setErrorMessage] = useState(null);
+  const hasTouchedUbicacionRef = useRef(false);
 
   // Load next code & categories when area changes
   useEffect(() => {
@@ -828,12 +1158,25 @@ function CreateItemModal({ defaultArea, onClose, onCreated }) {
               sublabel: c.cargo || c.departamento || null
             })));
           }
-          if (ubicRes.success && ubicRes.ubicaciones) {
-            setUbicaciones(ubicRes.ubicaciones.map(u => ({
-              label: u.nombre,
-              value: u.nombre,
-              sublabel: u.provincia ? `${u.tipo} • ${u.provincia}` : u.tipo
-            })));
+          if (ubicRes.success && Array.isArray(ubicRes.ubicaciones)) {
+            const mappedUbics = ubicRes.ubicaciones
+              .map(u => {
+                const resolvedCampId = u.campamento_id
+                  ? Number(u.campamento_id)
+                  : (String(u.tipo || '').toLowerCase() === 'campamento' && u.id ? Number(u.id) : null);
+                const nombre = toSafeDisplayString(u.nombre, '');
+                return {
+                  label: nombre,
+                  value: nombre,
+                  sublabel: u.provincia
+                    ? `${toSafeDisplayString(u.tipo, 'Sede')} • ${toSafeDisplayString(u.provincia, '')}`
+                    : toSafeDisplayString(u.tipo, 'Sede'),
+                  campamento_id: resolvedCampId
+                };
+              })
+              .filter(u => u.value && u.value !== '—');
+
+            setUbicaciones(mappedUbics);
           }
         }
       } catch (err) {
@@ -852,6 +1195,32 @@ function CreateItemModal({ defaultArea, onClose, onCreated }) {
       isCancelled = true;
     };
   }, [fetchCustodios, fetchUbicaciones]);
+
+  // Initialize default ubicacion & sync campamento_id once ubicaciones/catalog load
+  useEffect(() => {
+    setFormData(prev => {
+      let nextUbic = prev.ubicacion_nombre;
+      if (!nextUbic && !hasTouchedUbicacionRef.current && ubicaciones.length > 0) {
+        nextUbic = ubicaciones[0].value;
+      }
+      if (!nextUbic) return prev;
+
+      const matchedId = prev.campamento_id ?? resolveCampamentoIdForUbicacion(
+        nextUbic,
+        ubicaciones,
+        campamentosCatalog,
+        activeCampamento
+      );
+      if (nextUbic === prev.ubicacion_nombre && matchedId === prev.campamento_id) {
+        return prev;
+      }
+      return {
+        ...prev,
+        ubicacion_nombre: nextUbic,
+        campamento_id: matchedId
+      };
+    });
+  }, [ubicaciones, campamentosCatalog, activeCampamento]);
 
   const handleCreateCategoria = async (newCatName) => {
     try {
@@ -878,11 +1247,22 @@ function CreateItemModal({ defaultArea, onClose, onCreated }) {
   };
 
   const handleCreateUbicacion = async (newUbicName) => {
+    if (!canOperateCampamentos) return;
     try {
       const res = await createCampamento({ nombre: newUbicName, provincia: 'República Dominicana' });
       if (res.success) {
-        setUbicaciones(prev => [...prev, { label: newUbicName, value: newUbicName, sublabel: 'Nuevo Campamento' }]);
-        setFormData(prev => ({ ...prev, ubicacion_nombre: newUbicName }));
+        const newCampId = res.campamento?.id ?? res.id ?? null;
+        setUbicaciones(prev => [...prev, {
+          label: newUbicName,
+          value: newUbicName,
+          sublabel: 'Nuevo Campamento',
+          campamento_id: newCampId ? Number(newCampId) : null
+        }]);
+        setFormData(prev => ({
+          ...prev,
+          ubicacion_nombre: newUbicName,
+          campamento_id: newCampId ? Number(newCampId) : null
+        }));
       }
     } catch (err) {
       console.error('Error creating campamento:', err);
@@ -894,28 +1274,46 @@ function CreateItemModal({ defaultArea, onClose, onCreated }) {
     setSaving(true);
     setErrorMessage(null);
     try {
-      const res = await createArticulo(formData);
+      const resolvedCampId = formData.campamento_id ?? resolveCampamentoIdForUbicacion(
+        formData.ubicacion_nombre,
+        ubicaciones,
+        campamentosCatalog,
+        activeCampamento
+      );
+      const payload = { ...formData };
+      if (resolvedCampId) {
+        payload.campamento_id = Number(resolvedCampId);
+      } else {
+        delete payload.campamento_id;
+      }
+
+      const res = await createArticulo(payload);
       if (res.success) {
         onCreated();
       } else {
-        setErrorMessage(res.message || 'Error al guardar el artículo.');
+        setErrorMessage(toSafeDisplayString(res.message || res.error, 'Error al guardar el artículo.'));
       }
     } catch (err) {
-      setErrorMessage(err.message || 'Error de comunicación con el servidor.');
+      setErrorMessage(toSafeDisplayString(err?.message || err, 'Error de comunicación con el servidor.'));
     } finally {
       setSaving(false);
     }
   };
 
   return (
-    <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-sm flex items-center justify-center p-4">
-      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-3xl overflow-hidden border border-slate-200">
-        <div className="bg-slate-900 text-white p-5 flex items-center justify-between">
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="modal-crear-activo-title"
+      className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-sm flex items-center justify-center p-4 overflow-y-auto"
+    >
+      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-3xl max-h-[92vh] overflow-hidden border border-slate-200 flex flex-col">
+        <div className="bg-slate-900 text-white p-5 flex items-center justify-between flex-shrink-0">
           <div className="flex items-center space-x-2">
             <Plus className="w-5 h-5 text-[#F28524]" />
-            <h3 className="font-bold text-base">Registrar Nuevo Activo en MySQL</h3>
+            <h3 id="modal-crear-activo-title" className="font-bold text-base">Registrar Nuevo Activo en MySQL</h3>
           </div>
-          <button onClick={onClose} className="text-slate-400 hover:text-white">
+          <button type="button" onClick={onClose} aria-label="Cerrar modal de registro" className="text-slate-300 hover:text-white p-1 rounded-lg">
             <X className="w-5 h-5" />
           </button>
         </div>
@@ -923,7 +1321,7 @@ function CreateItemModal({ defaultArea, onClose, onCreated }) {
         {errorMessage && (
           <div className="bg-rose-50 border-b border-rose-200 px-6 py-3 flex items-center space-x-3 text-xs text-rose-800">
             <AlertTriangle className="w-4 h-4 text-rose-600 flex-shrink-0" />
-            <span className="font-semibold">{errorMessage}</span>
+            <span className="font-semibold">{toSafeDisplayString(errorMessage, '')}</span>
           </div>
         )}
 
@@ -1111,9 +1509,22 @@ function CreateItemModal({ defaultArea, onClose, onCreated }) {
                 placeholder="Seleccione campamento o almacén..."
                 options={ubicaciones}
                 value={formData.ubicacion_nombre}
-                onChange={val => setFormData({ ...formData, ubicacion_nombre: val })}
-                allowCreate={true}
-                onCreateNew={handleCreateUbicacion}
+                onChange={val => {
+                  hasTouchedUbicacionRef.current = true;
+                  const matchedCampId = resolveCampamentoIdForUbicacion(
+                    val,
+                    ubicaciones,
+                    campamentosCatalog,
+                    activeCampamento
+                  );
+                  setFormData(prev => ({
+                    ...prev,
+                    ubicacion_nombre: val,
+                    campamento_id: matchedCampId
+                  }));
+                }}
+                allowCreate={canOperateCampamentos}
+                onCreateNew={canOperateCampamentos ? handleCreateUbicacion : undefined}
                 loading={loadingUbicaciones}
                 required={true}
                 helperText="Campamentos oficiales y bodegas registradas"

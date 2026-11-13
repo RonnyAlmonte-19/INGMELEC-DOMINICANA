@@ -1,4 +1,11 @@
-import React, { createContext, useState, useContext, useEffect, useCallback } from 'react';
+import { createContext, useState, useContext, useEffect, useCallback } from 'react';
+import { toSafeDisplayString } from '../utils/jsonFormat';
+import {
+  isDeveloperUser,
+  userHasPermission,
+  userHasAnyPermission,
+  canAccessModule as checkModuleAccess
+} from '../utils/permissions';
 
 const AppContext = createContext();
 
@@ -30,34 +37,40 @@ export const AppProvider = ({ children }) => {
     }
   });
 
-  const setActiveCampamento = (camp) => {
-    setActiveCampamentoState(camp);
+  const setActiveCampamento = useCallback((camp) => {
+    setActiveCampamentoState(camp || null);
     if (camp) {
       localStorage.setItem('ingmelec_active_campamento', JSON.stringify(camp));
     } else {
       localStorage.removeItem('ingmelec_active_campamento');
     }
-  };
+  }, []);
 
   const hasPermission = useCallback((permKey) => {
-    if (!currentUser) return false;
-    if (currentUser.rol === 'developer' || currentUser.es_developer === 1) return true;
-    const perms = Array.isArray(currentUser.permisos) ? currentUser.permisos : [];
-    if (perms.includes('*')) return true;
-    return perms.includes(permKey);
+    return userHasPermission(currentUser, permKey);
+  }, [currentUser]);
+
+  const hasAnyPermission = useCallback((permKeys) => {
+    return userHasAnyPermission(currentUser, permKeys);
+  }, [currentUser]);
+
+  const canAccessModule = useCallback((pageId) => {
+    return checkModuleAccess(currentUser, pageId);
   }, [currentUser]);
 
   const [kpis, setKpis] = useState(null);
   const [kpisLoading, setKpisLoading] = useState(false);
+  const [campamentosCatalog, setCampamentosCatalog] = useState([]);
   const [entornoInfo, setEntornoInfo] = useState(null);
   const [toast, setToast] = useState(null);
 
-  const showToast = (message, type = 'success') => {
-    setToast({ id: Date.now(), message, type });
+  const showToast = useCallback((message, type = 'success') => {
+    const safeMessage = toSafeDisplayString(message, 'Operación completada.');
+    setToast({ id: Date.now(), message: safeMessage, type });
     setTimeout(() => {
       setToast(null);
     }, 4500);
-  };
+  }, []);
 
   // Helper for authenticated requests
   const apiFetch = useCallback(async (endpoint, options = {}) => {
@@ -104,7 +117,7 @@ export const AppProvider = ({ children }) => {
       setAuthToken(data.token);
       setCurrentUser(data.user);
 
-      if (data.user.campamentos && data.user.campamentos.length > 0) {
+      if (!isDeveloperUser(data.user) && data.user.campamentos && data.user.campamentos.length > 0) {
         const principal = data.user.campamentos.find(c => c.es_principal) || data.user.campamentos[0];
         setActiveCampamento(principal);
       } else {
@@ -119,23 +132,78 @@ export const AppProvider = ({ children }) => {
     }
   };
 
-  // Logout action
-  const logout = () => {
+  // Logout action: notifica al servidor antes de limpiar credenciales locales
+  const logout = async () => {
+    const token = localStorage.getItem('ingmelec_token') || authToken;
+    if (token) {
+      let timeoutId = null;
+      try {
+        const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+        if (controller) {
+          timeoutId = setTimeout(() => controller.abort(), 3000);
+        }
+        await fetch(`${API_V2}/auth/logout`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${token}`
+          },
+          ...(controller ? { signal: controller.signal } : {})
+        });
+      } catch {
+        // Silenciar errores de red/API para nunca bloquear el logout local
+      } finally {
+        if (timeoutId !== null) {
+          clearTimeout(timeoutId);
+        }
+      }
+    }
+
     localStorage.removeItem('ingmelec_token');
     localStorage.removeItem('ingmelec_user');
+    localStorage.removeItem('ingmelec_active_campamento');
     setAuthToken(null);
     setCurrentUser(null);
     setActiveCampamento(null);
     setKpis(null);
+    setCampamentosCatalog([]);
+    setEntornoInfo(null);
     showToast('Sesión cerrada correctamente.', 'info');
   };
 
-  // Fetch Dashboard KPIs
-  const refreshKpis = useCallback(async () => {
-    if (!currentUser) return;
+  const activeCampamentoId = activeCampamento ? activeCampamento.id : null;
+
+  // Fetch Dashboard KPIs (soporta filtros campamento_id / almacen_id y propagación desde activeCampamento)
+  const refreshKpis = useCallback(async (params) => {
+    if (!currentUser || !userHasPermission(currentUser, 'dash:ver')) {
+      setKpis(null);
+      return;
+    }
+    const isExplicitFilterObj =
+      params &&
+      typeof params === 'object' &&
+      !('nativeEvent' in params) &&
+      !('target' in params);
+
+    const effectiveParams = isExplicitFilterObj
+      ? {
+          campamento_id: params.campamento_id,
+          almacen_id: params.almacen_id
+        }
+      : (activeCampamentoId ? { campamento_id: String(activeCampamentoId) } : {});
+
+    const qsParams = new URLSearchParams();
+    if (effectiveParams.campamento_id && effectiveParams.campamento_id !== 'TODOS') {
+      qsParams.append('campamento_id', String(effectiveParams.campamento_id));
+    }
+    if (effectiveParams.almacen_id && effectiveParams.almacen_id !== 'TODOS') {
+      qsParams.append('almacen_id', String(effectiveParams.almacen_id));
+    }
+    const qs = qsParams.toString();
+
     try {
       setKpisLoading(true);
-      const data = await apiFetch('/dashboard/kpis');
+      const data = await apiFetch(`/dashboard/kpis${qs ? `?${qs}` : ''}`);
       if (data.success) {
         setKpis(data.kpis);
       }
@@ -143,6 +211,25 @@ export const AppProvider = ({ children }) => {
       console.error('Error refreshing KPIs:', err);
     } finally {
       setKpisLoading(false);
+    }
+  }, [currentUser, activeCampamentoId, apiFetch]);
+
+  // Fetch Campamentos Catalog (sedes reales, almacenes y aliases)
+  const refreshCampamentosCatalog = useCallback(async () => {
+    if (!currentUser || !userHasPermission(currentUser, 'camp:ver')) {
+      setCampamentosCatalog([]);
+      return [];
+    }
+    try {
+      const data = await apiFetch('/campamentos');
+      if (data?.success && Array.isArray(data.campamentos)) {
+        setCampamentosCatalog(data.campamentos);
+        return data.campamentos;
+      }
+      return [];
+    } catch (err) {
+      console.error('Error refreshing campamentos catalog:', err);
+      return [];
     }
   }, [currentUser, apiFetch]);
 
@@ -161,10 +248,16 @@ export const AppProvider = ({ children }) => {
 
   useEffect(() => {
     if (currentUser) {
-      refreshKpis();
       fetchEntorno();
+      refreshCampamentosCatalog();
     }
-  }, [currentUser, refreshKpis, fetchEntorno]);
+  }, [currentUser, fetchEntorno, refreshCampamentosCatalog]);
+
+  useEffect(() => {
+    if (currentUser) {
+      refreshKpis(activeCampamentoId ? { campamento_id: activeCampamentoId } : {});
+    }
+  }, [currentUser, activeCampamentoId, refreshKpis]);
 
   // Fetch items with filters and pagination
   const fetchArticulos = useCallback(async (filters = {}) => {
@@ -195,7 +288,7 @@ export const AppProvider = ({ children }) => {
       showToast(res.message || 'Error al actualizar', 'error');
     }
     return res;
-  }, [apiFetch, refreshKpis]);
+  }, [apiFetch, refreshKpis, showToast]);
 
   // Create item
   const createArticulo = useCallback(async (data) => {
@@ -210,7 +303,7 @@ export const AppProvider = ({ children }) => {
       showToast(res.message || 'Error al registrar', 'error');
     }
     return res;
-  }, [apiFetch, refreshKpis]);
+  }, [apiFetch, refreshKpis, showToast]);
 
   // Delete/Deactivate item
   const deleteArticulo = useCallback(async (id) => {
@@ -224,7 +317,7 @@ export const AppProvider = ({ children }) => {
       showToast(res.message || 'Error al retirar', 'error');
     }
     return res;
-  }, [apiFetch, refreshKpis]);
+  }, [apiFetch, refreshKpis, showToast]);
 
   // Register movement
   const registrarMovimiento = useCallback(async (movData) => {
@@ -239,11 +332,21 @@ export const AppProvider = ({ children }) => {
       showToast(res.message || 'Error en movimiento', 'error');
     }
     return res;
-  }, [apiFetch, refreshKpis]);
+  }, [apiFetch, refreshKpis, showToast]);
 
-  // Fetch movements
-  const fetchMovimientos = useCallback(async (limit = 100) => {
-    return await apiFetch(`/movimientos?limit=${limit}`);
+  // Fetch movements (acepta limit numérico o objeto { limit, campamento_id })
+  const fetchMovimientos = useCallback(async (limitOrParams = 100) => {
+    const query = new URLSearchParams();
+    if (typeof limitOrParams === 'object' && limitOrParams !== null) {
+      const lim = limitOrParams.limit ?? 100;
+      query.append('limit', String(lim));
+      if (limitOrParams.campamento_id && limitOrParams.campamento_id !== 'TODOS') {
+        query.append('campamento_id', String(limitOrParams.campamento_id));
+      }
+    } else {
+      query.append('limit', String(limitOrParams || 100));
+    }
+    return await apiFetch(`/movimientos?${query.toString()}`);
   }, [apiFetch]);
 
   // Fetch reports
@@ -277,7 +380,7 @@ export const AppProvider = ({ children }) => {
       showToast(res.message || 'Error creando usuario', 'error');
     }
     return res;
-  }, [apiFetch]);
+  }, [apiFetch, showToast]);
 
   const updateUsuario = useCallback(async (id, userData) => {
     const res = await apiFetch(`/usuarios/${id}`, {
@@ -290,7 +393,7 @@ export const AppProvider = ({ children }) => {
       showToast(res.message || 'Error actualizando usuario', 'error');
     }
     return res;
-  }, [apiFetch]);
+  }, [apiFetch, showToast]);
 
   const updateUsuarioEstado = useCallback(async (id, activo) => {
     const res = await apiFetch(`/usuarios/${id}/estado`, {
@@ -303,7 +406,7 @@ export const AppProvider = ({ children }) => {
       showToast(res.message || 'Error cambiando estado de usuario', 'error');
     }
     return res;
-  }, [apiFetch]);
+  }, [apiFetch, showToast]);
 
   const updateUsuarioPermisos = useCallback(async (id, permisos) => {
     const res = await apiFetch(`/usuarios/${id}/permisos`, {
@@ -316,7 +419,7 @@ export const AppProvider = ({ children }) => {
       showToast(res.message || 'Error actualizando permisos', 'error');
     }
     return res;
-  }, [apiFetch]);
+  }, [apiFetch, showToast]);
 
   const recoverUsuarioPassword = useCallback(async (id, nuevaPassword) => {
     const res = await apiFetch(`/usuarios/${id}/recuperar`, {
@@ -329,14 +432,14 @@ export const AppProvider = ({ children }) => {
       showToast(res.message || 'Error restableciendo contraseña', 'error');
     }
     return res;
-  }, [apiFetch]);
+  }, [apiFetch, showToast]);
 
   const fetchUsuariosAuditoria = useCallback(async () => {
     return await apiFetch('/usuarios/auditoria');
   }, [apiFetch]);
 
   // ==========================================
-  // CAMPAMENTOS & ALMACENES (AUDITORÍAS)
+  // CAMPAMENTOS, ALIASES & ALMACENES (AUDITORÍAS)
   // ==========================================
   const fetchCampamentos = useCallback(async () => {
     return await apiFetch('/campamentos');
@@ -347,26 +450,76 @@ export const AppProvider = ({ children }) => {
       method: 'POST',
       body: JSON.stringify(campData)
     });
-    if (res.success) {
-      showToast('Campamento registrado exitosamente.', 'success');
+    if (res?.success) {
+      showToast(toSafeDisplayString(res.message, 'Campamento registrado exitosamente.'), 'success');
+      await Promise.all([refreshCampamentosCatalog(), refreshKpis()]);
     } else {
-      showToast(res.message || 'Error al registrar campamento.', 'error');
+      showToast(toSafeDisplayString(res?.message || res?.error, 'Error al registrar campamento.'), 'error');
     }
     return res;
-  }, [apiFetch]);
+  }, [apiFetch, showToast, refreshCampamentosCatalog, refreshKpis]);
+
+  const updateCampamento = useCallback(async (id, payload) => {
+    const res = await apiFetch(`/campamentos/${id}`, {
+      method: 'PUT',
+      body: JSON.stringify(payload)
+    });
+    if (res?.success) {
+      showToast(toSafeDisplayString(res.message, 'Campamento actualizado correctamente.'), 'success');
+      await Promise.all([refreshCampamentosCatalog(), refreshKpis()]);
+    } else {
+      showToast(toSafeDisplayString(res?.message || res?.error, 'Error al actualizar campamento.'), 'error');
+    }
+    return res;
+  }, [apiFetch, showToast, refreshCampamentosCatalog, refreshKpis]);
 
   const createAlmacen = useCallback(async (campamentoId, almData) => {
     const res = await apiFetch(`/campamentos/${campamentoId}/almacenes`, {
       method: 'POST',
       body: JSON.stringify(almData)
     });
-    if (res.success) {
-      showToast('Almacén/Bodega agregada correctamente.', 'success');
+    if (res?.success) {
+      showToast(toSafeDisplayString(res.message, 'Almacén/Bodega agregada correctamente.'), 'success');
+      await Promise.all([refreshCampamentosCatalog(), refreshKpis()]);
     } else {
-      showToast(res.message || 'Error al agregar almacén.', 'error');
+      showToast(toSafeDisplayString(res?.message || res?.error, 'Error al agregar almacén.'), 'error');
     }
     return res;
+  }, [apiFetch, showToast, refreshCampamentosCatalog, refreshKpis]);
+
+  const fetchCampamentoAliases = useCallback(async () => {
+    return await apiFetch('/campamentos/alias');
   }, [apiFetch]);
+
+  const resolverAliasCampamento = useCallback(async (payload) => {
+    return await apiFetch('/campamentos/resolver-alias', {
+      method: 'POST',
+      body: JSON.stringify(payload)
+    });
+  }, [apiFetch]);
+
+  const previewReasignacionAlias = useCallback(async (payload) => {
+    return await apiFetch('/campamentos/reasignaciones/preview', {
+      method: 'POST',
+      body: JSON.stringify(payload)
+    });
+  }, [apiFetch]);
+
+  const aplicarReasignacionAlias = useCallback(async (payload) => {
+    const res = await apiFetch('/campamentos/reasignaciones/aplicar', {
+      method: 'POST',
+      body: JSON.stringify(payload)
+    });
+    if (res?.success) {
+      const count = Number(res.reasignados ?? 0);
+      const fallbackMsg = `Reasignación completada: ${count} artículo(s) actualizados sin alterar cantidades.`;
+      showToast(toSafeDisplayString(res.message, fallbackMsg), 'success');
+      await Promise.all([refreshCampamentosCatalog(), refreshKpis()]);
+    } else {
+      showToast(toSafeDisplayString(res?.message || res?.error, 'No se pudo completar la reasignación territorial.'), 'error');
+    }
+    return res;
+  }, [apiFetch, showToast, refreshCampamentosCatalog, refreshKpis]);
 
   // ==========================================
   // LEVANTAMIENTOS Y AUDITORÍAS EN CAMPO
@@ -391,12 +544,12 @@ export const AppProvider = ({ children }) => {
       body: JSON.stringify(data)
     });
     if (res.success) {
-      showToast(`Levantamiento ${res.codigo_levantamiento || ''} iniciado con éxito.`, 'success');
+      showToast(`Levantamiento ${res.codigo_levantamiento || res.codigo || ''} iniciado con éxito.`, 'success');
     } else {
       showToast(res.message || 'Error al crear levantamiento.', 'error');
     }
     return res;
-  }, [apiFetch]);
+  }, [apiFetch, showToast]);
 
   const updateLevantamiento = useCallback(async (id, data) => {
     const res = await apiFetch(`/levantamientos/${id}`, {
@@ -409,7 +562,7 @@ export const AppProvider = ({ children }) => {
       showToast(res.message || 'Error al actualizar levantamiento.', 'error');
     }
     return res;
-  }, [apiFetch]);
+  }, [apiFetch, showToast]);
 
   const fetchLevantamientoItems = useCallback(async (levId, filters = {}) => {
     const params = new URLSearchParams();
@@ -427,8 +580,10 @@ export const AppProvider = ({ children }) => {
       body: JSON.stringify(itemData)
     });
     if (res.success) {
-      if (res.warning_duplicado) {
-        showToast(`Artículo guardado con advertencia: ${res.warning_duplicado.mensaje}`, 'info');
+      const rawWarning = res.warning_duplicado || res.advertencia;
+      if (rawWarning) {
+        const warningText = toSafeDisplayString(rawWarning.mensaje || rawWarning, '');
+        showToast(`Artículo guardado con advertencia: ${warningText}`, 'info');
       } else {
         showToast('Artículo registrado en el levantamiento.', 'success');
       }
@@ -436,7 +591,7 @@ export const AppProvider = ({ children }) => {
       showToast(res.message || 'Error al registrar artículo.', 'error');
     }
     return res;
-  }, [apiFetch]);
+  }, [apiFetch, showToast]);
 
   const updateLevantamientoItem = useCallback(async (levId, itemId, itemData) => {
     const res = await apiFetch(`/levantamientos/${levId}/items/${itemId}`, {
@@ -449,7 +604,7 @@ export const AppProvider = ({ children }) => {
       showToast(res.message || 'Error al actualizar artículo.', 'error');
     }
     return res;
-  }, [apiFetch]);
+  }, [apiFetch, showToast]);
 
   const deleteLevantamientoItem = useCallback(async (levId, itemId) => {
     const res = await apiFetch(`/levantamientos/${levId}/items/${itemId}`, {
@@ -461,7 +616,7 @@ export const AppProvider = ({ children }) => {
       showToast(res.message || 'Error al eliminar artículo.', 'error');
     }
     return res;
-  }, [apiFetch]);
+  }, [apiFetch, showToast]);
 
   const importLevantamientoItems = useCallback(async (levId, items) => {
     const res = await apiFetch(`/levantamientos/${levId}/import-items`, {
@@ -474,7 +629,7 @@ export const AppProvider = ({ children }) => {
       showToast(res.message || 'Error al importar artículos.', 'error');
     }
     return res;
-  }, [apiFetch]);
+  }, [apiFetch, showToast]);
 
   const consolidarLevantamiento = useCallback(async (levId, payload = {}) => {
     const res = await apiFetch(`/levantamientos/${levId}/consolidar`, {
@@ -488,7 +643,11 @@ export const AppProvider = ({ children }) => {
       showToast(res.message || 'Error al consolidar levantamiento.', 'error');
     }
     return res;
-  }, [apiFetch, refreshKpis]);
+  }, [apiFetch, refreshKpis, showToast]);
+
+  const fetchLevantamientoConciliacion = useCallback(async (levId) => {
+    return await apiFetch(`/levantamientos/${levId}/conciliacion`);
+  }, [apiFetch]);
 
   // Dynamic Catalogs & Auto-coding
   const fetchNextCode = useCallback(async (area) => {
@@ -565,10 +724,20 @@ export const AppProvider = ({ children }) => {
         activeCampamento,
         setActiveCampamento,
         hasPermission,
+        hasAnyPermission,
+        canAccessModule,
+        isDeveloper: isDeveloperUser(currentUser),
         // Levantamientos & Campamentos
+        campamentosCatalog,
+        refreshCampamentosCatalog,
         fetchCampamentos,
         createCampamento,
+        updateCampamento,
         createAlmacen,
+        fetchCampamentoAliases,
+        resolverAliasCampamento,
+        previewReasignacionAlias,
+        aplicarReasignacionAlias,
         fetchLevantamientos,
         getLevantamientoById,
         createLevantamiento,
@@ -579,6 +748,7 @@ export const AppProvider = ({ children }) => {
         deleteLevantamientoItem,
         importLevantamientoItems,
         consolidarLevantamiento,
+        fetchLevantamientoConciliacion,
         // Dynamic Catalogs & Codes
         fetchNextCode,
         fetchCategorias,
@@ -592,6 +762,8 @@ export const AppProvider = ({ children }) => {
       {children}
       {toast && (
         <div
+          role="status"
+          aria-live="polite"
           className={`fixed bottom-6 right-6 z-50 px-5 py-3 rounded-xl shadow-2xl flex items-center space-x-3 text-sm font-medium transition-all duration-300 transform translate-y-0 ${
             toast.type === 'success'
               ? 'bg-emerald-600 text-white'
@@ -600,7 +772,7 @@ export const AppProvider = ({ children }) => {
               : 'bg-slate-800 text-white'
           }`}
         >
-          <span>{toast.message}</span>
+          <span>{toSafeDisplayString(toast.message, 'Operación completada.')}</span>
         </div>
       )}
     </AppContext.Provider>
