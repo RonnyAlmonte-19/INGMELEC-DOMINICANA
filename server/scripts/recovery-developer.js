@@ -143,8 +143,7 @@ async function runRecovery() {
 
   const sslConfig = {
     ca: fs.readFileSync(caCertPath),
-    rejectUnauthorized: true,
-    checkServerIdentity: () => undefined
+    rejectUnauthorized: true
   };
 
   console.log('\n🔒 Parámetros de Conexión Verificados:');
@@ -189,7 +188,7 @@ async function runRecovery() {
   console.log('  CAPTURA INTERACTIVA DE CONTRASEÑA NUEVA (PRIVADA / ENMASCARADA)');
   console.log('---------------------------------------------------------------------');
 
-  let password = '';
+  let password;
   if (process.env.DEVELOPER_ADMIN_PASSWORD) {
     password = process.env.DEVELOPER_ADMIN_PASSWORD;
     delete process.env.DEVELOPER_ADMIN_PASSWORD;
@@ -215,7 +214,6 @@ async function runRecovery() {
   // 5. Generar hash Argon2id
   console.log('\n🔒 Generando hash seguro Argon2id (64 MiB RAM, 3 iteraciones, 1 hilo)...');
   const newHash = await argon2.hash(password, ARGON2_CONFIG);
-  password = ''; // Limpieza inmediata de memoria
 
   // 6. Resumen de la operación y solicitud de aprobación previa
   console.log('\n=====================================================================');
@@ -245,12 +243,22 @@ async function runRecovery() {
 
   try {
     if (exists) {
-      await conn.query(`
-        UPDATE inv_usuarios
-        SET password_hash = ?, rol = 'developer', es_developer = 1, activo = 1, permisos_json = '["*"]'
-        WHERE id = ?
-      `, [newHash, existingRows[0].id]);
-      console.log(`✔ UPDATE ejecutado exitosamente sobre ID: ${existingRows[0].id}.`);
+      const [tvCols] = await conn.query("SHOW COLUMNS FROM inv_usuarios LIKE 'token_version'");
+      const hasTokenVersion = tvCols.length > 0;
+      const updateSql = hasTokenVersion
+        ? `
+          UPDATE inv_usuarios
+          SET password_hash = ?, rol = 'developer', es_developer = 1, activo = 1, permisos_json = '["*"]',
+              token_version = COALESCE(token_version, 1) + 1
+          WHERE id = ?
+        `
+        : `
+          UPDATE inv_usuarios
+          SET password_hash = ?, rol = 'developer', es_developer = 1, activo = 1, permisos_json = '["*"]'
+          WHERE id = ?
+        `;
+      await conn.query(updateSql, [newHash, existingRows[0].id]);
+      console.log(`✔ UPDATE ejecutado exitosamente sobre ID: ${existingRows[0].id}${hasTokenVersion ? ' (token_version incrementado)' : ''}.`);
     } else {
       const [resIns] = await conn.query(`
         INSERT INTO inv_usuarios (

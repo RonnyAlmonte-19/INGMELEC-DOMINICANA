@@ -10,42 +10,7 @@
   </head>
   <body>
     <div id="root"></div>
-    <script>
-      window.addEventListener('error', function(event) {
-        var errDiv = document.createElement('div');
-        errDiv.style.position = 'fixed';
-        errDiv.style.top = '0';
-        errDiv.style.left = '0';
-        errDiv.style.width = '100%';
-        errDiv.style.backgroundColor = '#ef4444';
-        errDiv.style.color = '#ffffff';
-        errDiv.style.padding = '20px';
-        errDiv.style.zIndex = '999999';
-        errDiv.style.fontFamily = 'monospace';
-        errDiv.style.fontSize = '14px';
-        errDiv.style.whiteSpace = 'pre-wrap';
-        errDiv.style.boxShadow = '0 10px 15px -3px rgba(0, 0, 0, 0.3)';
-        errDiv.innerHTML = '<strong>❌ ERROR RUNTIME DETECTADO:</strong><br/>' + event.message + '<br/><br/><strong>Stack:</strong><br/>' + (event.error ? event.error.stack : 'No stack trace');
-        document.body.appendChild(errDiv);
-      });
-      window.addEventListener('unhandledrejection', function(event) {
-        var errDiv = document.createElement('div');
-        errDiv.style.position = 'fixed';
-        errDiv.style.top = '0';
-        errDiv.style.left = '0';
-        errDiv.style.width = '100%';
-        errDiv.style.backgroundColor = '#f59e0b';
-        errDiv.style.color = '#ffffff';
-        errDiv.style.padding = '20px';
-        errDiv.style.zIndex = '999999';
-        errDiv.style.fontFamily = 'monospace';
-        errDiv.style.fontSize = '14px';
-        errDiv.style.whiteSpace = 'pre-wrap';
-        errDiv.style.boxShadow = '0 10px 15px -3px rgba(0, 0, 0, 0.3)';
-        errDiv.innerHTML = '<strong>⚠️ PROMESA RECHAZADA SIN MANEJO:</strong><br/>' + event.reason;
-        document.body.appendChild(errDiv);
-      });
-    </script>
+    <script src="/error-trap.js"></script>
     <script type="module" src="/src/main.jsx"></script>
   </body>
 </html>
