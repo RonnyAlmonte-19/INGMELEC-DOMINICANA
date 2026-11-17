@@ -174,7 +174,8 @@ describe('ETAPA 1 QA Independiente - Aislamiento Local v2.1', () => {
       cwd: REPO_ROOT,
       encoding: 'utf8'
     }).trim();
-    assert.match(branch, /^(main|develop\/almacen-v2\.1|feature\/estabilizacion-v2\.1\.1)$/);
+    // v2.2: se añade la rama de desarrollo de Actas; el resto de comprobaciones no cambia.
+    assert.match(branch, /^(main|develop\/almacen-v2\.1|feature\/estabilizacion-v2\.1\.1|feature\/v2\.2-actas)$/);
 
     assert.equal(fs.existsSync(path.join(REPO_ROOT, '.gitignore')), true);
     assert.equal(fs.existsSync(path.join(REPO_ROOT, 'server', 'scripts', 'recovery-developer.js')), true);

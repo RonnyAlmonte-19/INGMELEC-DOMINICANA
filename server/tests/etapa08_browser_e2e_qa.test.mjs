@@ -52,6 +52,7 @@ process.env.JWT_TTL_HOURS = '12';
 const { default: express } = await import('express');
 const { getPool, closePool } = await import('../database/db.js');
 const { default: almacenRouter, resetSchemaCapabilitiesCache } = await import('../routes/almacenApi.js');
+const { default: actasRouter } = await import('../routes/actasApi.js');
 const { withLocalMariaDb } = await import('./helpers/local-mariadb.mjs');
 
 async function seedIsolatedDb() {
@@ -92,6 +93,8 @@ async function startFullStackServer() {
     next();
   });
   app.use(express.json({ limit: '10mb' }));
+  // Igual que server/index.js: el router de actas (v2.2) se monta antes que el de almacén
+  app.use('/api/v2', actasRouter);
   app.use('/api/v2', almacenRouter);
   app.use(express.static(distPath));
   app.use((req, res) => {

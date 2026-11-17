@@ -106,7 +106,9 @@ async function apiReq(baseUrl, endpoint, { method = 'GET', token = null, body = 
 describe('ETAPA 8 QA — Equipo A (Seguridad/RBAC) y Equipo B (BD/Campamentos/Inventario)', () => {
   test('Equipo A: Seguridad Auth, Argon2id, JWT/token_version, 20 permisos, 12 vistas y Movimientos 4 escenarios', async () => {
     const allPermKeys = PERMISSION_CATEGORIES.flatMap((c) => c.items.map((i) => i.key));
-    assert.equal(allPermKeys.length, 20, 'Deben existir exactamente 20 permisos granulares');
+    // v2.2: los 20 permisos originales no cambian; se añaden 3 act:* (actas) sin tocar roles por defecto.
+    assert.equal(allPermKeys.filter((k) => !k.startsWith('act:')).length, 20, 'Deben existir exactamente 20 permisos granulares base');
+    assert.deepEqual(allPermKeys.filter((k) => k.startsWith('act:')), ['act:ver', 'act:crear', 'act:anular']);
     assert.equal(MODULE_PAGE_ORDER.length, 12, 'Deben existir exactamente 12 módulos en navegación');
 
     await withLocalMariaDb(async () => {
