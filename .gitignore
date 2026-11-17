@@ -73,6 +73,12 @@ server/tests/e2e_playwright_cdp_disposable.mjs
 server/tests/e2e_production_migration_validation.mjs
 server/scripts/*
 !server/scripts/recovery-developer.js
+# v2.2: lanzador local sintetico y E2E de navegador (sin secretos; las credenciales van en server/.env.dev-credenciales, ignorado)
+!server/scripts/dev-local-v22.mjs
+!server/scripts/e2e-actas-ui.mjs
+!server/scripts/e2e-fechas-ui.mjs
+!server/scripts/e2e-cantidades-ui.mjs
+!server/scripts/e2e-filtros-ui.mjs
 server/start-test-server.js
 server/test-hash.js
 server/check-db.js

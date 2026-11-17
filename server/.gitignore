@@ -22,6 +22,11 @@ tests/e2e_playwright_cdp_disposable.mjs
 tests/e2e_production_migration_validation.mjs
 scripts/*
 !scripts/recovery-developer.js
+!scripts/dev-local-v22.mjs
+!scripts/e2e-actas-ui.mjs
+!scripts/e2e-fechas-ui.mjs
+!scripts/e2e-cantidades-ui.mjs
+!scripts/e2e-filtros-ui.mjs
 data/*.xlsx
 start-test-server.js
 test-hash.js
