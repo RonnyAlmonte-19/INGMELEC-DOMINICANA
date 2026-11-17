@@ -1,0 +1,507 @@
+-- =================================================================================
+-- INGMELEC | ALMACÉN GENERAL (v2.1 — ETAPA 6)
+-- PROPUESTA FUTURA IDEMPOTENTE: CLAVES FORÁNEAS, INTEGRIDAD KÁRDEX E ÍNDICES ÓPTIMOS
+-- ARCHIVO: server/database/migrations/migration_06_v21_integridad_fk_indices.sql
+-- HALLAZGOS RELACIONADOS: A10 (claves foráneas faltantes), B06 (índices redundantes y
+--                         compuestos), M06 (higiene de migraciones y reversión segura)
+-- =================================================================================
+-- ADVERTENCIA DE USO Y SEGURIDAD:
+--   1. PROPUESTA LOCAL — CERO EJECUCIONES AUTOMÁTICAS EN PRODUCCIÓN (Clever Cloud).
+--   2. NO EJECUTAR EN PRODUCCIÓN SIN RESPALDO PREVIO VERIFICADO Y AUTORIZACIÓN EXPLÍCITA.
+--   3. Script 100% idempotente compatible con MySQL 8.0+ y MariaDB 10.11+ usando
+--      `information_schema` + `PREPARE / EXECUTE / DEALLOCATE PREPARE`.
+--   4. Precondición esperada: haber aplicado `migration_01`..`migration_05`
+--      (o fixture sintético equivalente).
+--   5. GARANTÍA NO DESTRUCTIVA: nunca elimina artículos, movimientos ni usuarios reales;
+--      únicamente anula a NULL referencias huérfanas opcionales si existieran, protege
+--      `inv_movimientos.articulo_id` con `ON DELETE RESTRICT`, agrega las llaves
+--      foráneas faltantes y sustituye índices redundantes por índices compuestos reales.
+-- =================================================================================
+
+SET NAMES utf8mb4;
+
+-- ---------------------------------------------------------------------------------
+-- 1. Saneamiento NO destructivo de posibles referencias huérfanas antes de FKs
+-- ---------------------------------------------------------------------------------
+START TRANSACTION;
+
+UPDATE `inv_articulos`
+SET `campamento_id` = NULL,
+    `estado_vinculacion_sede` = 'SIN_SEDE'
+WHERE `campamento_id` IS NOT NULL
+  AND `campamento_id` NOT IN (SELECT `id` FROM `inv_campamentos`);
+
+UPDATE `inv_articulos`
+SET `almacen_id` = NULL
+WHERE `almacen_id` IS NOT NULL
+  AND `almacen_id` NOT IN (SELECT `id` FROM `inv_almacenes`);
+
+UPDATE `inv_articulos`
+SET `lote_id` = NULL
+WHERE `lote_id` IS NOT NULL
+  AND `lote_id` NOT IN (SELECT `id` FROM `inv_lotes_importacion`);
+
+UPDATE `inv_articulos`
+SET `creado_por` = NULL
+WHERE `creado_por` IS NOT NULL
+  AND `creado_por` NOT IN (SELECT `id` FROM `inv_usuarios`);
+
+UPDATE `inv_lotes_importacion`
+SET `usuario_id` = NULL
+WHERE `usuario_id` IS NOT NULL
+  AND `usuario_id` NOT IN (SELECT `id` FROM `inv_usuarios`);
+
+UPDATE `inv_movimientos`
+SET `usuario_id` = NULL
+WHERE `usuario_id` IS NOT NULL
+  AND `usuario_id` NOT IN (SELECT `id` FROM `inv_usuarios`);
+
+UPDATE `inv_auditoria`
+SET `usuario_id` = NULL
+WHERE `usuario_id` IS NOT NULL
+  AND `usuario_id` NOT IN (SELECT `id` FROM `inv_usuarios`);
+
+UPDATE `inv_levantamientos`
+SET `almacen_id` = NULL
+WHERE `almacen_id` IS NOT NULL
+  AND `almacen_id` NOT IN (SELECT `id` FROM `inv_almacenes`);
+
+UPDATE `inv_levantamientos`
+SET `consolidado_por` = NULL
+WHERE `consolidado_por` IS NOT NULL
+  AND `consolidado_por` NOT IN (SELECT `id` FROM `inv_usuarios`);
+
+UPDATE `inv_levantamiento_items`
+SET `articulo_maestro_id` = NULL
+WHERE `articulo_maestro_id` IS NOT NULL
+  AND `articulo_maestro_id` NOT IN (SELECT `id` FROM `inv_articulos`);
+
+UPDATE `inv_levantamiento_items`
+SET `creado_por` = NULL
+WHERE `creado_por` IS NOT NULL
+  AND `creado_por` NOT IN (SELECT `id` FROM `inv_usuarios`);
+
+UPDATE `inv_usuarios`
+SET `campamento_id` = NULL
+WHERE `campamento_id` IS NOT NULL
+  AND `campamento_id` NOT IN (SELECT `id` FROM `inv_campamentos`);
+
+UPDATE `inv_usuarios`
+SET `almacen_id` = NULL
+WHERE `almacen_id` IS NOT NULL
+  AND `almacen_id` NOT IN (SELECT `id` FROM `inv_almacenes`);
+
+DELETE FROM `inv_usuario_campamentos`
+WHERE `usuario_id` NOT IN (SELECT `id` FROM `inv_usuarios`)
+   OR `campamento_id` NOT IN (SELECT `id` FROM `inv_campamentos`);
+
+DELETE FROM `inv_usuario_almacenes`
+WHERE `usuario_id` NOT IN (SELECT `id` FROM `inv_usuarios`)
+   OR `almacen_id` NOT IN (SELECT `id` FROM `inv_almacenes`);
+
+COMMIT;
+
+-- ---------------------------------------------------------------------------------
+-- 2. Endurecimiento de inv_movimientos.articulo_id: cambiar ON DELETE CASCADE a RESTRICT
+--    (Protege el historial del kárdex frente a eliminaciones físicas accidentales)
+-- ---------------------------------------------------------------------------------
+SET @v21_mov_fk_cascade_name := (
+  SELECT kcu.CONSTRAINT_NAME
+  FROM information_schema.KEY_COLUMN_USAGE kcu
+  JOIN information_schema.REFERENTIAL_CONSTRAINTS rc
+    ON rc.CONSTRAINT_SCHEMA = kcu.CONSTRAINT_SCHEMA
+   AND rc.TABLE_NAME = kcu.TABLE_NAME
+   AND rc.CONSTRAINT_NAME = kcu.CONSTRAINT_NAME
+  WHERE kcu.TABLE_SCHEMA = DATABASE()
+    AND kcu.TABLE_NAME = 'inv_movimientos'
+    AND kcu.COLUMN_NAME = 'articulo_id'
+    AND kcu.REFERENCED_TABLE_NAME = 'inv_articulos'
+    AND rc.DELETE_RULE <> 'RESTRICT'
+  LIMIT 1
+);
+
+SET @v21_drop_mov_fk_sql := IF(
+  @v21_mov_fk_cascade_name IS NOT NULL,
+  CONCAT('ALTER TABLE `inv_movimientos` DROP FOREIGN KEY `', @v21_mov_fk_cascade_name, '`'),
+  'SELECT ''[migration_06] inv_movimientos.articulo_id no tiene FK no-RESTRICT.'' AS estado_fk'
+);
+PREPARE stmt_v21_drop_mov_fk FROM @v21_drop_mov_fk_sql;
+EXECUTE stmt_v21_drop_mov_fk;
+DEALLOCATE PREPARE stmt_v21_drop_mov_fk;
+
+-- ---------------------------------------------------------------------------------
+-- 3. Incorporación idempotente de las Claves Foráneas faltantes (A10)
+-- ---------------------------------------------------------------------------------
+
+-- 3.1 inv_movimientos(articulo_id) -> inv_articulos(id) ON DELETE RESTRICT
+SET @v21_fk_exists := (
+  SELECT COUNT(*) FROM information_schema.KEY_COLUMN_USAGE
+  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'inv_movimientos'
+    AND COLUMN_NAME = 'articulo_id' AND REFERENCED_TABLE_NAME = 'inv_articulos'
+);
+SET @v21_fk_sql := IF(
+  @v21_fk_exists = 0,
+  'ALTER TABLE `inv_movimientos` ADD CONSTRAINT `fk_mov_articulo` FOREIGN KEY (`articulo_id`) REFERENCES `inv_articulos` (`id`) ON DELETE RESTRICT ON UPDATE CASCADE',
+  'SELECT ''fk_mov_articulo ok'' AS estado_fk'
+);
+PREPARE stmt_fk FROM @v21_fk_sql; EXECUTE stmt_fk; DEALLOCATE PREPARE stmt_fk;
+
+-- 3.2 inv_movimientos(usuario_id) -> inv_usuarios(id) ON DELETE SET NULL
+SET @v21_fk_exists := (
+  SELECT COUNT(*) FROM information_schema.KEY_COLUMN_USAGE
+  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'inv_movimientos'
+    AND COLUMN_NAME = 'usuario_id' AND REFERENCED_TABLE_NAME = 'inv_usuarios'
+);
+SET @v21_fk_sql := IF(
+  @v21_fk_exists = 0,
+  'ALTER TABLE `inv_movimientos` ADD CONSTRAINT `fk_mov_usuario` FOREIGN KEY (`usuario_id`) REFERENCES `inv_usuarios` (`id`) ON DELETE SET NULL ON UPDATE CASCADE',
+  'SELECT ''fk_mov_usuario ok'' AS estado_fk'
+);
+PREPARE stmt_fk FROM @v21_fk_sql; EXECUTE stmt_fk; DEALLOCATE PREPARE stmt_fk;
+
+-- 3.3 inv_articulos(lote_id, creado_por, campamento_id, almacen_id)
+SET @v21_fk_exists := (
+  SELECT COUNT(*) FROM information_schema.KEY_COLUMN_USAGE
+  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'inv_articulos'
+    AND COLUMN_NAME = 'lote_id' AND REFERENCED_TABLE_NAME = 'inv_lotes_importacion'
+);
+SET @v21_fk_sql := IF(
+  @v21_fk_exists = 0,
+  'ALTER TABLE `inv_articulos` ADD CONSTRAINT `fk_art_lote` FOREIGN KEY (`lote_id`) REFERENCES `inv_lotes_importacion` (`id`) ON DELETE SET NULL ON UPDATE CASCADE',
+  'SELECT ''fk_art_lote ok'' AS estado_fk'
+);
+PREPARE stmt_fk FROM @v21_fk_sql; EXECUTE stmt_fk; DEALLOCATE PREPARE stmt_fk;
+
+SET @v21_fk_exists := (
+  SELECT COUNT(*) FROM information_schema.KEY_COLUMN_USAGE
+  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'inv_articulos'
+    AND COLUMN_NAME = 'creado_por' AND REFERENCED_TABLE_NAME = 'inv_usuarios'
+);
+SET @v21_fk_sql := IF(
+  @v21_fk_exists = 0,
+  'ALTER TABLE `inv_articulos` ADD CONSTRAINT `fk_art_creado_por` FOREIGN KEY (`creado_por`) REFERENCES `inv_usuarios` (`id`) ON DELETE SET NULL ON UPDATE CASCADE',
+  'SELECT ''fk_art_creado_por ok'' AS estado_fk'
+);
+PREPARE stmt_fk FROM @v21_fk_sql; EXECUTE stmt_fk; DEALLOCATE PREPARE stmt_fk;
+
+SET @v21_fk_exists := (
+  SELECT COUNT(*) FROM information_schema.KEY_COLUMN_USAGE
+  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'inv_articulos'
+    AND COLUMN_NAME = 'campamento_id' AND REFERENCED_TABLE_NAME = 'inv_campamentos'
+);
+SET @v21_fk_sql := IF(
+  @v21_fk_exists = 0,
+  'ALTER TABLE `inv_articulos` ADD CONSTRAINT `fk_art_campamento` FOREIGN KEY (`campamento_id`) REFERENCES `inv_campamentos` (`id`) ON DELETE SET NULL ON UPDATE CASCADE',
+  'SELECT ''fk_art_campamento ok'' AS estado_fk'
+);
+PREPARE stmt_fk FROM @v21_fk_sql; EXECUTE stmt_fk; DEALLOCATE PREPARE stmt_fk;
+
+SET @v21_fk_exists := (
+  SELECT COUNT(*) FROM information_schema.KEY_COLUMN_USAGE
+  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'inv_articulos'
+    AND COLUMN_NAME = 'almacen_id' AND REFERENCED_TABLE_NAME = 'inv_almacenes'
+);
+SET @v21_fk_sql := IF(
+  @v21_fk_exists = 0,
+  'ALTER TABLE `inv_articulos` ADD CONSTRAINT `fk_art_almacen` FOREIGN KEY (`almacen_id`) REFERENCES `inv_almacenes` (`id`) ON DELETE SET NULL ON UPDATE CASCADE',
+  'SELECT ''fk_art_almacen ok'' AS estado_fk'
+);
+PREPARE stmt_fk FROM @v21_fk_sql; EXECUTE stmt_fk; DEALLOCATE PREPARE stmt_fk;
+
+-- 3.4 inv_lotes_importacion(usuario_id) -> inv_usuarios(id)
+SET @v21_fk_exists := (
+  SELECT COUNT(*) FROM information_schema.KEY_COLUMN_USAGE
+  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'inv_lotes_importacion'
+    AND COLUMN_NAME = 'usuario_id' AND REFERENCED_TABLE_NAME = 'inv_usuarios'
+);
+SET @v21_fk_sql := IF(
+  @v21_fk_exists = 0,
+  'ALTER TABLE `inv_lotes_importacion` ADD CONSTRAINT `fk_lote_usuario` FOREIGN KEY (`usuario_id`) REFERENCES `inv_usuarios` (`id`) ON DELETE SET NULL ON UPDATE CASCADE',
+  'SELECT ''fk_lote_usuario ok'' AS estado_fk'
+);
+PREPARE stmt_fk FROM @v21_fk_sql; EXECUTE stmt_fk; DEALLOCATE PREPARE stmt_fk;
+
+-- 3.5 inv_auditoria(usuario_id) -> inv_usuarios(id)
+SET @v21_fk_exists := (
+  SELECT COUNT(*) FROM information_schema.KEY_COLUMN_USAGE
+  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'inv_auditoria'
+    AND COLUMN_NAME = 'usuario_id' AND REFERENCED_TABLE_NAME = 'inv_usuarios'
+);
+SET @v21_fk_sql := IF(
+  @v21_fk_exists = 0,
+  'ALTER TABLE `inv_auditoria` ADD CONSTRAINT `fk_aud_usuario` FOREIGN KEY (`usuario_id`) REFERENCES `inv_usuarios` (`id`) ON DELETE SET NULL ON UPDATE CASCADE',
+  'SELECT ''fk_aud_usuario ok'' AS estado_fk'
+);
+PREPARE stmt_fk FROM @v21_fk_sql; EXECUTE stmt_fk; DEALLOCATE PREPARE stmt_fk;
+
+-- 3.6 inv_levantamientos(campamento_id, almacen_id, consolidado_por, creado_por)
+SET @v21_fk_exists := (
+  SELECT COUNT(*) FROM information_schema.KEY_COLUMN_USAGE
+  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'inv_levantamientos'
+    AND COLUMN_NAME = 'campamento_id' AND REFERENCED_TABLE_NAME = 'inv_campamentos'
+);
+SET @v21_fk_sql := IF(
+  @v21_fk_exists = 0,
+  'ALTER TABLE `inv_levantamientos` ADD CONSTRAINT `fk_lev_campamento` FOREIGN KEY (`campamento_id`) REFERENCES `inv_campamentos` (`id`) ON DELETE RESTRICT ON UPDATE CASCADE',
+  'SELECT ''fk_lev_campamento ok'' AS estado_fk'
+);
+PREPARE stmt_fk FROM @v21_fk_sql; EXECUTE stmt_fk; DEALLOCATE PREPARE stmt_fk;
+
+SET @v21_fk_exists := (
+  SELECT COUNT(*) FROM information_schema.KEY_COLUMN_USAGE
+  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'inv_levantamientos'
+    AND COLUMN_NAME = 'almacen_id' AND REFERENCED_TABLE_NAME = 'inv_almacenes'
+);
+SET @v21_fk_sql := IF(
+  @v21_fk_exists = 0,
+  'ALTER TABLE `inv_levantamientos` ADD CONSTRAINT `fk_lev_almacen` FOREIGN KEY (`almacen_id`) REFERENCES `inv_almacenes` (`id`) ON DELETE SET NULL ON UPDATE CASCADE',
+  'SELECT ''fk_lev_almacen ok'' AS estado_fk'
+);
+PREPARE stmt_fk FROM @v21_fk_sql; EXECUTE stmt_fk; DEALLOCATE PREPARE stmt_fk;
+
+SET @v21_fk_exists := (
+  SELECT COUNT(*) FROM information_schema.KEY_COLUMN_USAGE
+  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'inv_levantamientos'
+    AND COLUMN_NAME = 'consolidado_por' AND REFERENCED_TABLE_NAME = 'inv_usuarios'
+);
+SET @v21_fk_sql := IF(
+  @v21_fk_exists = 0,
+  'ALTER TABLE `inv_levantamientos` ADD CONSTRAINT `fk_lev_consolidado_por` FOREIGN KEY (`consolidado_por`) REFERENCES `inv_usuarios` (`id`) ON DELETE SET NULL ON UPDATE CASCADE',
+  'SELECT ''fk_lev_consolidado_por ok'' AS estado_fk'
+);
+PREPARE stmt_fk FROM @v21_fk_sql; EXECUTE stmt_fk; DEALLOCATE PREPARE stmt_fk;
+
+SET @v21_fk_exists := (
+  SELECT COUNT(*) FROM information_schema.KEY_COLUMN_USAGE
+  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'inv_levantamientos'
+    AND COLUMN_NAME = 'creado_por' AND REFERENCED_TABLE_NAME = 'inv_usuarios'
+);
+SET @v21_fk_sql := IF(
+  @v21_fk_exists = 0,
+  'ALTER TABLE `inv_levantamientos` ADD CONSTRAINT `fk_lev_creado_por` FOREIGN KEY (`creado_por`) REFERENCES `inv_usuarios` (`id`) ON DELETE RESTRICT ON UPDATE CASCADE',
+  'SELECT ''fk_lev_creado_por ok'' AS estado_fk'
+);
+PREPARE stmt_fk FROM @v21_fk_sql; EXECUTE stmt_fk; DEALLOCATE PREPARE stmt_fk;
+
+-- 3.7 inv_levantamiento_items(levantamiento_id, articulo_maestro_id, creado_por)
+SET @v21_fk_exists := (
+  SELECT COUNT(*) FROM information_schema.KEY_COLUMN_USAGE
+  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'inv_levantamiento_items'
+    AND COLUMN_NAME = 'levantamiento_id' AND REFERENCED_TABLE_NAME = 'inv_levantamientos'
+);
+SET @v21_fk_sql := IF(
+  @v21_fk_exists = 0,
+  'ALTER TABLE `inv_levantamiento_items` ADD CONSTRAINT `fk_item_levantamiento` FOREIGN KEY (`levantamiento_id`) REFERENCES `inv_levantamientos` (`id`) ON DELETE CASCADE ON UPDATE CASCADE',
+  'SELECT ''fk_item_levantamiento ok'' AS estado_fk'
+);
+PREPARE stmt_fk FROM @v21_fk_sql; EXECUTE stmt_fk; DEALLOCATE PREPARE stmt_fk;
+
+SET @v21_fk_exists := (
+  SELECT COUNT(*) FROM information_schema.KEY_COLUMN_USAGE
+  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'inv_levantamiento_items'
+    AND COLUMN_NAME = 'articulo_maestro_id' AND REFERENCED_TABLE_NAME = 'inv_articulos'
+);
+SET @v21_fk_sql := IF(
+  @v21_fk_exists = 0,
+  'ALTER TABLE `inv_levantamiento_items` ADD CONSTRAINT `fk_item_maestro` FOREIGN KEY (`articulo_maestro_id`) REFERENCES `inv_articulos` (`id`) ON DELETE SET NULL ON UPDATE CASCADE',
+  'SELECT ''fk_item_maestro ok'' AS estado_fk'
+);
+PREPARE stmt_fk FROM @v21_fk_sql; EXECUTE stmt_fk; DEALLOCATE PREPARE stmt_fk;
+
+SET @v21_fk_exists := (
+  SELECT COUNT(*) FROM information_schema.KEY_COLUMN_USAGE
+  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'inv_levantamiento_items'
+    AND COLUMN_NAME = 'creado_por' AND REFERENCED_TABLE_NAME = 'inv_usuarios'
+);
+SET @v21_fk_sql := IF(
+  @v21_fk_exists = 0,
+  'ALTER TABLE `inv_levantamiento_items` ADD CONSTRAINT `fk_item_creado_por` FOREIGN KEY (`creado_por`) REFERENCES `inv_usuarios` (`id`) ON DELETE SET NULL ON UPDATE CASCADE',
+  'SELECT ''fk_item_creado_por ok'' AS estado_fk'
+);
+PREPARE stmt_fk FROM @v21_fk_sql; EXECUTE stmt_fk; DEALLOCATE PREPARE stmt_fk;
+
+-- 3.8 inv_usuarios(campamento_id, almacen_id) y tablas puente usuario <-> sede / almacén
+SET @v21_fk_exists := (
+  SELECT COUNT(*) FROM information_schema.KEY_COLUMN_USAGE
+  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'inv_usuarios'
+    AND COLUMN_NAME = 'campamento_id' AND REFERENCED_TABLE_NAME = 'inv_campamentos'
+);
+SET @v21_fk_sql := IF(
+  @v21_fk_exists = 0,
+  'ALTER TABLE `inv_usuarios` ADD CONSTRAINT `fk_usr_campamento` FOREIGN KEY (`campamento_id`) REFERENCES `inv_campamentos` (`id`) ON DELETE SET NULL ON UPDATE CASCADE',
+  'SELECT ''fk_usr_campamento ok'' AS estado_fk'
+);
+PREPARE stmt_fk FROM @v21_fk_sql; EXECUTE stmt_fk; DEALLOCATE PREPARE stmt_fk;
+
+SET @v21_fk_exists := (
+  SELECT COUNT(*) FROM information_schema.KEY_COLUMN_USAGE
+  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'inv_usuarios'
+    AND COLUMN_NAME = 'almacen_id' AND REFERENCED_TABLE_NAME = 'inv_almacenes'
+);
+SET @v21_fk_sql := IF(
+  @v21_fk_exists = 0,
+  'ALTER TABLE `inv_usuarios` ADD CONSTRAINT `fk_usr_almacen` FOREIGN KEY (`almacen_id`) REFERENCES `inv_almacenes` (`id`) ON DELETE SET NULL ON UPDATE CASCADE',
+  'SELECT ''fk_usr_almacen ok'' AS estado_fk'
+);
+PREPARE stmt_fk FROM @v21_fk_sql; EXECUTE stmt_fk; DEALLOCATE PREPARE stmt_fk;
+
+SET @v21_fk_exists := (
+  SELECT COUNT(*) FROM information_schema.KEY_COLUMN_USAGE
+  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'inv_usuario_campamentos'
+    AND COLUMN_NAME = 'usuario_id' AND REFERENCED_TABLE_NAME = 'inv_usuarios'
+);
+SET @v21_fk_sql := IF(
+  @v21_fk_exists = 0,
+  'ALTER TABLE `inv_usuario_campamentos` ADD CONSTRAINT `fk_uc_usuario` FOREIGN KEY (`usuario_id`) REFERENCES `inv_usuarios` (`id`) ON DELETE CASCADE ON UPDATE CASCADE',
+  'SELECT ''fk_uc_usuario ok'' AS estado_fk'
+);
+PREPARE stmt_fk FROM @v21_fk_sql; EXECUTE stmt_fk; DEALLOCATE PREPARE stmt_fk;
+
+SET @v21_fk_exists := (
+  SELECT COUNT(*) FROM information_schema.KEY_COLUMN_USAGE
+  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'inv_usuario_campamentos'
+    AND COLUMN_NAME = 'campamento_id' AND REFERENCED_TABLE_NAME = 'inv_campamentos'
+);
+SET @v21_fk_sql := IF(
+  @v21_fk_exists = 0,
+  'ALTER TABLE `inv_usuario_campamentos` ADD CONSTRAINT `fk_uc_campamento` FOREIGN KEY (`campamento_id`) REFERENCES `inv_campamentos` (`id`) ON DELETE CASCADE ON UPDATE CASCADE',
+  'SELECT ''fk_uc_campamento ok'' AS estado_fk'
+);
+PREPARE stmt_fk FROM @v21_fk_sql; EXECUTE stmt_fk; DEALLOCATE PREPARE stmt_fk;
+
+SET @v21_fk_exists := (
+  SELECT COUNT(*) FROM information_schema.KEY_COLUMN_USAGE
+  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'inv_usuario_almacenes'
+    AND COLUMN_NAME = 'usuario_id' AND REFERENCED_TABLE_NAME = 'inv_usuarios'
+);
+SET @v21_fk_sql := IF(
+  @v21_fk_exists = 0,
+  'ALTER TABLE `inv_usuario_almacenes` ADD CONSTRAINT `fk_ua_usuario` FOREIGN KEY (`usuario_id`) REFERENCES `inv_usuarios` (`id`) ON DELETE CASCADE ON UPDATE CASCADE',
+  'SELECT ''fk_ua_usuario ok'' AS estado_fk'
+);
+PREPARE stmt_fk FROM @v21_fk_sql; EXECUTE stmt_fk; DEALLOCATE PREPARE stmt_fk;
+
+SET @v21_fk_exists := (
+  SELECT COUNT(*) FROM information_schema.KEY_COLUMN_USAGE
+  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'inv_usuario_almacenes'
+    AND COLUMN_NAME = 'almacen_id' AND REFERENCED_TABLE_NAME = 'inv_almacenes'
+);
+SET @v21_fk_sql := IF(
+  @v21_fk_exists = 0,
+  'ALTER TABLE `inv_usuario_almacenes` ADD CONSTRAINT `fk_ua_almacen` FOREIGN KEY (`almacen_id`) REFERENCES `inv_almacenes` (`id`) ON DELETE CASCADE ON UPDATE CASCADE',
+  'SELECT ''fk_ua_almacen ok'' AS estado_fk'
+);
+PREPARE stmt_fk FROM @v21_fk_sql; EXECUTE stmt_fk; DEALLOCATE PREPARE stmt_fk;
+
+-- ---------------------------------------------------------------------------------
+-- 4. Índices compuestos óptimos y retiro de índices redundantes (B06)
+-- ---------------------------------------------------------------------------------
+
+-- 4.1 Índice compuesto de consultas principales en inv_articulos
+SET @v21_idx_exists := (
+  SELECT COUNT(*) FROM information_schema.STATISTICS
+  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'inv_articulos' AND INDEX_NAME = 'idx_art_filtro_compuesto'
+);
+SET @v21_idx_sql := IF(
+  @v21_idx_exists = 0,
+  'CREATE INDEX `idx_art_filtro_compuesto` ON `inv_articulos` (`activo`, `es_sintetico`, `campamento_id`, `area`)',
+  'SELECT ''idx_art_filtro_compuesto ok'' AS estado_idx'
+);
+PREPARE stmt_idx FROM @v21_idx_sql; EXECUTE stmt_idx; DEALLOCATE PREPARE stmt_idx;
+
+-- 4.2 Índice compuesto de consultas cronológicas en inv_movimientos
+SET @v21_idx_exists := (
+  SELECT COUNT(*) FROM information_schema.STATISTICS
+  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'inv_movimientos' AND INDEX_NAME = 'idx_mov_sint_fecha'
+);
+SET @v21_idx_sql := IF(
+  @v21_idx_exists = 0,
+  'CREATE INDEX `idx_mov_sint_fecha` ON `inv_movimientos` (`es_sintetico`, `fecha_movimiento`)',
+  'SELECT ''idx_mov_sint_fecha ok'' AS estado_idx'
+);
+PREPARE stmt_idx FROM @v21_idx_sql; EXECUTE stmt_idx; DEALLOCATE PREPARE stmt_idx;
+
+-- 4.3 Retiro seguro de índices redundantes SOLO si un UNIQUE KEY ya cubre su prefijo izquierdo
+SET @v21_has_redundant := (
+  SELECT IF(
+    EXISTS(SELECT 1 FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'inv_usuarios' AND INDEX_NAME = 'idx_inv_usuarios_email')
+    AND EXISTS(SELECT 1 FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'inv_usuarios' AND NON_UNIQUE = 0 AND COLUMN_NAME = 'email' AND SEQ_IN_INDEX = 1),
+    1, 0
+  )
+);
+SET @v21_drop_sql := IF(@v21_has_redundant = 1, 'DROP INDEX `idx_inv_usuarios_email` ON `inv_usuarios`', 'SELECT ''idx_inv_usuarios_email sin cambios'' AS estado_idx');
+PREPARE stmt_idx FROM @v21_drop_sql; EXECUTE stmt_idx; DEALLOCATE PREPARE stmt_idx;
+
+SET @v21_has_redundant := (
+  SELECT IF(
+    EXISTS(SELECT 1 FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'inv_categorias' AND INDEX_NAME = 'idx_cat_area')
+    AND EXISTS(SELECT 1 FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'inv_categorias' AND NON_UNIQUE = 0 AND COLUMN_NAME = 'area' AND SEQ_IN_INDEX = 1),
+    1, 0
+  )
+);
+SET @v21_drop_sql := IF(@v21_has_redundant = 1, 'DROP INDEX `idx_cat_area` ON `inv_categorias`', 'SELECT ''idx_cat_area sin cambios'' AS estado_idx');
+PREPARE stmt_idx FROM @v21_drop_sql; EXECUTE stmt_idx; DEALLOCATE PREPARE stmt_idx;
+
+SET @v21_has_redundant := (
+  SELECT IF(
+    EXISTS(SELECT 1 FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'inv_custodios' AND INDEX_NAME = 'idx_cust_nombre')
+    AND EXISTS(SELECT 1 FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'inv_custodios' AND NON_UNIQUE = 0 AND COLUMN_NAME = 'nombre' AND SEQ_IN_INDEX = 1),
+    1, 0
+  )
+);
+SET @v21_drop_sql := IF(@v21_has_redundant = 1, 'DROP INDEX `idx_cust_nombre` ON `inv_custodios`', 'SELECT ''idx_cust_nombre sin cambios'' AS estado_idx');
+PREPARE stmt_idx FROM @v21_drop_sql; EXECUTE stmt_idx; DEALLOCATE PREPARE stmt_idx;
+
+SET @v21_has_redundant := (
+  SELECT IF(
+    EXISTS(SELECT 1 FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'inv_campamentos' AND INDEX_NAME = 'idx_camp_nombre')
+    AND EXISTS(SELECT 1 FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'inv_campamentos' AND NON_UNIQUE = 0 AND COLUMN_NAME = 'nombre' AND SEQ_IN_INDEX = 1),
+    1, 0
+  )
+);
+SET @v21_drop_sql := IF(@v21_has_redundant = 1, 'DROP INDEX `idx_camp_nombre` ON `inv_campamentos`', 'SELECT ''idx_camp_nombre sin cambios'' AS estado_idx');
+PREPARE stmt_idx FROM @v21_drop_sql; EXECUTE stmt_idx; DEALLOCATE PREPARE stmt_idx;
+
+SET @v21_has_redundant := (
+  SELECT IF(
+    EXISTS(SELECT 1 FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'inv_levantamientos' AND INDEX_NAME = 'idx_lev_codigo')
+    AND EXISTS(SELECT 1 FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'inv_levantamientos' AND NON_UNIQUE = 0 AND COLUMN_NAME = 'codigo_levantamiento' AND SEQ_IN_INDEX = 1),
+    1, 0
+  )
+);
+SET @v21_drop_sql := IF(@v21_has_redundant = 1, 'DROP INDEX `idx_lev_codigo` ON `inv_levantamientos`', 'SELECT ''idx_lev_codigo sin cambios'' AS estado_idx');
+PREPARE stmt_idx FROM @v21_drop_sql; EXECUTE stmt_idx; DEALLOCATE PREPARE stmt_idx;
+
+SET @v21_has_redundant := (
+  SELECT IF(
+    EXISTS(SELECT 1 FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'inv_usuario_campamentos' AND INDEX_NAME = 'idx_uc_usuario')
+    AND EXISTS(SELECT 1 FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'inv_usuario_campamentos' AND NON_UNIQUE = 0 AND COLUMN_NAME = 'usuario_id' AND SEQ_IN_INDEX = 1),
+    1, 0
+  )
+);
+SET @v21_drop_sql := IF(@v21_has_redundant = 1, 'DROP INDEX `idx_uc_usuario` ON `inv_usuario_campamentos`', 'SELECT ''idx_uc_usuario sin cambios'' AS estado_idx');
+PREPARE stmt_idx FROM @v21_drop_sql; EXECUTE stmt_idx; DEALLOCATE PREPARE stmt_idx;
+
+SET @v21_has_redundant := (
+  SELECT IF(
+    EXISTS(SELECT 1 FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'inv_usuario_almacenes' AND INDEX_NAME = 'idx_ua_usuario')
+    AND EXISTS(SELECT 1 FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'inv_usuario_almacenes' AND NON_UNIQUE = 0 AND COLUMN_NAME = 'usuario_id' AND SEQ_IN_INDEX = 1),
+    1, 0
+  )
+);
+SET @v21_drop_sql := IF(@v21_has_redundant = 1, 'DROP INDEX `idx_ua_usuario` ON `inv_usuario_almacenes`', 'SELECT ''idx_ua_usuario sin cambios'' AS estado_idx');
+PREPARE stmt_idx FROM @v21_drop_sql; EXECUTE stmt_idx; DEALLOCATE PREPARE stmt_idx;
+
+-- =================================================================================
+-- VERIFICACIÓN POST-MIGRACIÓN (SOLO LECTURA — DESCOMENTAR PARA AUDITORÍA)
+-- =================================================================================
+-- SELECT TABLE_NAME, CONSTRAINT_NAME, UPDATE_RULE, DELETE_RULE
+-- FROM information_schema.REFERENTIAL_CONSTRAINTS
+-- WHERE CONSTRAINT_SCHEMA = DATABASE()
+-- ORDER BY TABLE_NAME, CONSTRAINT_NAME;
+--
+-- SELECT TABLE_NAME, INDEX_NAME, GROUP_CONCAT(COLUMN_NAME ORDER BY SEQ_IN_INDEX) AS cols
+-- FROM information_schema.STATISTICS
+-- WHERE TABLE_SCHEMA = DATABASE()
+-- GROUP BY TABLE_NAME, INDEX_NAME
+-- ORDER BY TABLE_NAME, INDEX_NAME;

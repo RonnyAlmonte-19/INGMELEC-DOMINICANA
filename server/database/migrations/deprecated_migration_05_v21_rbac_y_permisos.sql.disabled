@@ -1,0 +1,267 @@
+-- =================================================================================
+-- INGMELEC | ALMACÉN GENERAL (v2.1 — ETAPA 5)
+-- PROPUESTA FUTURA IDEMPOTENTE: RBAC, DEFECTO SEGURO Y PERMISOS JSON
+-- ARCHIVO: server/database/migrations/migration_05_v21_rbac_y_permisos.sql
+-- HALLAZGOS / REQUISITOS RELACIONADOS: Etapa 5 — RBAC estricto y defecto seguro
+-- =================================================================================
+-- ADVERTENCIA DE USO Y SEGURIDAD:
+--   1. PROPUESTA LOCAL — CERO EJECUCIONES AUTOMÁTICAS EN PRODUCCIÓN (Clever Cloud).
+--   2. NO EJECUTAR EN PRODUCCIÓN SIN RESPALDO PREVIO VERIFICADO Y AUTORIZACIÓN EXPLÍCITA.
+--   3. Script 100% idempotente y determinista compatible con MySQL 8.0+ y MariaDB 10.11+
+--      usando transacción atómica, `JSON_VALID(COALESCE(permisos_json, ''))`,
+--      `JSON_TYPE`, `JSON_LENGTH`, `JSON_CONTAINS`, `JSON_SEARCH` y `JSON_ARRAY_APPEND`.
+--   4. Precondición esperada: haber aplicado `migration_01`..`migration_04`
+--      (o fixture sintético equivalente con `inv_usuarios.permisos_json` y `es_developer`).
+--   5. GARANTÍA DE INTEGRIDAD OPERATIVA:
+--      - CERO modificaciones sobre `inv_articulos`, `inv_campamentos`,
+--        `inv_movimientos` o `inv_levantamientos`.
+--      - Nunca convierte cuentas con `'[]'` vacío ni cuentas inactivas (`activo = 0`)
+--        en cuentas con acceso; conserva defecto seguro sin privilegios.
+-- =================================================================================
+
+SET NAMES utf8mb4;
+
+START TRANSACTION;
+
+-- ---------------------------------------------------------------------------------
+-- 1. Defecto seguro sin acceso: garantizar que `inv_usuarios.permisos_json` nunca
+--    quede NULL, inválido o no-arreglo en cuentas no developer
+-- ---------------------------------------------------------------------------------
+UPDATE `inv_usuarios`
+SET `permisos_json` = '[]'
+WHERE `id` >= 0
+  AND (`es_developer` = 0 OR LOWER(TRIM(COALESCE(`rol`, ''))) <> 'developer')
+  AND CASE
+    WHEN `permisos_json` IS NULL THEN 1
+    WHEN JSON_VALID(COALESCE(`permisos_json`, '')) = 0 THEN 1
+    WHEN JSON_TYPE(`permisos_json`) <> 'ARRAY' THEN 1
+    ELSE 0
+  END = 1;
+
+-- ---------------------------------------------------------------------------------
+-- 2. Anti-autoescalamiento: para cuentas no developer (`es_developer = 0` o
+--    `rol <> 'developer'`) donde `permisos_json` contenga wildcard '*', limpiar a
+--    defecto seguro '[]' sin elevar privilegios
+-- ---------------------------------------------------------------------------------
+UPDATE `inv_usuarios`
+SET `permisos_json` = '[]'
+WHERE `id` >= 0
+  AND (`es_developer` = 0 OR LOWER(TRIM(COALESCE(`rol`, ''))) <> 'developer')
+  AND CASE
+    WHEN `permisos_json` IS NULL THEN 0
+    WHEN JSON_VALID(COALESCE(`permisos_json`, '')) = 0 THEN 0
+    WHEN JSON_CONTAINS(`permisos_json`, '"*"') = 1 THEN 1
+    WHEN JSON_SEARCH(`permisos_json`, 'one', '*') IS NOT NULL THEN 1
+    ELSE 0
+  END = 1;
+
+-- ---------------------------------------------------------------------------------
+-- 3. Cuenta principal developer: asegurar que la única cuenta principal
+--    (`es_developer = 1 AND rol = 'developer'`) conserve exactamente '["*"]'
+-- ---------------------------------------------------------------------------------
+UPDATE `inv_usuarios`
+SET `permisos_json` = '["*"]'
+WHERE `id` >= 0
+  AND `es_developer` = 1
+  AND LOWER(TRIM(COALESCE(`rol`, ''))) = 'developer'
+  AND CASE
+    WHEN `permisos_json` IS NULL THEN 1
+    WHEN JSON_VALID(COALESCE(`permisos_json`, '')) = 0 THEN 1
+    WHEN JSON_TYPE(`permisos_json`) <> 'ARRAY' THEN 1
+    WHEN JSON_LENGTH(`permisos_json`) <> 1 THEN 1
+    WHEN JSON_CONTAINS(`permisos_json`, '"*"') = 0 THEN 1
+    ELSE 0
+  END = 1;
+
+-- ---------------------------------------------------------------------------------
+-- 4.1 Continuidad operativa ('dash:ver'): para cuentas activas existentes
+--     (`es_developer = 0 AND activo = 1`) cuya `permisos_json` ya contenga permisos
+--     no vacíos (`JSON_VALID` y `JSON_LENGTH > 0`), agregar 'dash:ver' de forma
+--     idempotente (SIN tocar cuentas con '[]' vacío ni cuentas inactivas)
+-- ---------------------------------------------------------------------------------
+UPDATE `inv_usuarios`
+SET `permisos_json` = JSON_ARRAY_APPEND(`permisos_json`, '$', 'dash:ver')
+WHERE `id` >= 0
+  AND `es_developer` = 0
+  AND LOWER(TRIM(COALESCE(`rol`, ''))) <> 'developer'
+  AND `activo` = 1
+  AND CASE
+    WHEN `permisos_json` IS NULL THEN 0
+    WHEN JSON_VALID(COALESCE(`permisos_json`, '')) = 0 THEN 0
+    WHEN JSON_TYPE(`permisos_json`) <> 'ARRAY' THEN 0
+    WHEN JSON_LENGTH(`permisos_json`) <= 0 THEN 0
+    WHEN JSON_CONTAINS(`permisos_json`, '"*"') <> 0 THEN 0
+    WHEN JSON_CONTAINS(`permisos_json`, '"dash:ver"') = 0 THEN 1
+    ELSE 0
+  END = 1;
+
+-- ---------------------------------------------------------------------------------
+-- 4.2 Bitácora / Auditoría ('aud:ver'): únicamente a cuentas activas con
+--     `rol IN ('admin', 'auditor', 'gerencia')` y permisos no vacíos (`JSON_LENGTH > 0`)
+-- ---------------------------------------------------------------------------------
+UPDATE `inv_usuarios`
+SET `permisos_json` = JSON_ARRAY_APPEND(`permisos_json`, '$', 'aud:ver')
+WHERE `id` >= 0
+  AND `es_developer` = 0
+  AND `activo` = 1
+  AND LOWER(TRIM(COALESCE(`rol`, ''))) IN ('admin', 'auditor', 'gerencia')
+  AND CASE
+    WHEN `permisos_json` IS NULL THEN 0
+    WHEN JSON_VALID(COALESCE(`permisos_json`, '')) = 0 THEN 0
+    WHEN JSON_TYPE(`permisos_json`) <> 'ARRAY' THEN 0
+    WHEN JSON_LENGTH(`permisos_json`) <= 0 THEN 0
+    WHEN JSON_CONTAINS(`permisos_json`, '"*"') <> 0 THEN 0
+    WHEN JSON_CONTAINS(`permisos_json`, '"aud:ver"') = 0 THEN 1
+    ELSE 0
+  END = 1;
+
+COMMIT;
+
+-- =================================================================================
+-- VERIFICACIÓN POST-MIGRACIÓN (SOLO LECTURA — DESCOMENTAR PARA VALIDAR)
+-- =================================================================================
+-- -- 1. Verificación de metadatos de `inv_usuarios` vía information_schema:
+-- SELECT
+--   COLUMN_NAME,
+--   COLUMN_TYPE,
+--   IS_NULLABLE,
+--   COLUMN_DEFAULT
+-- FROM information_schema.COLUMNS
+-- WHERE TABLE_SCHEMA = DATABASE()
+--   AND TABLE_NAME = 'inv_usuarios'
+--   AND COLUMN_NAME IN ('rol', 'activo', 'es_developer', 'token_version', 'permisos_json')
+-- ORDER BY ORDINAL_POSITION;
+--
+-- -- 2. Resumen de invariantes RBAC (todos los contadores de brecha deben retornar 0):
+-- SELECT
+--   COUNT(*) AS total_usuarios,
+--   SUM(CASE
+--     WHEN (`es_developer` = 0 OR LOWER(TRIM(COALESCE(`rol`, ''))) <> 'developer')
+--       AND (
+--         `permisos_json` IS NULL
+--         OR JSON_VALID(COALESCE(`permisos_json`, '')) = 0
+--         OR JSON_TYPE(`permisos_json`) <> 'ARRAY'
+--       )
+--     THEN 1 ELSE 0
+--   END) AS brecha_null_o_invalido_no_dev,
+--   SUM(CASE
+--     WHEN (`es_developer` = 0 OR LOWER(TRIM(COALESCE(`rol`, ''))) <> 'developer')
+--       AND JSON_VALID(COALESCE(`permisos_json`, '')) = 1
+--       AND (
+--         JSON_CONTAINS(`permisos_json`, '"*"') = 1
+--         OR JSON_SEARCH(`permisos_json`, 'one', '*') IS NOT NULL
+--       )
+--     THEN 1 ELSE 0
+--   END) AS brecha_wildcard_no_dev,
+--   SUM(CASE
+--     WHEN `es_developer` = 1 AND LOWER(TRIM(COALESCE(`rol`, ''))) = 'developer'
+--       AND (
+--         `permisos_json` IS NULL
+--         OR JSON_VALID(COALESCE(`permisos_json`, '')) = 0
+--         OR JSON_TYPE(`permisos_json`) <> 'ARRAY'
+--         OR JSON_LENGTH(`permisos_json`) <> 1
+--         OR JSON_CONTAINS(`permisos_json`, '"*"') = 0
+--       )
+--     THEN 1 ELSE 0
+--   END) AS brecha_dev_sin_wildcard,
+--   SUM(CASE
+--     WHEN `es_developer` = 0 AND LOWER(TRIM(COALESCE(`rol`, ''))) <> 'developer'
+--       AND `activo` = 1
+--       AND JSON_VALID(COALESCE(`permisos_json`, '')) = 1
+--       AND JSON_TYPE(`permisos_json`) = 'ARRAY'
+--       AND JSON_LENGTH(`permisos_json`) > 0
+--       AND JSON_CONTAINS(`permisos_json`, '"dash:ver"') = 0
+--     THEN 1 ELSE 0
+--   END) AS brecha_activos_con_permisos_sin_dash_ver,
+--   SUM(CASE
+--     WHEN `es_developer` = 0
+--       AND `activo` = 1
+--       AND LOWER(TRIM(COALESCE(`rol`, ''))) IN ('admin', 'auditor', 'gerencia')
+--       AND JSON_VALID(COALESCE(`permisos_json`, '')) = 1
+--       AND JSON_TYPE(`permisos_json`) = 'ARRAY'
+--       AND JSON_LENGTH(`permisos_json`) > 0
+--       AND JSON_CONTAINS(`permisos_json`, '"aud:ver"') = 0
+--     THEN 1 ELSE 0
+--   END) AS brecha_roles_control_sin_aud_ver
+-- FROM `inv_usuarios`;
+--
+-- -- 3. Inspección detallada por cuenta en `inv_usuarios`:
+-- SELECT
+--   `id`,
+--   `email`,
+--   `rol`,
+--   `activo`,
+--   `es_developer`,
+--   JSON_VALID(COALESCE(`permisos_json`, '')) AS json_valido,
+--   CASE
+--     WHEN JSON_VALID(COALESCE(`permisos_json`, '')) = 1 THEN JSON_LENGTH(`permisos_json`)
+--     ELSE NULL
+--   END AS total_permisos,
+--   CASE
+--     WHEN JSON_VALID(COALESCE(`permisos_json`, '')) = 1 THEN JSON_CONTAINS(`permisos_json`, '"dash:ver"')
+--     ELSE 0
+--   END AS tiene_dash_ver,
+--   CASE
+--     WHEN JSON_VALID(COALESCE(`permisos_json`, '')) = 1 THEN JSON_CONTAINS(`permisos_json`, '"aud:ver"')
+--     ELSE 0
+--   END AS tiene_aud_ver,
+--   `permisos_json`
+-- FROM `inv_usuarios`
+-- ORDER BY `id`;
+--
+-- -- 4. Confirmación de cero cambios en tablas operativas:
+-- SELECT
+--   (SELECT COUNT(*) FROM `inv_articulos`) AS total_articulos,
+--   (SELECT COUNT(*) FROM `inv_campamentos`) AS total_campamentos,
+--   (SELECT COUNT(*) FROM `inv_movimientos`) AS total_movimientos,
+--   (SELECT COUNT(*) FROM `inv_levantamientos`) AS total_levantamientos;
+
+-- =================================================================================
+-- PLAN DE REVERSIÓN SEGURO NO DESTRUCTIVO (ROLLBACK MANUAL — SOLO CON RESPALDO PREVIO)
+-- =================================================================================
+-- REGLAS DE SEGURIDAD ANTES DE REVERTIR:
+--   1. Tomar respaldo previo antes de aplicar `migration_05`:
+--      CREATE TABLE `inv_usuarios_backup_pre_m05` AS
+--      SELECT `id`, `rol`, `activo`, `es_developer`, `permisos_json` FROM `inv_usuarios`;
+--   2. No revertir en producción sin coordinar el backend (`almacenApi.js`) para evitar
+--      bloqueos `403` en `GET /dashboard/kpis` (`dash:ver`) o auditoría (`aud:ver`).
+--   3. La reversión selectiva sin respaldo (Opción R2) NO restaura `NULL` ni wildcard
+--      `'*'` en cuentas no developer, manteniendo el principio de defecto seguro.
+--
+-- -- Opción R1 (Recomendada: restauración exacta desde snapshot previo `inv_usuarios_backup_pre_m05`):
+-- START TRANSACTION;
+-- UPDATE `inv_usuarios` u
+-- JOIN `inv_usuarios_backup_pre_m05` b ON b.`id` = u.`id`
+-- SET u.`permisos_json` = b.`permisos_json`
+-- WHERE u.`id` >= 0;
+-- COMMIT;
+-- -- (Opcional tras validar): DROP TABLE IF EXISTS `inv_usuarios_backup_pre_m05`;
+--
+-- -- Opción R2 (Reversión selectiva sin respaldo: retira únicamente 'dash:ver' y 'aud:ver'
+-- --            de cuentas no developer manteniendo '[]' en lugar de NULL o '*'):
+-- START TRANSACTION;
+-- UPDATE `inv_usuarios`
+-- SET `permisos_json` = JSON_REMOVE(
+--   `permisos_json`,
+--   JSON_UNQUOTE(JSON_SEARCH(`permisos_json`, 'one', 'dash:ver'))
+-- )
+-- WHERE `id` >= 0
+--   AND `es_developer` = 0
+--   AND JSON_VALID(COALESCE(`permisos_json`, '')) = 1
+--   AND JSON_TYPE(`permisos_json`) = 'ARRAY'
+--   AND JSON_CONTAINS(`permisos_json`, '"dash:ver"') = 1
+--   AND JSON_SEARCH(`permisos_json`, 'one', 'dash:ver') IS NOT NULL;
+--
+-- UPDATE `inv_usuarios`
+-- SET `permisos_json` = JSON_REMOVE(
+--   `permisos_json`,
+--   JSON_UNQUOTE(JSON_SEARCH(`permisos_json`, 'one', 'aud:ver'))
+-- )
+-- WHERE `id` >= 0
+--   AND `es_developer` = 0
+--   AND LOWER(TRIM(COALESCE(`rol`, ''))) IN ('admin', 'auditor', 'gerencia')
+--   AND JSON_VALID(COALESCE(`permisos_json`, '')) = 1
+--   AND JSON_TYPE(`permisos_json`) = 'ARRAY'
+--   AND JSON_CONTAINS(`permisos_json`, '"aud:ver"') = 1
+--   AND JSON_SEARCH(`permisos_json`, 'one', 'aud:ver') IS NOT NULL;
+-- COMMIT;
