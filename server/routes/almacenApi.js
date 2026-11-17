@@ -3,6 +3,7 @@ import crypto from 'crypto';
 import argon2 from 'argon2';
 import { getPool } from '../database/db.js';
 import { validateAndGetJwtSecret } from '../config/auth.js';
+import { applyDateRange } from '../services/dateRange.js';
 
 const router = express.Router();
 
@@ -131,7 +132,11 @@ export const KNOWN_PERMISSION_KEYS = [
   'camp:ver',
   'camp:stock',
   'camp:operar',
-  'aud:ver'
+  'aud:ver',
+  // v2.2 Actas de Entrega (no forman parte de ningún rol por defecto)
+  'act:ver',
+  'act:crear',
+  'act:anular'
 ];
 
 const KNOWN_PERMISSION_SET = new Set(KNOWN_PERMISSION_KEYS);
@@ -2658,6 +2663,70 @@ router.get('/articulos/next-code', requireAuth, requirePermission('inv:crear'), 
   }
 });
 
+// v2.2 — Contadores "facetados" del inventario (solo lectura). Cada contador responde:
+// "¿cuántos artículos habría si el usuario eligiera esta opción, manteniendo TODOS los demás filtros?".
+// Reutiliza las mismas condiciones del listado (sin duplicar lógica) y respeta siempre el alcance por sede.
+async function computeArticuloFacetas(db, { conditions, params, segs, scope, baseCount, areaValue, categoriaValue }) {
+  const sinSeg = (tag) => {
+    const s = segs[tag];
+    let cs = [...conditions];
+    let ps = [...params];
+    if (s) {
+      cs = conditions.filter((_, i) => i < s.c0 || i >= s.c1);
+      ps = params.filter((_, i) => i < s.p0 || i >= s.p1);
+    }
+    // Al quitar el filtro de sede, un usuario con alcance limitado conserva SIEMPRE su alcance.
+    if (tag === 'campamento' && !scope.isGlobal) {
+      const sf = buildArticleScopeFilter(scope, 'a');
+      cs.push(sf.sql);
+      ps.push(...sf.params);
+    }
+    return { where: cs.join(' AND '), params: ps };
+  };
+  const agrupar = async (tag, col, { texto = false } = {}) => {
+    const { where, params: ps } = sinSeg(tag);
+    const extra = texto ? ` AND ${col} IS NOT NULL AND TRIM(${col}) <> ''` : '';
+    const [rows] = await db.query(
+      `SELECT ${col} AS valor, COUNT(*) AS total FROM inv_articulos a WHERE ${where}${extra} GROUP BY ${col} ORDER BY total DESC LIMIT 300`,
+      ps
+    );
+    return rows.map((r) => ({ valor: r.valor, total: Number(r.total) }));
+  };
+
+  const areasRows = await agrupar('area', 'a.area');
+  const categorias = (await agrupar('categoria', 'a.categoria', { texto: true })).sort((x, y) => String(x.valor).localeCompare(String(y.valor), 'es'));
+  const ubicaciones = (await agrupar('ubicacion', 'a.ubicacion_nombre', { texto: true })).sort((x, y) => String(x.valor).localeCompare(String(y.valor), 'es'));
+  const campamentos = (await agrupar('campamento', 'a.campamento_id')).map((c) => ({ campamento_id: c.valor, total: c.total }));
+
+  // Totales de contexto: alcance del usuario sin ningún filtro, y dentro del área / de la categoría elegidas.
+  const base = conditions.slice(0, baseCount);
+  const scopeConds = [];
+  const scopeParams = [];
+  if (!scope.isGlobal) {
+    const sf = buildArticleScopeFilter(scope, 'a');
+    scopeConds.push(sf.sql);
+    scopeParams.push(...sf.params);
+  }
+  const contar = async (extraConds, extraParams) => {
+    const w = [...base, ...scopeConds, ...extraConds].join(' AND ');
+    const [[r]] = await db.query(`SELECT COUNT(*) AS n FROM inv_articulos a WHERE ${w}`, [...scopeParams, ...extraParams]);
+    return Number(r.n);
+  };
+  const totales = { alcance: await contar([], []), area: null, categoria: null };
+  if (areaValue) totales.area = await contar(['a.area = ?'], [areaValue]);
+  // Totales independientes entre sí (cada uno = alcance + ese único filtro), para que nunca se confundan
+  // con el resultado de la combinación completa.
+  if (categoriaValue) totales.categoria = await contar(['a.categoria = ?'], [categoriaValue]);
+
+  return {
+    areas: Object.fromEntries(areasRows.map((r) => [r.valor, r.total])),
+    categorias,
+    ubicaciones,
+    campamentos,
+    totales
+  };
+}
+
 router.get('/articulos', requireAuth, requirePermission('inv:ver'), async (req, res) => {
   try {
     const db = getPool();
@@ -2691,7 +2760,17 @@ router.get('/articulos', requireAuth, requirePermission('inv:ver'), async (req, 
     }
     const { isSinSedeReq, selectedCid } = campFilter;
 
+    // v2.2: se registra en qué posiciones de (conditions, params) vive cada filtro para poder calcular
+    // contadores "facetados" (opción elegida + resto de filtros) sin duplicar la lógica de filtrado.
+    const segs = {};
+    const track = (tag) => {
+      const c0 = conditions.length;
+      const p0 = params.length;
+      return () => { segs[tag] = { c0, c1: conditions.length, p0, p1: params.length }; };
+    };
+
     // Ámbito de campamentos / sedes permitidas
+    const endCamp = track('campamento');
     if (!scope.isGlobal) {
       if (selectedCid !== null) {
         conditions.push('(a.campamento_id = ?)');
@@ -2707,18 +2786,23 @@ router.get('/articulos', requireAuth, requirePermission('inv:ver'), async (req, 
       conditions.push('a.campamento_id = ?');
       params.push(selectedCid);
     }
+    endCamp();
 
+    const endArea = track('area');
     const areaParam = asNonEmptyString(area);
     if (areaParam && areaParam.toUpperCase() !== 'TODOS') {
       conditions.push('a.area = ?');
       params.push(areaParam.toUpperCase());
     }
+    endArea();
 
+    const endCat = track('categoria');
     const categoriaParam = asNonEmptyString(categoria);
     if (categoriaParam && categoriaParam.toUpperCase() !== 'TODAS') {
       conditions.push('a.categoria = ?');
       params.push(categoriaParam);
     }
+    endCat();
 
     const estadoParam = asNonEmptyString(estado);
     if (estadoParam && estadoParam.toUpperCase() !== 'TODOS') {
@@ -2729,11 +2813,13 @@ router.get('/articulos', requireAuth, requirePermission('inv:ver'), async (req, 
       }
     }
 
+    const endUbic = track('ubicacion');
     const ubicacionParam = asNonEmptyString(ubicacion);
     if (ubicacionParam && ubicacionParam.toUpperCase() !== 'TODAS') {
       conditions.push('a.ubicacion_nombre = ?');
       params.push(ubicacionParam);
     }
+    endUbic();
 
     if (sinSerial === 'true') {
       conditions.push(buildSqlSinSerialCondition('a.serie_imei'));
@@ -2757,6 +2843,11 @@ router.get('/articulos', requireAuth, requirePermission('inv:ver'), async (req, 
         a.observaciones LIKE ?
       )`);
       params.push(q, q, q, q, q, q, q, q);
+    }
+
+    // v2.2: filtro por fecha de registro (fecha_creacion/creado_en); sin parámetros no cambia nada
+    if (schemaCaps.articulos.createdCol !== 'id') {
+      if (!applyDateRange(req, res, conditions, params, `a.${schemaCaps.articulos.createdCol}`)) return;
     }
 
     const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
@@ -2832,6 +2923,20 @@ router.get('/articulos', requireAuth, requirePermission('inv:ver'), async (req, 
     const [rows] = await db.query(query, [...params, numLimit, offset]);
     const sanitizedRows = rows.map(sanitizeListArticleRow);
 
+    // v2.2: contadores facetados solo si se piden (?facetas=true); sin el parámetro la respuesta es idéntica a la anterior
+    let facetas;
+    if (req.query.facetas === 'true') {
+      facetas = await computeArticuloFacetas(db, {
+        conditions,
+        params,
+        segs,
+        scope,
+        baseCount: includeSynthetic ? 1 : 2,
+        areaValue: areaParam && areaParam.toUpperCase() !== 'TODOS' ? areaParam.toUpperCase() : null,
+        categoriaValue: categoriaParam && categoriaParam.toUpperCase() !== 'TODAS' ? categoriaParam : null
+      });
+    }
+
     res.json({
       success: true,
       articulos: sanitizedRows,
@@ -2845,7 +2950,8 @@ router.get('/articulos', requireAuth, requirePermission('inv:ver'), async (req, 
         page: numPage,
         limit: numLimit,
         totalPages: Math.ceil(total / numLimit)
-      }
+      },
+      ...(facetas ? { facetas } : {})
     });
   } catch (error) {
     console.error('List articulos error:', error);
@@ -3648,6 +3754,9 @@ router.get('/movimientos', requireAuth, requirePermission('inv:movimientos_ver')
       params.push(reqCid);
     }
 
+    // v2.2: filtro por fecha del movimiento (solo lectura)
+    if (!applyDateRange(req, res, conds, params, 'm.fecha_movimiento')) return;
+
     if (conds.length > 0) {
       query += ` WHERE ${conds.join(' AND ')}`;
     }
@@ -4083,6 +4192,14 @@ router.get('/reportes/consolidado', requireAuth, requirePermission('rep:ver'), a
       }
     }
 
+    // v2.2: período = artículos registrados en el rango (fecha_creacion/creado_en); sin parámetros no cambia nada
+    const capsFecha = await getSchemaCapabilities(db);
+    if (capsFecha.articulos.createdCol !== 'id') {
+      const dateConds = [];
+      if (!applyDateRange(req, res, dateConds, paramsArt, `a.${capsFecha.articulos.createdCol}`)) return;
+      whereArt += dateConds.map((c) => ` AND ${c}`).join('');
+    }
+
     // Group by Area & Estado
     const [areaEstado] = await db.query(`
       SELECT a.area, a.estado_fisico,
@@ -4252,6 +4369,13 @@ router.get('/reportes/exportar', requireAuth, requirePermission('rep:exportar'),
       params.push(q, q, q, q, q, q, q, q);
     }
 
+    // v2.2: misma regla de fecha de registro que GET /articulos (exportación coherente con lo filtrado)
+    if (schemaCaps.articulos.createdCol !== 'id') {
+      const dateConds = [];
+      if (!applyDateRange(req, res, dateConds, params, `a.${schemaCaps.articulos.createdCol}`)) return;
+      query += dateConds.map((c) => ` AND ${c}`).join('');
+    }
+
     const exportSortMap = {
       id: 'a.id',
       codigo_original: 'a.codigo_original',
@@ -4318,10 +4442,16 @@ router.get('/auditoria', requireAuth, requireAuditoriaAccess, async (req, res) =
     const scope = await getUserAllowedCampamentos(db, req.user);
     const limit = sanitizeLimit(req.query.limit, 100, 1000);
 
+    // v2.2: filtro por fecha del evento (inv_auditoria.fecha); sin parámetros no cambia nada
+    const fechaConds = [];
+    const fechaParams = [];
+    if (!applyDateRange(req, res, fechaConds, fechaParams, 'aud.fecha')) return;
+    const fechaSql = fechaConds.length ? ` AND ${fechaConds.join(' AND ')}` : '';
+
     if (scope.isGlobal) {
       const [rows] = await db.query(
-        'SELECT * FROM inv_auditoria ORDER BY fecha DESC LIMIT ?',
-        [limit]
+        `SELECT aud.* FROM inv_auditoria aud WHERE 1 = 1${fechaSql} ORDER BY aud.fecha DESC LIMIT ?`,
+        [...fechaParams, limit]
       );
       return res.json({ success: true, logs: normalizeAuditLogRows(rows) });
     }
@@ -4347,10 +4477,10 @@ router.get('/auditoria', requireAuth, requireAuditoriaAccess, async (req, res) =
            WHERE li.id = aud.entidad_id AND l.campamento_id IN (?)
          ))
          OR (aud.entidad = 'inv_campamentos' AND aud.entidad_id IN (?))
-       )
+       )${fechaSql}
        ORDER BY aud.fecha DESC
        LIMIT ?`,
-      [...artScope.params, scope.campamentoIds, scope.campamentoIds, scope.campamentoIds, limit]
+      [...artScope.params, scope.campamentoIds, scope.campamentoIds, scope.campamentoIds, ...fechaParams, limit]
     );
     res.json({ success: true, logs: normalizeAuditLogRows(rows) });
   } catch (error) {
@@ -6684,6 +6814,9 @@ router.get('/levantamientos', requireAuth, requirePermission('lev:ver'), async (
       params.push(cId);
     }
 
+    // v2.2: filtro por fecha de inicio del levantamiento (DATE, sin zona horaria)
+    if (!applyDateRange(req, res, conditions, params, 'l.fecha_inicio', { dateOnly: true })) return;
+
     const query = `
       SELECT l.*,
              c.nombre as campamento_nombre,
@@ -8507,5 +8640,17 @@ router.post('/levantamientos/:id/consolidar', requireAuth, requirePermission('le
     safeRelease(conn);
   }
 });
+
+// v2.2: utilidades internas reutilizadas por el módulo Actas (sin cambiar su comportamiento).
+export {
+  requireAuth,
+  requirePermission,
+  requireAnyPermission,
+  getUserAllowedCampamentos,
+  canTargetCampamento,
+  logAudit,
+  safeRollback,
+  parsePositiveInt
+};
 
 export default router;

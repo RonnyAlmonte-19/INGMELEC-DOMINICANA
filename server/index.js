@@ -4,6 +4,7 @@ import morgan from 'morgan';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import almacenRouter from './routes/almacenApi.js';
+import actasRouter from './routes/actasApi.js';
 import { validateAndGetJwtSecret } from './config/auth.js';
 
 // Validar que JWT_SECRET exista y sea seguro antes de inicializar la app
@@ -137,6 +138,7 @@ if (String(process.env.MAINTENANCE_MODE || '').trim().toLowerCase() === 'true') 
 }
 
 // Routing mount - Único router oficial para INGMELEC | ALMACÉN GENERAL
+app.use('/api/v2', actasRouter); // v2.2: Actas (404 si ACTAS_ENABLED != true)
 app.use('/api/v2', almacenRouter);
 
 // Bloqueo explícito del router legado /api (desmontado por seguridad defensiva)
