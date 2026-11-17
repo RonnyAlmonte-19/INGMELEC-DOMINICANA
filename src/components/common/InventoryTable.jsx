@@ -16,6 +16,8 @@ import {
   mapArticulosToExportRows
 } from '../../utils/exportUtils';
 import ItemDetailModal from './ItemDetailModal';
+import AgotadoBadge from './AgotadoBadge';
+import DateRangeFilter, { EMPTY_DATE_RANGE, dateRangeParams } from './DateRangeFilter';
 import SearchableSelect from './SearchableSelect';
 
 function normalizeLookupText(val) {
@@ -84,6 +86,7 @@ export default function InventoryTable({
   };
 
   const [loading, setLoading] = useState(true);
+  const [fechaRango, setFechaRango] = useState(EMPTY_DATE_RANGE); // v2.2: filtro por fecha de registro
   const [exporting, setExporting] = useState(false);
   const [articulos, setArticulos] = useState([]);
   const [resumen, setResumen] = useState({ totalRegistros: 0, totalUnidadesFisicas: 0, articulosSinCantidad: 0 });
@@ -140,6 +143,8 @@ export default function InventoryTable({
   // Available filter options
   const [availableUbicaciones, setAvailableUbicaciones] = useState([]);
   const [availableCategorias, setAvailableCategorias] = useState([]);
+  // v2.2: contadores calculados por el backend (opción elegida + resto de filtros) y totales de contexto
+  const [facetas, setFacetas] = useState(null);
 
   // Detect and update when initialFilters / popstate URL params change (M08)
   useEffect(() => {
@@ -227,6 +232,8 @@ export default function InventoryTable({
         categoria: categoria !== 'TODAS' ? categoria : undefined,
         sinSerial: sinSerial ? 'true' : undefined,
         sinCantidad: sinCantidad ? 'true' : undefined,
+        ...dateRangeParams(fechaRango),
+        facetas: 'true',
         page: pagination.page,
         limit: pagination.limit,
         sortBy,
@@ -236,6 +243,7 @@ export default function InventoryTable({
       if (res.success) {
         setArticulos(res.articulos);
         setPagination(res.pagination);
+        setFacetas(res.facetas || null);
         if (res.resumen) {
           setResumen(res.resumen);
         }
@@ -251,15 +259,15 @@ export default function InventoryTable({
     } finally {
       setLoading(false);
     }
-  }, [fixedArea, areaFilter, campamentoFilter, search, estado, ubicacion, categoria, sinSerial, sinCantidad, pagination.page, pagination.limit, sortBy, sortOrder, fetchArticulos]);
+  }, [fixedArea, areaFilter, campamentoFilter, search, estado, ubicacion, categoria, sinSerial, sinCantidad, fechaRango, pagination.page, pagination.limit, sortBy, sortOrder, fetchArticulos]);
 
   useEffect(() => {
     loadData();
   }, [loadData]);
 
   // Reset all filters
+  // v2.2: limpia los filtros pero CONSERVA la búsqueda del usuario (se quita con la ✕ del cuadro de búsqueda)
   const handleClearFilters = () => {
-    setSearch('');
     setEstado('TODOS');
     setCampamentoFilter('TODOS');
     setAreaFilter('TODAS');
@@ -267,6 +275,7 @@ export default function InventoryTable({
     setCategoria('TODAS');
     setSinSerial(false);
     setSinCantidad(false);
+    setFechaRango(EMPTY_DATE_RANGE);
     setSortBy('id');
     setSortOrder('ASC');
     setPagination(p => ({ ...p, page: 1 }));
@@ -300,6 +309,7 @@ export default function InventoryTable({
       if (sinSerial) query.append('sinSerial', 'true');
       if (sinCantidad) query.append('sinCantidad', 'true');
       if (search.trim()) query.append('search', search.trim());
+      Object.entries(dateRangeParams(fechaRango)).forEach(([k, v]) => query.append(k, v));
       query.append('sortBy', sortBy);
       query.append('sortOrder', sortOrder);
 
@@ -369,7 +379,8 @@ export default function InventoryTable({
     }
   };
 
-  const hasActiveFilters = estado !== 'TODOS' || campamentoFilter !== 'TODOS' || areaFilter !== 'TODAS' || ubicacion !== 'TODAS' || categoria !== 'TODAS' || search !== '' || sinSerial || sinCantidad;
+  const hasFiltersWithoutSearch = estado !== 'TODOS' || campamentoFilter !== 'TODOS' || areaFilter !== 'TODAS' || ubicacion !== 'TODAS' || categoria !== 'TODAS' || sinSerial || sinCantidad || Boolean(fechaRango.desde || fechaRango.hasta);
+  const hasActiveFilters = hasFiltersWithoutSearch || search.trim() !== '';
 
   const isGlobalRole = isDeveloperUser(currentUser) || currentRole === 'gerencia';
   const canCreate = userHasPermission(currentUser, 'inv:crear');
@@ -433,7 +444,39 @@ export default function InventoryTable({
     return map;
   }, [campamentoSelectOptions, sinSedeOption]);
 
+  // v2.2: contadores del backend. Cada cifra = artículos que habría al elegir esa opción manteniendo los demás filtros.
+  const facetaCampamentos = useMemo(() => {
+    if (!facetas?.campamentos) return null;
+    const map = {};
+    let todos = 0;
+    facetas.campamentos.forEach((c) => {
+      const key = c.campamento_id === null || c.campamento_id === undefined ? 'SIN_SEDE' : String(c.campamento_id);
+      map[key] = (map[key] || 0) + c.total;
+      todos += c.total;
+    });
+    return { map, todos };
+  }, [facetas]);
+
+  const categoriaOptions = useMemo(() => {
+    const lista = facetas?.categorias
+      ? facetas.categorias.map((c) => ({ valor: toSafeDisplayString(c.valor, ''), total: c.total }))
+      : availableCategorias.map((c) => ({ valor: toSafeDisplayString(c, ''), total: null }));
+    if (categoria && categoria !== 'TODAS' && !lista.some((c) => c.valor === categoria)) {
+      lista.unshift({ valor: categoria, total: facetas ? 0 : null });
+    }
+    return lista;
+  }, [facetas, availableCategorias, categoria]);
+
   const ubicacionFilterOptions = useMemo(() => {
+    if (facetas?.ubicaciones) {
+      const lista = facetas.ubicaciones
+        .map((u) => ({ valor: toSafeDisplayString(u.valor, ''), total: u.total }))
+        .filter((u) => u.valor && u.valor !== '—');
+      if (ubicacion && ubicacion !== 'TODAS' && !lista.some((u) => u.valor === ubicacion)) {
+        lista.unshift({ valor: ubicacion, total: 0 });
+      }
+      return lista;
+    }
     const set = new Set();
     if (Array.isArray(kpis?.ubicaciones)) {
       kpis.ubicaciones.forEach(u => {
@@ -448,10 +491,12 @@ export default function InventoryTable({
     if (ubicacion && ubicacion !== 'TODAS') {
       set.add(ubicacion);
     }
-    return Array.from(set);
-  }, [kpis, availableUbicaciones, ubicacion]);
+    return Array.from(set).map((valor) => ({ valor, total: null }));
+  }, [kpis, availableUbicaciones, ubicacion, facetas]);
 
+  const AREA_LABELS = { INFORMATICA: 'Informática', OFICINAS: 'Oficinas y Mobiliario', COCINA: 'Cocina y Comedor', ALMACEN: 'Almacén y Herramientas' };
   const formatAreaOpt = (label, areaKey) => {
+    if (facetas?.areas) return `${label} (${Number(facetas.areas[areaKey] ?? 0)})`;
     const porArea = kpis?.porArea;
     if (porArea && porArea[areaKey] !== undefined && porArea[areaKey] !== null) {
       return `${label} (${Number(porArea[areaKey])})`;
@@ -606,7 +651,8 @@ export default function InventoryTable({
             />
             {search && (
               <button
-                onClick={() => setSearch('')}
+                onClick={() => { setSearch(''); setPagination(p => ({ ...p, page: 1 })); }}
+                aria-label="Quitar búsqueda"
                 className="absolute right-3 top-1/2 transform -translate-y-1/2 text-slate-400 hover:text-slate-600"
               >
                 <X className="w-3.5 h-3.5" />
@@ -623,15 +669,20 @@ export default function InventoryTable({
               title="Filtrar por Campamento Confirmado o Sin Sede Verificada"
             >
               <option value="TODOS">
-                {typeof kpis?.totalArticulos === 'number'
-                  ? `Todos los Campamentos (${kpis.totalArticulos})`
-                  : 'Todos los Campamentos'}
+                {facetaCampamentos
+                  ? `Todos los Campamentos (${facetaCampamentos.todos})`
+                  : (typeof kpis?.totalArticulos === 'number'
+                    ? `Todos los Campamentos (${kpis.totalArticulos})`
+                    : 'Todos los Campamentos')}
               </option>
-              {campamentoSelectOptions.map(opt => (
-                <option key={opt.value} value={opt.value}>
-                  {opt.count !== null ? `${opt.nombre} (${opt.count})` : opt.nombre}
-                </option>
-              ))}
+              {campamentoSelectOptions.map(opt => {
+                const cuenta = facetaCampamentos ? (facetaCampamentos.map[opt.value] ?? 0) : opt.count;
+                return (
+                  <option key={opt.value} value={opt.value}>
+                    {cuenta !== null ? `${opt.nombre} (${cuenta})` : opt.nombre}
+                  </option>
+                );
+              })}
               {campamentoFilter !== 'TODOS' &&
                 campamentoFilter !== 'SIN_SEDE' &&
                 !campamentoSelectOptions.some(opt => opt.value === campamentoFilter) && (
@@ -642,7 +693,9 @@ export default function InventoryTable({
                   {sinSedeOption.historica
                     ? `${sinSedeOption.nombre} · ${sinSedeOption.historica}`
                     : sinSedeOption.nombre}
-                  {sinSedeOption.count !== null ? ` (${sinSedeOption.count})` : ''}
+                  {(facetaCampamentos ? (facetaCampamentos.map.SIN_SEDE ?? 0) : sinSedeOption.count) !== null
+                    ? ` (${facetaCampamentos ? (facetaCampamentos.map.SIN_SEDE ?? 0) : sinSedeOption.count})`
+                    : ''}
                 </option>
               )}
             </select>
@@ -671,8 +724,8 @@ export default function InventoryTable({
                 className="w-full px-3 py-2 text-xs border border-slate-200 rounded-xl focus:ring-2 focus:ring-[#F28524] focus:outline-none bg-white text-slate-700 truncate"
               >
                 <option value="TODAS">Todas las Categorías</option>
-                {availableCategorias.map((c, i) => (
-                  <option key={i} value={c}>{toSafeDisplayString(c, '')}</option>
+                {categoriaOptions.map((c) => (
+                  <option key={c.valor} value={c.valor}>{c.total !== null ? `${c.valor} (${c.total})` : c.valor}</option>
                 ))}
               </select>
             </div>
@@ -703,8 +756,8 @@ export default function InventoryTable({
               title="Ubicación histórica literal en Excel"
             >
               <option value="TODAS">Ubicación Excel (Todas)</option>
-              {ubicacionFilterOptions.map((ubName) => (
-                <option key={ubName} value={ubName}>{ubName}</option>
+              {ubicacionFilterOptions.map((ub) => (
+                <option key={ub.valor} value={ub.valor}>{ub.total !== null ? `${ub.valor} (${ub.total})` : ub.valor}</option>
               ))}
             </select>
           </div>
@@ -713,6 +766,13 @@ export default function InventoryTable({
         {/* Quick toggles & Clear filters */}
         <div className="flex flex-wrap items-center justify-between gap-3 text-xs text-slate-600 pt-1 border-t border-slate-100">
           <div className="flex flex-wrap items-center gap-4">
+            <DateRangeFilter
+              value={fechaRango}
+              onChange={(r) => { setFechaRango(r); setPagination(p => ({ ...p, page: 1 })); }}
+              label="Filtrar por fecha de registro"
+              hint="Fecha en que el artículo fue registrado en el sistema."
+            />
+
             <label className="flex items-center space-x-1.5 cursor-pointer hover:text-slate-900">
               <input
                 type="checkbox"
@@ -733,9 +793,10 @@ export default function InventoryTable({
               <span>Cantidad Pendiente de Comprobación</span>
             </label>
 
-            {hasActiveFilters && (
+            {hasFiltersWithoutSearch && (
               <button
                 onClick={handleClearFilters}
+                title="Quita los filtros y conserva el texto de búsqueda"
                 className="text-[#F28524] hover:text-[#d87019] font-bold flex items-center space-x-1 underline decoration-1"
               >
                 <RotateCcw className="w-3 h-3" />
@@ -758,6 +819,29 @@ export default function InventoryTable({
             </select>
           </div>
         </div>
+      </div>
+
+      {/* v2.2: resumen claro de resultados (totales calculados por el backend, no por las filas cargadas) */}
+      <div data-testid="resumen-resultados" className="bg-white px-4 py-3 rounded-2xl shadow-sm border border-slate-200/80 text-xs text-slate-600 flex flex-wrap items-center gap-x-5 gap-y-1">
+        <span className="font-bold text-slate-900">
+          {loading
+            ? 'Buscando…'
+            : `${Number(pagination.total || 0).toLocaleString('es-DO')} ${pagination.total === 1 ? 'artículo encontrado' : 'artículos encontrados'}${hasActiveFilters ? ' con los filtros activos' : ''}`}
+        </span>
+        {facetas?.totales && (
+          <>
+            <span>Total existente en su alcance: <strong className="text-slate-800">{Number(facetas.totales.alcance).toLocaleString('es-DO')}</strong></span>
+            {facetas.totales.area !== null && (
+              <span>Dentro del área {AREA_LABELS[fixedArea || areaFilter] || fixedArea || areaFilter}: <strong className="text-slate-800">{Number(facetas.totales.area).toLocaleString('es-DO')}</strong></span>
+            )}
+            {facetas.totales.categoria !== null && (
+              <span>Dentro de la categoría {categoria}: <strong className="text-slate-800">{Number(facetas.totales.categoria).toLocaleString('es-DO')}</strong></span>
+            )}
+          </>
+        )}
+        <span className="text-[11px] text-slate-400 basis-full">
+          Los números entre paréntesis de los desplegables indican cuántos artículos habría al elegir esa opción, manteniendo los demás filtros activos.
+        </span>
       </div>
 
       {/* Main Table Container */}
@@ -848,17 +932,36 @@ export default function InventoryTable({
                 <tr>
                   <td colSpan="11" className="py-16 text-center text-slate-400">
                     <Package className="w-10 h-10 mx-auto text-slate-300 mb-2" />
-                    <p className="font-semibold text-slate-600">{toSafeDisplayString(defaultEmptyMessage, 'No se encontraron artículos.')}</p>
-                    <p className="text-xs text-slate-400 mt-1">Verifica los filtros seleccionados o limpia la búsqueda.</p>
-                    {hasActiveFilters && (
-                      <button
-                        onClick={handleClearFilters}
-                        className="mt-3 px-4 py-1.5 bg-[#F28524] text-white rounded-xl text-xs font-bold shadow hover:bg-[#d87019] transition-all inline-flex items-center space-x-1.5"
-                      >
-                        <RotateCcw className="w-3.5 h-3.5" />
-                        <span>Restablecer Filtros</span>
-                      </button>
-                    )}
+                    <p className="font-semibold text-slate-600">
+                      {hasActiveFilters
+                        ? 'No se encontraron artículos con los filtros seleccionados'
+                        : toSafeDisplayString(defaultEmptyMessage, 'No se encontraron artículos.')}
+                    </p>
+                    <p className="text-xs text-slate-400 mt-1">
+                      {hasActiveFilters && facetas?.totales
+                        ? `Existen ${Number(facetas.totales.alcance).toLocaleString('es-DO')} artículos en su alcance, pero ninguno cumple TODOS los filtros activos a la vez.`
+                        : 'Verifica los filtros seleccionados o limpia la búsqueda.'}
+                    </p>
+                    <div className="mt-3 flex flex-wrap items-center justify-center gap-2">
+                      {hasFiltersWithoutSearch && (
+                        <button
+                          onClick={handleClearFilters}
+                          className="px-4 py-1.5 bg-[#F28524] text-white rounded-xl text-xs font-bold shadow hover:bg-[#d87019] transition-all inline-flex items-center space-x-1.5"
+                        >
+                          <RotateCcw className="w-3.5 h-3.5" />
+                          <span>Limpiar filtros{search.trim() ? ' (conserva su búsqueda)' : ''}</span>
+                        </button>
+                      )}
+                      {search.trim() !== '' && (
+                        <button
+                          onClick={() => { setSearch(''); setPagination(p => ({ ...p, page: 1 })); }}
+                          className="px-4 py-1.5 border border-slate-200 text-slate-700 rounded-xl text-xs font-bold hover:bg-slate-50 transition-all inline-flex items-center space-x-1.5"
+                        >
+                          <X className="w-3.5 h-3.5" />
+                          <span>Quitar búsqueda</span>
+                        </button>
+                      )}
+                    </div>
                   </td>
                 </tr>
               ) : (
@@ -917,6 +1020,7 @@ export default function InventoryTable({
                           <span className="text-[11px] text-slate-400 ml-1">
                             {art.unidad_medida}
                           </span>
+                          <AgotadoBadge articulo={art} className="ml-2" />
                         </>
                       ) : (
                         <span className="inline-flex items-center px-2 py-0.5 rounded text-[10px] font-bold bg-amber-100 text-amber-900 border border-amber-300" title="Cantidad vacía o '--' en Excel original; no convertida a 0 ni 1">

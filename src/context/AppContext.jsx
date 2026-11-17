@@ -343,6 +343,8 @@ export const AppProvider = ({ children }) => {
       if (limitOrParams.campamento_id && limitOrParams.campamento_id !== 'TODOS') {
         query.append('campamento_id', String(limitOrParams.campamento_id));
       }
+      if (limitOrParams.fecha_desde) query.append('fecha_desde', String(limitOrParams.fecha_desde));
+      if (limitOrParams.fecha_hasta) query.append('fecha_hasta', String(limitOrParams.fecha_hasta));
     } else {
       query.append('limit', String(limitOrParams || 100));
     }
@@ -360,8 +362,14 @@ export const AppProvider = ({ children }) => {
   }, [apiFetch]);
 
   // Fetch audit log
-  const fetchAuditoria = useCallback(async (limit = 100) => {
-    return await apiFetch(`/auditoria?limit=${limit}`);
+  const fetchAuditoria = useCallback(async (limitOrParams = 100) => {
+    if (typeof limitOrParams === 'object' && limitOrParams !== null) {
+      const q = new URLSearchParams({ limit: String(limitOrParams.limit ?? 100) });
+      if (limitOrParams.fecha_desde) q.append('fecha_desde', limitOrParams.fecha_desde);
+      if (limitOrParams.fecha_hasta) q.append('fecha_hasta', limitOrParams.fecha_hasta);
+      return await apiFetch(`/auditoria?${q.toString()}`);
+    }
+    return await apiFetch(`/auditoria?limit=${limitOrParams}`);
   }, [apiFetch]);
 
   // Users management (Exclusivo Developer)
@@ -692,9 +700,61 @@ export const AppProvider = ({ children }) => {
     return await apiFetch('/catalogos/ubicaciones');
   }, [apiFetch]);
 
+  // ==========================================
+  // v2.2 ACTAS DE ENTREGA DE HERRAMIENTAS
+  // ==========================================
+  const fetchActasDisponible = useCallback(async () => {
+    try {
+      const res = await apiFetch('/actas/disponible');
+      return Boolean(res?.success && res.enabled);
+    } catch {
+      return false;
+    }
+  }, [apiFetch]);
+
+  const crearActaEntrega = useCallback(async (payload) => {
+    const res = await apiFetch('/actas', { method: 'POST', body: JSON.stringify(payload) });
+    if (res.success) {
+      showToast(res.message || 'Acta registrada.', 'success');
+      refreshKpis();
+    } else {
+      showToast(res.message || 'No se pudo registrar el acta.', 'error');
+    }
+    return res;
+  }, [apiFetch, refreshKpis, showToast]);
+
+  const fetchActas = useCallback(async (filters = {}) => {
+    const params = new URLSearchParams();
+    Object.entries(filters).forEach(([k, v]) => {
+      if (v !== undefined && v !== null && v !== '') params.append(k, v);
+    });
+    return await apiFetch(`/actas?${params.toString()}`);
+  }, [apiFetch]);
+
+  const fetchActaOpciones = useCallback(async () => apiFetch('/actas/opciones'), [apiFetch]);
+
+  const fetchActaById = useCallback(async (id) => apiFetch(`/actas/${id}`), [apiFetch]);
+
+  const anularActaEntrega = useCallback(async (id, motivo) => {
+    const res = await apiFetch(`/actas/${id}/anular`, { method: 'POST', body: JSON.stringify({ motivo }) });
+    showToast(res.message || (res.success ? 'Acta anulada.' : 'No se pudo anular el acta.'), res.success ? 'success' : 'error');
+    return res;
+  }, [apiFetch, showToast]);
+
+  const registrarImpresionActa = useCallback(async (id) => {
+    try { return await apiFetch(`/actas/${id}/impresion`, { method: 'POST' }); } catch { return null; }
+  }, [apiFetch]);
+
   return (
     <AppContext.Provider
       value={{
+        fetchActasDisponible,
+        crearActaEntrega,
+        fetchActas,
+        fetchActaOpciones,
+        fetchActaById,
+        anularActaEntrega,
+        registrarImpresionActa,
         currentUser,
         currentRole: currentUser?.rol,
         authToken,

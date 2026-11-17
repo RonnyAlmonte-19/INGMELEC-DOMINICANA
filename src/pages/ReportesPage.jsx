@@ -4,6 +4,7 @@ import {
   Layers, MapPin, User, FileSpreadsheet, AlertTriangle
 } from 'lucide-react';
 import { useApp } from '../context/AppContext';
+import DateRangeFilter, { EMPTY_DATE_RANGE, dateRangeParams, describeDateRange } from '../components/common/DateRangeFilter';
 import { toSafeDisplayString } from '../utils/jsonFormat';
 import { userHasPermission } from '../utils/permissions';
 import {
@@ -22,6 +23,7 @@ export default function ReportesPage() {
   const [data, setData] = useState(null);
   const activeCampIdStr = activeCampamento?.id ? String(activeCampamento.id) : 'TODOS';
   const [selectedCampamento, setSelectedCampamento] = useState(activeCampIdStr);
+  const [fechaRango, setFechaRango] = useState(EMPTY_DATE_RANGE); // v2.2: artículos registrados en el período
 
   useEffect(() => {
     setSelectedCampamento(activeCampIdStr);
@@ -56,7 +58,10 @@ export default function ReportesPage() {
   useEffect(() => {
     setLoading(true);
     setReportError('');
-    fetchReporteConsolidado(selectedCampamento !== 'TODOS' ? { campamento_id: selectedCampamento } : {})
+    fetchReporteConsolidado({
+      ...(selectedCampamento !== 'TODOS' ? { campamento_id: selectedCampamento } : {}),
+      ...dateRangeParams(fechaRango)
+    })
       .then(res => {
         if (res?.success) {
           setData(res.reporte);
@@ -68,13 +73,16 @@ export default function ReportesPage() {
         setReportError('Error de conexión al consultar reportes consolidados.');
       })
       .finally(() => setLoading(false));
-  }, [fetchReporteConsolidado, selectedCampamento]);
+  }, [fetchReporteConsolidado, selectedCampamento, fechaRango]);
 
   const handleExportFull = async (format = 'csv') => {
     try {
       setExporting(true);
       setReportError('');
-      const q = selectedCampamento !== 'TODOS' ? `?campamento_id=${encodeURIComponent(selectedCampamento)}` : '';
+      const qp = new URLSearchParams();
+      if (selectedCampamento !== 'TODOS') qp.append('campamento_id', selectedCampamento);
+      Object.entries(dateRangeParams(fechaRango)).forEach(([k, v]) => qp.append(k, v));
+      const q = qp.toString() ? `?${qp.toString()}` : '';
       const token = typeof localStorage !== 'undefined' ? localStorage.getItem('ingmelec_token') : null;
       const res = await fetch(`/api/v2/reportes/exportar${q}`, {
         headers: token ? { 'Authorization': `Bearer ${token}` } : {}
@@ -135,6 +143,9 @@ export default function ReportesPage() {
           </h1>
           <p className="text-xs text-slate-600 mt-1">
             Consolidado gerencial calculado directamente desde MySQL sobre {totalArticulos} activos empresariales ({totalUnidades} unidades físicas conocidas + {totalSinCantidad} con cantidad pendiente).
+            {describeDateRange(fechaRango) && (
+              <strong className="text-[#F28524]"> Período (registrados): {describeDateRange(fechaRango)}.</strong>
+            )}
           </p>
         </div>
 
@@ -174,6 +185,13 @@ export default function ReportesPage() {
               </option>
             )}
           </select>
+
+          <DateRangeFilter
+            value={fechaRango}
+            onChange={setFechaRango}
+            label="Período del reporte"
+            hint="Muestra los artículos registrados en el período (fecha de registro en el sistema)."
+          />
 
           {canPrintReport && (
             <button

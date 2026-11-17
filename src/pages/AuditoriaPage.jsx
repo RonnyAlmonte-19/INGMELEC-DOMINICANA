@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react';
 import { ShieldCheck } from 'lucide-react';
 import { useApp } from '../context/AppContext';
 import { formatAuditDetails, toSafeDisplayString } from '../utils/jsonFormat';
+import DateRangeFilter, { EMPTY_DATE_RANGE, dateRangeParams } from '../components/common/DateRangeFilter';
 
 export default function AuditoriaPage() {
   const { fetchAuditoria } = useApp();
@@ -9,13 +10,18 @@ export default function AuditoriaPage() {
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState('');
 
+  const [fechaRango, setFechaRango] = useState(EMPTY_DATE_RANGE); // v2.2: fecha del evento (inv_auditoria.fecha)
+
   useEffect(() => {
-    fetchAuditoria(150)
+    const hayFecha = Boolean(fechaRango.desde || fechaRango.hasta);
+    setLoading(true);
+    // Sin filtro: misma llamada de siempre. Con filtro: el backend filtra y se permite un tope mayor.
+    (hayFecha ? fetchAuditoria({ limit: 500, ...dateRangeParams(fechaRango) }) : fetchAuditoria(150))
       .then(res => {
         if (res.success) setLogs(res.logs);
       })
       .finally(() => setLoading(false));
-  }, [fetchAuditoria]);
+  }, [fetchAuditoria, fechaRango]);
 
   const filteredLogs = logs.filter(l => {
     if (!search) return true;
@@ -41,13 +47,14 @@ export default function AuditoriaPage() {
           </p>
         </div>
 
-        <div className="w-full sm:w-72">
+        <div className="w-full sm:w-auto flex items-center gap-2">
+          <DateRangeFilter value={fechaRango} onChange={setFechaRango} label="Filtrar por fecha del evento" />
           <input
             type="text"
             placeholder="Filtrar por acción o usuario..."
             value={search}
             onChange={e => setSearch(e.target.value)}
-            className="w-full px-3 py-2 text-xs border border-slate-200 rounded-xl focus:ring-2 focus:ring-[#F28524] focus:outline-none"
+            className="w-full sm:w-72 px-3 py-2 text-xs border border-slate-200 rounded-xl focus:ring-2 focus:ring-[#F28524] focus:outline-none"
           />
         </div>
       </div>

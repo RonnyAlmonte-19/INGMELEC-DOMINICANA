@@ -7,6 +7,7 @@ import {
 import { useApp } from '../context/AppContext';
 import LevantamientoWorkspace from '../components/levantamientos/LevantamientoWorkspace';
 import { userHasPermission } from '../utils/permissions';
+import DateRangeFilter, { EMPTY_DATE_RANGE, dateRangeParams } from '../components/common/DateRangeFilter';
 
 export default function LevantamientosPage({ navigateTo, pageParams }) {
   const {
@@ -66,6 +67,7 @@ export default function LevantamientosPage({ navigateTo, pageParams }) {
   const [estadoFilter, setEstadoFilter] = useState('TODOS');
   const [campamentoFilter, setCampamentoFilter] = useState(activeCampIdStr);
   const [searchQuery, setSearchQuery] = useState('');
+  const [fechaRango, setFechaRango] = useState(EMPTY_DATE_RANGE); // v2.2: fecha de inicio del levantamiento
 
   useEffect(() => {
     setCampamentoFilter(activeCampIdStr);
@@ -116,8 +118,10 @@ export default function LevantamientosPage({ navigateTo, pageParams }) {
   const loadData = useCallback(async () => {
     try {
       setLoading(true);
+      const fechasLev = dateRangeParams(fechaRango);
       const [levRes, campRes] = await Promise.all([
-        fetchLevantamientos(),
+        // Sin filtro de fecha: llamada idéntica a la anterior
+        Object.keys(fechasLev).length > 0 ? fetchLevantamientos(fechasLev) : fetchLevantamientos(),
         canViewCampamentos
           ? fetchCampamentos()
           : Promise.resolve({ success: true, campamentos: currentUser?.campamentos || [] })
@@ -135,7 +139,7 @@ export default function LevantamientosPage({ navigateTo, pageParams }) {
     } finally {
       setLoading(false);
     }
-  }, [fetchLevantamientos, fetchCampamentos, canViewCampamentos, currentUser, showToast]);
+  }, [fetchLevantamientos, fetchCampamentos, canViewCampamentos, currentUser, showToast, fechaRango]);
 
   useEffect(() => {
     loadData();
@@ -420,6 +424,8 @@ export default function LevantamientosPage({ navigateTo, pageParams }) {
               <option value="Finalizado">Finalizado</option>
             </select>
           </div>
+
+          <DateRangeFilter value={fechaRango} onChange={setFechaRango} label="Filtrar por fecha de inicio" hint="Fecha de inicio del levantamiento." />
         </div>
       </div>
 
@@ -434,7 +440,7 @@ export default function LevantamientosPage({ navigateTo, pageParams }) {
           <ClipboardCheck className="w-12 h-12 text-slate-300 mx-auto mb-3" />
           <h3 className="text-sm font-bold text-slate-800">No hay levantamientos registrados</h3>
           <p className="text-xs text-slate-500 mt-1 mb-5">
-            {searchQuery || estadoFilter !== 'TODOS' || campamentoFilter !== 'TODOS'
+            {searchQuery || estadoFilter !== 'TODOS' || campamentoFilter !== 'TODOS' || fechaRango.desde || fechaRango.hasta
               ? 'No se encontraron resultados con los filtros aplicados.'
               : 'Comience creando una nueva sesión de auditoría para su campamento o almacén.'}
           </p>

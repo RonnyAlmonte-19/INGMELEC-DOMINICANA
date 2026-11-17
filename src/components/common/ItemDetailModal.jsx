@@ -6,6 +6,7 @@ import {
 } from 'lucide-react';
 import { useApp } from '../../context/AppContext';
 import { userHasPermission } from '../../utils/permissions';
+import AgotadoBadge from './AgotadoBadge';
 
 export default function ItemDetailModal({ itemId, onClose, onUpdated }) {
   const { getArticuloById, updateArticulo, deleteArticulo, currentUser } = useApp();
@@ -402,6 +403,7 @@ export default function ItemDetailModal({ itemId, onClose, onUpdated }) {
                   <div className="text-2xl font-black text-slate-800 mt-1">
                     {item.cantidad_num !== null ? item.cantidad_num : item.cantidad_texto}
                     <span className="text-xs font-normal text-slate-500 ml-1.5">{item.unidad_medida}</span>
+                    <AgotadoBadge articulo={item} className="ml-2 align-middle" />
                   </div>
                   <div className="text-xs text-slate-500 mt-1">
                     {item.cantidad_verificada ? (

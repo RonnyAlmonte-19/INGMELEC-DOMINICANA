@@ -5,10 +5,26 @@ import {
   Search, Calendar, User, MapPin
 } from 'lucide-react';
 import { useApp } from '../context/AppContext';
-import { userHasPermission } from '../utils/permissions';
+import { userHasPermission, userHasAnyPermission } from '../utils/permissions';
+import { isAgotado } from '../utils/stock';
+import DateRangeFilter, { EMPTY_DATE_RANGE, dateRangeParams } from '../components/common/DateRangeFilter';
+import ActaAsignacionForm from '../components/actas/ActaAsignacionForm';
+import ActasHistorial from '../components/actas/ActasHistorial';
 
 export default function MovimientosPage() {
-  const { fetchMovimientos, registrarMovimiento, fetchArticulos, activeCampamento, currentUser } = useApp();
+  const { fetchMovimientos, registrarMovimiento, fetchArticulos, activeCampamento, currentUser, fetchActasDisponible } = useApp();
+  // v2.2 Actas: solo activas si el backend tiene ACTAS_ENABLED=true
+  const [actasEnabled, setActasEnabled] = useState(false);
+  const [showActaForm, setShowActaForm] = useState(false);
+  const [vista, setVista] = useState('bitacora');
+  const [fechaRango, setFechaRango] = useState(EMPTY_DATE_RANGE); // v2.2: fecha del movimiento (solo Bitácora)
+  const [actasRefresh, setActasRefresh] = useState(0);
+  useEffect(() => {
+    if (typeof fetchActasDisponible !== 'function') return;
+    fetchActasDisponible().then(setActasEnabled);
+  }, [fetchActasDisponible]);
+  const puedeCrearActa = actasEnabled && userHasAnyPermission(currentUser, ['act:crear', 'inv:movimientos_registrar']);
+  const puedeVerActas = actasEnabled && userHasAnyPermission(currentUser, ['act:ver', 'inv:movimientos_ver']);
   const [movimientos, setMovimientos] = useState([]);
   const [loading, setLoading] = useState(true);
   const [showModal, setShowModal] = useState(false);
@@ -39,8 +55,13 @@ export default function MovimientosPage() {
     }
     setLoading(true);
     try {
+      const fechas = dateRangeParams(fechaRango);
+      const hayFecha = Object.keys(fechas).length > 0;
+      // Sin filtro de fecha: la misma llamada de siempre.
       const res = await fetchMovimientos(
-        activeCampamentoId ? { limit: 150, campamento_id: activeCampamentoId } : 150
+        hayFecha
+          ? { limit: 500, ...(activeCampamentoId ? { campamento_id: activeCampamentoId } : {}), ...fechas }
+          : (activeCampamentoId ? { limit: 150, campamento_id: activeCampamentoId } : 150)
       );
       if (res.success) {
         setMovimientos(res.movimientos);
@@ -48,7 +69,7 @@ export default function MovimientosPage() {
     } finally {
       setLoading(false);
     }
-  }, [fetchMovimientos, activeCampamentoId, canViewMovimientos]);
+  }, [fetchMovimientos, activeCampamentoId, canViewMovimientos, fechaRango]);
 
   useEffect(() => {
     loadMovimientos();
@@ -143,13 +164,36 @@ export default function MovimientosPage() {
         )}
       </div>
 
+      {puedeVerActas && (
+        <div className="flex gap-2" role="tablist">
+          {[['bitacora', 'Bitácora de Operaciones'], ['actas', 'Actas de Entrega']].map(([id, label]) => (
+            <button key={id} type="button" role="tab" aria-selected={vista === id} onClick={() => setVista(id)}
+              className={`px-4 py-2 rounded-xl text-xs font-bold border ${vista === id ? 'bg-[#F28524] text-white border-[#F28524]' : 'bg-white text-slate-700 border-slate-200 hover:bg-slate-50'}`}>
+              {label}
+            </button>
+          ))}
+        </div>
+      )}
+
+      {showActaForm && (
+        <ActaAsignacionForm
+          onClose={() => setShowActaForm(false)}
+          onCreated={() => { setActasRefresh((n) => n + 1); loadMovimientos(); }}
+        />
+      )}
+
+      {puedeVerActas && vista === 'actas' && <ActasHistorial refreshToken={actasRefresh} />}
+
       {/* Movements Table */}
-      <div className="bg-white rounded-2xl shadow-sm border border-slate-200/80 overflow-hidden">
+      <div className={`bg-white rounded-2xl shadow-sm border border-slate-200/80 overflow-hidden ${puedeVerActas && vista === 'actas' ? 'hidden' : ''}`}>
         <div className="p-4 border-b border-slate-100 flex items-center justify-between">
           <h3 className="font-bold text-sm text-slate-800">
             Bitácora de Operaciones ({movimientos.length})
           </h3>
-          <span className="text-xs text-slate-400">Orden cronológico descendente</span>
+          <div className="flex items-center gap-3">
+            <span className="text-xs text-slate-400">Orden cronológico descendente</span>
+            <DateRangeFilter value={fechaRango} onChange={setFechaRango} label="Filtrar por fecha del movimiento" />
+          </div>
         </div>
 
         <div className="overflow-x-auto">
@@ -268,7 +312,14 @@ export default function MovimientosPage() {
                     <button
                       type="button"
                       key={tipo}
-                      onClick={() => setFormData({ ...formData, tipo_movimiento: tipo })}
+                      onClick={() => {
+                        if (tipo === 'ASIGNACION' && puedeCrearActa) {
+                          setShowModal(false);
+                          setShowActaForm(true);
+                          return;
+                        }
+                        setFormData({ ...formData, tipo_movimiento: tipo });
+                      }}
                       className={`py-2 px-3 rounded-lg border font-bold text-center transition-all ${
                         formData.tipo_movimiento === tipo
                           ? 'bg-[#F28524] text-white border-[#F28524] shadow'
@@ -292,7 +343,7 @@ export default function MovimientosPage() {
                   <option value="">-- Seleccione un artículo --</option>
                   {articulosList.map(a => (
                     <option key={a.id} value={a.id}>
-                      [{a.codigo_original || 'S/C'}] {a.articulo_nombre} ({a.area} · Stock: {a.cantidad_num ?? a.cantidad_texto} {a.unidad_medida})
+                      [{a.codigo_original || 'S/C'}] {a.articulo_nombre} ({a.area} · Stock: {a.cantidad_num ?? a.cantidad_texto} {a.unidad_medida}){isAgotado(a) ? ' · AGOTADO' : ''}
                     </option>
                   ))}
                 </select>

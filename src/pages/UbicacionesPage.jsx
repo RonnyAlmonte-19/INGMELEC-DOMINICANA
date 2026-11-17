@@ -15,6 +15,7 @@ import {
 } from 'lucide-react';
 import { useApp } from '../context/AppContext';
 import { toSafeDisplayString } from '../utils/jsonFormat';
+import DateRangeFilter, { EMPTY_DATE_RANGE, dateRangeParams } from '../components/common/DateRangeFilter';
 
 const DEPT_SHORT_LABELS = {
   INFORMATICA: 'INF',
@@ -298,6 +299,8 @@ export default function UbicacionesPage() {
     }
   }, [selectedFilter, activeCampamento, campamentosConfirmados, ubicacionesList]);
 
+  const [fechaRango, setFechaRango] = useState(EMPTY_DATE_RANGE); // v2.2: fecha de registro de los activos listados
+
   const loadSelectedItems = useCallback(async () => {
     if (!selectedFilter) return;
     setLoading(true);
@@ -310,7 +313,7 @@ export default function UbicacionesPage() {
       } else if (selectedFilter.ubicacionNombre) {
         query = { ubicacion: selectedFilter.ubicacionNombre, limit: 100 };
       }
-      const res = await fetchArticulos(query);
+      const res = await fetchArticulos({ ...query, ...dateRangeParams(fechaRango) });
       if (res?.success) {
         setItems(Array.isArray(res.articulos) ? res.articulos : []);
       }
@@ -319,7 +322,7 @@ export default function UbicacionesPage() {
     } finally {
       setLoading(false);
     }
-  }, [selectedFilter, fetchArticulos]);
+  }, [selectedFilter, fetchArticulos, fechaRango]);
 
   useEffect(() => {
     loadSelectedItems();
@@ -1652,6 +1655,12 @@ export default function UbicacionesPage() {
             </h3>
             <span className="text-xs text-slate-400">{items.length} activos listados</span>
           </div>
+          <DateRangeFilter
+            value={fechaRango}
+            onChange={setFechaRango}
+            label="Filtrar activos por fecha de registro"
+            hint="Aplica a los activos de la sede o ubicación seleccionada (fecha de registro en el sistema)."
+          />
         </div>
 
         <div className="overflow-x-auto">

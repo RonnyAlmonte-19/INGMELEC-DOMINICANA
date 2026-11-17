@@ -52,6 +52,14 @@ export const PERMISSION_CATEGORIES = [
       { key: 'camp:stock', label: 'Ver balances y stock de campamento' },
       { key: 'camp:operar', label: 'Gestionar almacenes y bodegas' }
     ]
+  },
+  {
+    categoria: 'Actas de Entrega de Herramientas',
+    items: [
+      { key: 'act:ver', label: 'Consultar historial de actas de entrega' },
+      { key: 'act:crear', label: 'Emitir actas de entrega de herramientas' },
+      { key: 'act:anular', label: 'Anular actas de entrega (con motivo y auditoría)' }
+    ]
   }
 ];
 
