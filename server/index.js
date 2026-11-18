@@ -119,13 +119,20 @@ app.use(json1mb);
 
 app.use(morgan('dev'));
 
-// Healthcheck ligero para Render / balanceadores de carga
+// Modo Mantenimiento: se evalúa una sola vez al arrancar. Solo el valor "true" lo activa
+// (no se aceptan alias como 1/yes/on). Cambiar la variable exige reiniciar el proceso.
+const MAINTENANCE_ACTIVE = String(process.env.MAINTENANCE_MODE || '').trim().toLowerCase() === 'true';
+if (MAINTENANCE_ACTIVE) {
+  console.warn('[MANTENIMIENTO] ACTIVO: las escrituras (POST, PUT, PATCH, DELETE) en /api/v2 devolverán 503.');
+}
+
+// Healthcheck ligero para Render / balanceadores de carga (maintenance indica si el modo está activo)
 app.get('/health', (req, res) => {
-  res.status(200).json({ status: 'ok', service: 'INGMELEC | ALMACÉN GENERAL', timestamp: new Date().toISOString() });
+  res.status(200).json({ status: 'ok', service: 'INGMELEC | ALMACÉN GENERAL', maintenance: MAINTENANCE_ACTIVE, timestamp: new Date().toISOString() });
 });
 
 // Modo Mantenimiento Defensivo: impide escrituras (POST, PUT, PATCH, DELETE) durante despliegues o migraciones
-if (String(process.env.MAINTENANCE_MODE || '').trim().toLowerCase() === 'true') {
+if (MAINTENANCE_ACTIVE) {
   app.use('/api/v2', (req, res, next) => {
     if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)) {
       return res.status(503).json({
